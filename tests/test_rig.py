@@ -152,6 +152,42 @@ class TestLogParsing(unittest.TestCase):
         self.assertEqual(m.group("variant"), "AVX2")
 
 
+class TestParseIts(unittest.TestCase):
+    def test_jetski_combined_line(self):
+        its = agent.parse_its(os.path.join(FIXTURES, "jetski_cpu_gpu.log"))
+        self.assertEqual(its["cpu"], 1)
+        self.assertEqual(its["gpu"], 84)
+        self.assertEqual(its["total"], 85)
+        self.assertEqual(its["avg"], 78)
+        self.assertEqual(its["epoch"], 239)
+        self.assertEqual(its["devices"], {"AVX2": 1, "CUDA": 84})
+
+    def test_qli_alternating_lines(self):
+        its = agent.parse_its(os.path.join(FIXTURES, "qli_cpu_gpu.log"))
+        self.assertEqual(its["cpu"], 0)
+        self.assertEqual(its["gpu"], 41)
+        self.assertEqual(its["total"], 41)
+        self.assertEqual(its["avg"], 19)
+        self.assertEqual(its["devices"], {"CUDA": 41, "AVX2": 0})
+
+    def test_cpu_only(self):
+        with tempfile.NamedTemporaryFile(
+                "w", suffix=".log", delete=False) as f:
+            f.write("2026-11-14T16:00:00.000+00:00 E:1 | SHARES: 0/0 "
+                    "(R:0) | [AVX2] 7 it/s | 6 avg it/s\n")
+            path = f.name
+        its = agent.parse_its(path)
+        os.unlink(path)
+        self.assertEqual(its["cpu"], 7)
+        self.assertIsNone(its["gpu"])
+        self.assertEqual(its["total"], 7)
+
+    def test_empty(self):
+        its = agent.parse_its("/nonexistent.log")
+        self.assertIsNone(its["total"])
+        self.assertEqual(its["devices"], {})
+
+
 class TestPoolState(unittest.TestCase):
     def setUp(self):
         self.td = tempfile.TemporaryDirectory()

@@ -326,6 +326,48 @@ def hardware_info():
     return info
 
 
+# Per-device hashrate tags, e.g. "[AVX2] 1 it/s | [CUDA] 84 it/s" (jetski,
+# one line) or separate lines per device (qli).
+DEVICE_RATE_RE = re.compile(r"\[([A-Za-z0-9_]+)\]\s*(\d+)\s*it/s")
+AVG_RATE_RE = re.compile(r"(\d+)\s+avg it/s")
+CPU_TAGS = {"AVX2", "AVX512", "GENERIC"}
+GPU_TAGS = {"CUDA", "AMD"}
+
+
+def parse_its(log_path, max_lines=300):
+    """Latest per-device it/s from a miner log tail.
+
+    Returns {"cpu": int|None, "gpu": int|None, "total": int|None,
+             "avg": int|None, "epoch": int|None,
+             "devices": {tag: latest_rate}}.
+    Each device takes its rate from the most recent line mentioning it,
+    which handles qli alternating CPU/GPU lines and jetski combined
+    lines. Bare "GPU #0: N it/s" lines carry no [tag] and are ignored."""
+    devices = {}
+    avg = epoch = None
+    for line in reversed(qp.tail_log_lines(log_path, max_lines=max_lines)):
+        for m in DEVICE_RATE_RE.finditer(line):
+            tag = m.group(1)
+            if tag not in devices:
+                devices[tag] = int(m.group(2))
+        if avg is None:
+            am = AVG_RATE_RE.search(line)
+            if am:
+                avg = int(am.group(1))
+        if epoch is None:
+            sm = qp.STATUS_RE.search(line) or qp.SHARES_ONLY_RE.search(line)
+            if sm:
+                epoch = int(sm.group("epoch"))
+    cpu_rates = [v for t, v in devices.items() if t in CPU_TAGS]
+    gpu_rates = [v for t, v in devices.items() if t in GPU_TAGS]
+    cpu = sum(cpu_rates) if cpu_rates else None
+    gpu = sum(gpu_rates) if gpu_rates else None
+    total = ((cpu or 0) + (gpu or 0)) if (cpu is not None
+                                         or gpu is not None) else None
+    return {"cpu": cpu, "gpu": gpu, "total": total, "avg": avg,
+            "epoch": epoch, "devices": devices}
+
+
 def jetski_summary():
     try:
         return json.loads(fetch_text(JETSKI_API, timeout=3))
@@ -455,7 +497,7 @@ def cmd_run(_args):
     save_state(rig_state)
     state["boot_count"] = rig_state["boot_count"]
     state["pool_source"] = pool_source
-    alias = os.environ.get("ALIAS") or f"clorqub-{os.uname().nodename}"
+    alias = os.environ.get("ALIAS") or f"cq-{os.uname().nodename}"
     threads = env_int("CPU_THREADS", max(1, (os.cpu_count() or 2) - 1))
     gpu = os.environ.get("GPU", "off") == "on"
     packages = {}  # pool -> pkg info dict
@@ -581,8 +623,7 @@ def cmd_run(_args):
                 "started_at": miner_obj.started_at if miner_obj else None,
                 "restarts": restarts,
             },
-            "its": {"it": rate["it"], "avg": rate["avg"],
-                    "epoch": rate["epoch"]},
+            "its": parse_its(os.path.join(LOGS_DIR, f"{pool}.log")),
             "shares": shares,
             "trainer": trainer or None,
             "jetski_summary": jetski_summary() if pool == "jetski" else None,
@@ -624,7 +665,8 @@ def cmd_run(_args):
             except Exception as e:
                 log(f"stats mirror failed: {e}")
             rate = qp.tail_hashrate(miner.log_path)
-            if rate["it"] and "first_its" not in timeline:
+            if (parse_its(miner.log_path)["total"] or 0) > 0 \
+                    and "first_its" not in timeline:
                 timeline["first_its"] = utcnow()
             if rate["found"] and "first_share" not in timeline:
                 timeline["first_share"] = utcnow()
