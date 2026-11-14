@@ -96,8 +96,10 @@ rigs that aren't yielding, and rotate out underperformers.
   all separate processes that read SQLite and send commands through it (see
   "Process model").
 - **Secrets:** `~/.config/clorqub/env` (mode 600), loaded as environment
-  variables; the systemd units use `EnvironmentFile=`. Currently holds
-  `CLORE_API_KEY`.
+  variables; the systemd units use `EnvironmentFile=`. Holds
+  `CLORE_API_KEY`, `QLI_ACCESS_TOKEN` (qli pool needs an access token) and
+  `JETSKI_WALLET` (jetski needs a wallet id; a public address, but kept in
+  the same file so all credentials live in one place).
 
 ## Phase 0 findings (2026-11-14)
 
@@ -306,11 +308,24 @@ One small image, miners downloaded at start, one miner running at a time.
   rig). The package URL used is the matching one, so the version stays in
   step with jetski's releases.
 - **Order:** `create_order` with `image=<registry>/clorqub-miner:<tag>`,
-  `ports={"22":"tcp"}`, `ssh_key=<clorqub public key>`, and `env`:
-  `POOL=jetski|qli`, `QUBIC_WALLET`, `ALIAS=clorqub-<server_id>-<order_id>`,
+  `ports={"22":"tcp"}`, `ssh_key=<clorqub public key>`, and `env` with only
+  non-secret settings: `POOL=jetski|qli`, `ALIAS=clorqub-<server_id>-<order_id>`,
   `CPU_THREADS` (from `specs.cpus`, minus 1), `GPU=on|off`, `JETSKI_MODE`,
-  and the package URLs. The wallet is a public address, so passing it in env
-  is fine; no secret goes into env.
+  and the package URLs.
+- **Credentials are pushed over SSH, not put in the order.** Order env is
+  stored by Clore and shown in its API/UI, so neither credential goes there.
+  Once SSH is up, `rig.py` writes `/clorqub/credentials.json` (mode 600):
+  - `jetski_wallet` -> jetski `pool.wallet`;
+  - `qli_access_token` -> qli `ClientSettings.accessToken`.
+
+  The agent waits for that file before starting a miner, and renders each
+  miner's `appsettings.json` from it. The early-boot timer allows for this
+  step.
+- **Exposure:** the host operator can read anything in the container, so
+  the qli token is exposed to every host we rent. Use a token dedicated to
+  clorqub if qubic.li allows several, so it can be revoked without touching
+  the local rig. The jetski wallet is a public address; the risk is only
+  that it identifies the user's wallet.
 - **Agent:** supervises the active miner, restarts it on crash, and writes
   `/clorqub/status.json` every few seconds: pool, package version + SHA-256,
   miner pid/uptime, it/s, shares (log + `.lock`), trainer version, epoch,
@@ -681,9 +696,10 @@ Clore rate limits (1 req/s, `create_order` 1 per 5 s) are enforced in
   pool run.
 - **Image hygiene**: no miner binaries in the image; no secrets in the
   image or in order env; the rig SSH key is dedicated to clorqub.
-- Secrets (`CLORE_API_KEY`, later the Discord bot token) only in
-  `~/.config/clorqub/env` (mode 600) / env vars, never in config, SQLite, logs
-  or the image.
+- Secrets (`CLORE_API_KEY`, `QLI_ACCESS_TOKEN`, later the Discord bot
+  token) only in `~/.config/clorqub/env` (mode 600) / env vars, never in
+  config, SQLite, logs, the image or Clore order env. The qli token reaches
+  rigs only over SSH (see "Rig runtime").
 
 ## Phases
 
@@ -718,8 +734,9 @@ spending anything.
 - Spot: how bids are won and lost (outbid behavior, minimum increment), and
   whether a spot rental that is outbid is paused or ended.
 - Miner packages run outside HiveOS: confirm both binaries run in a plain
-  container (any missing libraries, GPU runtime needs), and what qli's
-  `accessToken` vs `qubicAddress` means for pool-side stats.
+  container (any missing libraries, GPU runtime needs).
+- qli access token: can qubic.li issue more than one (a dedicated,
+  revocable clorqub token)? Does it give per-worker stats by alias?
 - Does jetski expose per-worker stats and payout APIs? If not, rig stats +
   wallet payouts only.
 - Does qubic.li expose a per-worker stats API suitable for yield measurement?
