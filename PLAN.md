@@ -93,7 +93,7 @@ clorqub/
     store.py           # SQLite: servers, rentals, measurements, blacklist,
                        #   spend, decisions log
     daemon.py          # main loop
-    cli.py             # status / report / dry-run / pause / set-budget /
+    cli.py             # status (share windows) / report / dry-run / pause / set-budget /
                        #   servers / server <id> / blacklist add|rm|list
 ```
 
@@ -111,6 +111,10 @@ SQLite tables:
 - `measurements`: `rental_id`, `server_id`, timestamp, epoch, trainer version,
   it/s, found/submitted/invalid shares (cumulative per epoch, as in
   `stats.<epoch>.lock`).
+- `shares`: individual share events (`worker`, `server_id`, `rental_id`, `Created` UTC,
+  epoch, invalid, `ReportedScore`), deduped by `SolutionHash`. These come from
+  `stats.<epoch>.lock` `Solutions[]`. When only counters are available
+  (HiveOS/pool), counter deltas between polls are stored as timestamped events.
 - `blacklist`: `server_id` (or host id), reason, source (auto/manual), added
   at, optional expiry.
 
@@ -131,6 +135,29 @@ Use:
 - **Reports**: `cli.py server <id>` gives a server's rental history, shares/hr
   over time, cost per share and incidents. `cli.py servers` ranks every server
   we've rented by lifetime shares-per-cent.
+
+### Share summary windows
+
+Share counts for **15m / 1h / 2h / 4h / 24h / epoch** (windows in config
+`summary_windows`), shown at these levels:
+
+- **fleet**: all active rentals, plus total $/h and shares per cent per window;
+- **per worker**: one row per HiveOS worker / jetski worker name (`alias`,
+  `-workername`), with rental id, `server_id`, hardware, uptime and $/h
+  alongside the windows. Also includes workers clorqub didn't rent (e.g. your
+  local rig) if HiveOS or the pool reports them, marked as unmanaged;
+- **per rental / server**: windows for one rental, or rolled up across all of a
+  server's rentals;
+- **per server history**: the same windows in `cli.py server <id>`.
+
+Each window shows found / invalid shares, shares/h, and shares per cent (spend
+over the same window). Computed from the `shares` table with the
+`count_shares_in_window` logic and the epoch-rollover merge. "Epoch" is the
+current Qubic epoch only. A window longer than a rental's uptime is marked
+partial (e.g. `12 (3h)`), so a new rig isn't compared unfairly.
+
+Shown by `cli.py status` (fleet + per-worker table; `--by server|rental`) and in the optional Phase 5
+dashboard.
 
 ### Share data sources (in order of preference)
 
@@ -179,7 +206,7 @@ every N minutes:
 | 0.5 | Extract `qubic_parse.py` from mining_optimizer.py, keep the TUI working on it | — |
 | 1 | Read-only scanner + scorer: rank marketplace by shares-per-cent, print table (seed perf table: it/s per CPU/GPU model) | 0 |
 | 2 | HiveOS custom miner package + single-rental path: rent one server, it joins farm, assign flight sheet, confirm shares | 0, 0.5 |
-| 3 | Stats collection + per-server history + learned perf model + blacklist (manual + auto rules, `servers`/`server <id>` reports) | 2 |
+| 3 | Stats collection + share summary windows (15m/1h/2h/4h/24h/epoch; fleet / worker / server) + per-server history + learned perf model + blacklist (manual + auto rules, `servers`/`server <id>` reports) | 2 |
 | 4 | Full loop: budget-capped auto-rent + rotation | 1, 3 |
 | 5 | Optional: read-only web dashboard (FastAPI + single HTML page reading SQLite, localhost only); or a remote-rigs pane in the existing TUI | 4 |
 
