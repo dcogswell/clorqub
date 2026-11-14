@@ -1,0 +1,48 @@
+{
+  "version": "4.5",
+  "uptime": 190,
+  "status": "mining",
+  "mode": "cpu",
+  "pps": true,
+  "epoch": 239,
+  "pool": {
+    "connected": true,
+    "authenticated": true
+  },
+  "hashrate": {
+    "total": 1,
+    "cpu": 1,
+    "gpu": 0,
+    "devices": {
+      "AVX2": 1
+    }
+  },
+  "results": {
+    "sent": 0,
+    "invalid": 0,
+    "found": 0,
+    "shares": {
+      "sent": 0,
+      "invalid": 0,
+      "found": 0
+    },
+    "solutions": {
+      "sent": 0,
+      "invalid": 0,
+      "found": 0
+    }
+  },
+  "submission": {
+    "pending": 0
+  },
+  "runnerVersions": {
+    "AVX2": "239.9"
+  },
+  "cpu": {
+    "version": "AVX2",
+    "loadedVersion": "239.9",
+    "threads": 1,
+    "hashrate": 1,
+    "running": true
+  }
+}
