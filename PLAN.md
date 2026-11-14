@@ -75,17 +75,19 @@ rigs that aren't yielding, and rotate out underperformers.
   is a restart of the miner inside the running rental — the rental stays up. A cheap rental that isn't
   yielding on one pool gets tried on the other before we release it. Payout
   mode (jetski solo vs PPLNS) is not a design driver for now.
-- **Rig runtime: our own Docker image on Clore, no HiveOS.** The user is on
-  the HiveOS free plan, which has no API access (Hiveon: "API Access will now
-  be limited to paid farms only"). Rather than pay for HiveOS, clorqub ships
-  its own small image (`clorqub-miner`) with an in-container agent, and
-  controls it over SSH. Miners are **not baked in**: like HiveOS, the agent
+- **Rig runtime: Clore's HiveOS Docker image, without running HiveOS.** The
+  user is on the HiveOS free plan, which has no API access (Hiveon: "API
+  Access will now be limited to paid farms only"). Rentals use
+  `cloreai/hiveos:0.4` (fast to start on Clore, likely cached on hosts) with
+  the order's `command` replaced by a clorqub bootstrap that fetches our
+  agent; the daemon controls the agent over SSH. No image of our own to
+  build or host. Miners are **not baked in**: like HiveOS, the agent
   downloads the pools' HiveOS custom-miner packages from their `latest`
   release URLs on the fly, because both projects release often and
-  third-party Docker images (e.g. qli's) fall behind. Benefits: no HiveOS API, worker cap or
-  bill; stats come straight from the miners' own files; boot, image pull and
-  trainer download times are measured directly. Lost: HiveOS dashboards and
-  GPU overclocking (not needed for v1).
+  third-party Docker images (e.g. qli's) fall behind. Benefits: no HiveOS
+  API, worker cap or bill; stats come straight from the miners' own files;
+  boot, pull and download times are measured directly. Lost: HiveOS
+  dashboards and GPU overclocking (not needed for v1).
 - **Log/stats parsing: reuse `~/qubjetski-Linux-v4.5/mining_optimizer.py`**,
   which already has proven parsers for both miners (see "Reuse" below).
 - **Hardware specs kept in SQLite for reference**: every server's listed CPU
@@ -193,6 +195,13 @@ Verified against the live Clore API (read-only calls) and docs.
   `appsettings.json` itself, and does its own timestamping and updates.
 - qli's config supports `Idling` pre/idle/post commands, so Qubic does have
   idle phases; the schedule is still to be confirmed.
+- **Both binaries run outside HiveOS** in a plain `ubuntu:24.04` container
+  (tested with no network and no credentials). `qubjetski-Client` is a
+  static Go binary; `qli-Client` needs only glibc + libstdc++ (present in
+  the base). jetski also has setup flags (`-wallet`, `-workername`, `-cpu`,
+  `-threads`, `-gpu`, `-gpu-version`, `-gpu-cards`, `-pplns`), but `-start`
+  reads `appsettings.json`, so the agent writes that file. GPU runtime needs
+  are untested (no GPU here).
 
 **Still open from Phase 0:** see "Open questions".
 
@@ -240,9 +249,11 @@ Python. Headless daemon + clients, SQLite (WAL mode) for state.
 ```text
 clorqub/
   config.toml          # max_rentals / burst settings, max_premium, budget cap,
-                       #   intervals, country_blocklist, thresholds, image tag
-  image/               # clorqub-miner Docker image (no miner binaries)
-    Dockerfile         #   two tags: cpu (small base) and cuda (NVIDIA)
+                       #   intervals, country_blocklist, thresholds, rig image,
+                       #   bootstrap (pinned agent commit + hashes)
+  rig/                 # runs inside rentals (fetched by the bootstrap)
+    bootstrap.sh       #   order `command`: fetch + verify agent, lock down
+                       #   image defaults, start sshd key-only, exec agent
     agent.py           #   in-container supervisor: fetch + verify packages,
                        #   start/stop/switch miner, update on new release,
                        #   write status.json, mirror .lock files, boot timeline
@@ -275,15 +286,61 @@ clorqub/
     tui.py             # Textual viewer (Phase 5)
 ```
 
-### Rig runtime: clorqub-miner image
+### Rig runtime: Clore's HiveOS image + bootstrap
 
-One small image, miners downloaded at start, one miner running at a time.
+No image of our own. Rentals use Clore's own **`cloreai/hiveos:0.4`** image
+(the HiveOS image pulls fast on Clore, most likely because hosts have it
+cached), and the order's `command` replaces its HiveOS startup with a small
+bootstrap that fetches our agent. Everything else — agent and miners — is
+downloaded at start, the same way HiveOS fetches custom miners.
 
-- **Contents:** `agent.py`, `qubic_parse.py`, `openssh-server`, `curl`,
-  `jq`, `tar`. **No miner binaries.** Two tags: `cpu` (small base, fast
-  pull) and `cuda` (NVIDIA runtime base, for GPU mining). `scorer.py` picks
-  the tag per server: `cpu` unless GPU mining is expected to pay for the
-  larger pull.
+- **What `cloreai/hiveos:0.4` contains** (inspected locally): 293 MB
+  compressed, 277k pulls. Ubuntu 24.04; CUDA 11.7 runtime + `cuda-compat-11-7`
+  + `libnvidia-compute-515`; HiveOS userland in `/hive`; python 3.12, jq,
+  curl, sshd, screen. Env already sets `NVIDIA_VISIBLE_DEVICES=all` and
+  `NVIDIA_DRIVER_CAPABILITIES=compute,utility`. Default `CMD` is
+  `/scripts/entrypoint.sh`, which writes `/hive-config/rig.conf` from
+  `rig_id` / `rig_pass` env vars and runs `hive`. Our `command` skips that,
+  so HiveOS never starts.
+- **Bootstrap** (the order's `command`, a short shell one-liner kept in
+  config):
+  1. download `agent.py` + `qubic_parse.py` from the clorqub GitHub repo at
+     a **pinned commit** (raw URLs);
+  2. verify their SHA-256 against values in the command itself;
+  3. lock down the image's defaults (see Security below), start `sshd`
+     key-only;
+  4. exec `agent.py`.
+
+  Updating the agent = new commit + new hashes in config; running rentals
+  keep their version until replaced.
+- **Security of the base image:** it has a `user` account with password `1`
+  and passwordless sudo. Before `sshd` starts, the bootstrap locks that
+  password (`passwd -l user`), sets `PasswordAuthentication no` and
+  `PermitRootLogin prohibit-password`, and installs only the clorqub public
+  key.
+- **GPU / CUDA:** qli requires **CUDA 12+ drivers (535+)** and its GPU
+  trainer is `CUDA12`; jetski downloads `JETSKI-TRAINER-GPU` /
+  `JETSKI-TRAINER-GPU-AMD` from `mirrordl.jetskipool.ai` at runtime.
+  - **Host drivers are fine:** every available Clore server reports
+    `cuda_version` 12.2–13.5 (1455 on 13.x, 190 on 12.x). A
+    `min_cuda_version` filter (default 12.0) still guards the score.
+  - **Risk:** the image's baked CUDA 11.7 runtime and
+    `libnvidia-compute-515` may shadow the host driver's libraries or fail
+    to satisfy a CUDA 12 trainer. GPU test rental checks: `nvidia-smi`
+    works, `ldd` on both downloaded GPU trainers, and a few minutes of GPU
+    it/s.
+  - If that fails: the agent sets `LD_LIBRARY_PATH` to prefer the
+    host-injected driver libraries, and if a trainer needs
+    `libcudart.so.12`, the agent downloads the CUDA 12 runtime libs at start
+    (cached per rental). Last resort: our own image (`FROM cloreai/hiveos:0.4`
+    + a CUDA 12 runtime layer) on GHCR.
+- **CPU-only rentals** don't touch CUDA, so they work on the image as is.
+- **Fallback image (only if needed):** if `command` can't override the
+  image's startup on Clore, or the CUDA issue can't be fixed at runtime,
+  build `ghcr.io/<github-user>/clorqub-miner` `FROM cloreai/hiveos:0.4`
+  with a tiny layer (agent + `CMD`). Hosts that cache the base then pull
+  only that layer. Pushing needs a GitHub token with `write:packages`
+  (`GHCR_TOKEN` in the env file).
 - **Miner packages, fetched on the fly** (URLs in config `packages`, one per
   pool; defaults are the three `latest` URLs in "Phase 0 findings"):
   1. At start, the agent downloads the active pool's package first, verifies
@@ -307,8 +364,9 @@ One small image, miners downloaded at start, one miner running at a time.
   pplns | solo` sets `pool.url` and `pps`. Default `pplns` (matches the local
   rig). The package URL used is the matching one, so the version stays in
   step with jetski's releases.
-- **Order:** `create_order` with `image=<registry>/clorqub-miner:<tag>`,
-  `ports={"22":"tcp"}`, `ssh_key=<clorqub public key>`, and `env` with only
+- **Order:** `create_order` with `image=cloreai/hiveos:0.4` (configurable),
+  `command=<bootstrap>`, `ports={"22":"tcp"}`,
+  `ssh_key=<clorqub public key>`, and `env` with only
   non-secret settings: `POOL=jetski|qli`, `ALIAS=clorqub-<server_id>-<order_id>`,
   `CPU_THREADS` (from `specs.cpus`, minus 1), `GPU=on|off`, `JETSKI_MODE`,
   and the package URLs.
@@ -337,9 +395,8 @@ One small image, miners downloaded at start, one miner running at a time.
 - **Control over SSH** (dedicated key pair at `~/.config/clorqub/id_ed25519`):
   `rig.py` reads `status.json`, copies `.lock` files, and runs
   `agent switch <pool>` to switch pools. No inbound API on the rig.
-- **Image registry:** Docker Hub or GHCR (public image; no secrets inside).
-  Image pull time counts against the 10-minute free window, so the `cpu` tag
-  is kept small.
+- **Pull time** counts against the 10-minute free window; the boot timeline
+  records it per rental, so hosts without the image cached show up.
 
 ### Process model
 
@@ -500,7 +557,8 @@ physical server does over time, across rentals.
 
 SQLite tables (besides the hardware reference above):
 
-- `rentals`: clore order id, `server_id`, image tag, start/end, price,
+- `rentals`: clore order id, `server_id`, rig image + agent commit,
+  start/end, price,
   creation fee, actual charges, spot/on-demand, `burst` flag, boot timeline
   (order created, running, SSH up, trainer downloaded, first it/s, first
   share), end reason (rotated, stalled, interrupted, budget, burst-unwind,
@@ -642,7 +700,7 @@ every N minutes:
      - up to max_rentals with the best candidates;
      - beyond that, up to max_rentals_burst only for high-value candidates;
      - never over the daily budget
-     -> create_order with the clorqub-miner image, POOL=jetski
+     -> create_order with cloreai/hiveos:0.4 + bootstrap command, POOL=jetski
   8. for rentals whose yield is well below expected on their current pool but
      whose price is still competitive: final snapshot, `agent switch` to the
      other pool (switch cap / min window), open a new pool_run
@@ -694,8 +752,10 @@ Clore rate limits (1 req/s, `create_order` 1 per 5 s) are enforced in
 - **Package integrity**: every miner package is verified against its
   published `.hash` before it runs; the version and SHA-256 are recorded per
   pool run.
-- **Image hygiene**: no miner binaries in the image; no secrets in the
-  image or in order env; the rig SSH key is dedicated to clorqub.
+- **Rig hygiene**: agent fetched at a pinned commit and hash-checked; the
+  base image's default password locked and SSH key-only before `sshd`
+  starts; no secrets in order env or `command`; the rig SSH key is dedicated
+  to clorqub.
 - Secrets (`CLORE_API_KEY`, `QLI_ACCESS_TOKEN`, later the Discord bot
   token) only in `~/.config/clorqub/env` (mode 600) / env vars, never in
   config, SQLite, logs, the image or Clore order env. The qli token reaches
@@ -705,9 +765,9 @@ Clore rate limits (1 req/s, `create_order` 1 per 5 s) are enforced in
 
 | Phase | Deliverable | Depends on |
 |-------|-------------|------------|
-| 0 | Done so far: Clore API auth/rate limits/endpoints, marketplace field meanings (cross-checked with web UI), price units, spot data, region/network data, HiveOS dropped, miner packages (URLs, `.hash` verification, config formats, jetski local API). **Remaining:** (1) Docker order specifics — `ssh_key` / `command` / max-duration fields, time from order to SSH, whether hosts allow mining in Docker orders; (2) creation-fee rule and actual-charge reporting, via one cheap test rental (with user approval); (3) both miners running outside HiveOS in a plain container, and a real jetski `/summary` response; (4) jetski and qubic.li per-worker stats and payout APIs; (5) QUBIC/USD price source; (6) Qubic idle-phase schedule | — |
+| 0 | Done so far: Clore API auth/rate limits/endpoints, marketplace field meanings (cross-checked with web UI), price units, spot data, region/network data, HiveOS dropped, miner packages (URLs, `.hash` verification, config formats, jetski local API). **Remaining:** (1) Docker order specifics — `ssh_key` / `command` / max-duration fields, time from order to SSH, whether hosts allow mining in Docker orders; (2) creation-fee rule and actual-charge reporting, via one cheap test rental (with user approval); (3) a real jetski `/summary` response and GPU runtime needs (both binaries already confirmed to run in plain `ubuntu:24.04`); (4) jetski and qubic.li per-worker stats and payout APIs; (5) QUBIC/USD price source; (6) Qubic idle-phase schedule | — |
 | 1 | Read-only scanner + scorer: marketplace -> `servers` / `server_specs` / `server_prices`; rank by QUBIC per dollar with premium ceiling and country filter, show effective cost per QUBIC vs market, print table. Seed `cpu_models` / `gpu_models` (it/s per thread / per card) from published benchmarks, the local rig, and/or a few short test rentals; seed QUBIC/share from current pool payouts | 0 |
-| 2 | `qubic_parse.py` (copied parsers for both miners + tests against real `stats.<epoch>.lock`/log samples) + `clorqub-miner` image (cpu + cuda tags, agent, both miners, `.lock` mirror) + SQLite schema incl. `commands`/`events` + collector + single-rental path: rent one server, early boot check, confirm shares — on each pool, with a switch between them that loses no data | 0 |
+| 2 | `qubic_parse.py` (copied parsers for both miners + tests against real `stats.<epoch>.lock`/log samples) + rig bootstrap + agent (package fetch/verify, both miners, `.lock` mirror; tested locally in `cloreai/hiveos:0.4`) + SQLite schema incl. `commands`/`events` + collector + single-rental path: rent one server, early boot check, confirm shares — on each pool, with a switch between them that loses no data | 0 |
 | 3 | Share summary windows (15m/1h/2h/4h/24h/epoch; fleet / worker / server, split by pool run) + per-server history + learned perf model + payouts + blacklist (manual + auto rules, `servers`/`server <id>`/`hardware` reports) | 2 |
 | 4 | Full loop: spend policy (2-rental limit, burst, premium ceiling, budget) + exploration + pool switching + rotation with hysteresis + watchdog | 1, 3 |
 | 5 | Textual TUI client (reads SQLite, sends `commands`) | 4 |
@@ -733,8 +793,14 @@ spending anything.
   API USD/day ÷ 24 — a fee we should include in cost?
 - Spot: how bids are won and lost (outbid behavior, minimum increment), and
   whether a spot rental that is outbid is paused or ended.
-- Miner packages run outside HiveOS: confirm both binaries run in a plain
-  container (any missing libraries, GPU runtime needs).
+- GPU on `cloreai/hiveos:0.4`: do the CUDA 12 trainers (qli `CUDA12`,
+  `JETSKI-TRAINER-GPU`) run with the image's baked CUDA 11.7 /
+  `libnvidia-compute-515`, or do those shadow the host driver? Check
+  `nvidia-smi`, `ldd` on the trainers, and real GPU it/s on a GPU test
+  rental.
+- Does the order's `command` override the image's `CMD` on Clore? Is the
+  web UI's HiveOS choice (CCR id `c9a4e2f6b7d488d8f0bab0ff`) the same image
+  as `cloreai/hiveos:0.4`, i.e. already cached on hosts? Measure pull time.
 - qli access token: can qubic.li issue more than one (a dedicated,
   revocable clorqub token)? Does it give per-worker stats by alias?
 - Does jetski expose per-worker stats and payout APIs? If not, rig stats +
@@ -742,8 +808,7 @@ spending anything.
 - Does qubic.li expose a per-worker stats API suitable for yield measurement?
 - QUBIC/USD price source (exchange or aggregator API); CLORE/USD comes from
   `spot_marketplace` `currency_rates_in_usd`.
-- GPU vs. CPU share yield on each pool: decides when the `cuda` image and GPU
-  mining are worth it.
+- GPU vs. CPU share yield on each pool: decides when GPU mining is worth it.
 - jetski `127.0.0.1:17899/summary`: capture a real response to fix the
   fields the agent reads (does it include share counts, or only versions and
   hashrate?).
