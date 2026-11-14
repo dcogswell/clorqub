@@ -9,16 +9,20 @@ switch via /clorqub/control.json. Stdlib only.
 """
 
 import argparse
+import fcntl
 import hashlib
 import json
 import os
+import pty
 import re
 import shutil
 import signal
+import struct
 import subprocess
 import sys
 import tarfile
 import tempfile
+import termios
 import threading
 import time
 import urllib.request
@@ -245,39 +249,125 @@ def write_status(status, secrets=()):
 # Miner process supervision
 # ---------------------------------------------------------------------------
 
+def _ensure_viewer(raw_log_path):
+    """Make stock `miner`/`miner log` work: a detached screen session
+    named `miner` tails the raw log, and /run/hive/miner.1 links to it.
+    Best-effort -- every failure is logged and ignored."""
+    try:
+        os.makedirs("/run/hive", exist_ok=True)
+        os.makedirs("/run/screen", exist_ok=True)
+        try:
+            os.chmod("/run/screen", 0o777)
+        except OSError:
+            pass
+        subprocess.run(["screen", "-S", "miner", "-X", "quit"],
+                       capture_output=True, timeout=10)
+        # tail lives in window 1 like stock HiveOS so `miner log`'s
+        # screen-running check (-p 1) and bare `miner` attach both work
+        subprocess.run(["screen", "-dmS", "miner"],
+                       capture_output=True, timeout=10)
+        subprocess.run(["screen", "-S", "miner", "-X", "screen", "1",
+                        "tail", "-n", "+1", "-F", raw_log_path],
+                       capture_output=True, timeout=10)
+        subprocess.run(["screen", "-S", "miner", "-p", "0", "-X",
+                        "stuff", "exit\n"],
+                       capture_output=True, timeout=10)
+        hive_log = "/run/hive/miner.1"
+        if os.path.lexists(hive_log):
+            os.remove(hive_log)
+        os.symlink(raw_log_path, hive_log)
+    except Exception as e:
+        log(f"miner viewer setup failed: {e}")
+
+
 class MinerProc:
-    """Runs the miner in its own process group; stdout+stderr are appended
-    to logs/<pool>.log with a UTC timestamp prefix, ANSI stripped."""
+    """Runs the miner in its own process group under a pty. The raw
+    (colorized) stream is appended to logs/<pool>.raw.log for the `miner`
+    screen viewer; the ANSI-stripped copy keeps going to logs/<pool>.log
+    with a UTC timestamp prefix. Falls back to plain pipes if no pty."""
 
     def __init__(self, pool, pkg_dir, binary, args):
         self.pool = pool
         self.pkg_dir = pkg_dir
         self.cmd = [os.path.join(pkg_dir, binary)] + args
         self.log_path = os.path.join(LOGS_DIR, f"{pool}.log")
+        self.raw_path = os.path.join(LOGS_DIR, f"{pool}.raw.log")
         self.proc = None
         self.started_at = None
 
     def start(self):
         os.makedirs(LOGS_DIR, exist_ok=True)
         logf = open(self.log_path, "ab", buffering=0)
-        self.proc = subprocess.Popen(
-            self.cmd, cwd=self.pkg_dir,
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            stdin=subprocess.DEVNULL,
-            start_new_session=True)
+        try:
+            master, slave = pty.openpty()
+        except OSError as e:
+            log(f"pty unavailable ({e}); piping miner output")
+            self.proc = subprocess.Popen(
+                self.cmd, cwd=self.pkg_dir,
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                stdin=subprocess.DEVNULL,
+                start_new_session=True)
+            pump, args = self._pump_pipe, (self.proc, logf)
+        else:
+            try:
+                fcntl.ioctl(slave, termios.TIOCSWINSZ,
+                            struct.pack("HHHH", 60, 200, 0, 0))
+            except OSError:
+                pass
+            rawf = open(self.raw_path, "ab", buffering=0)
+            try:
+                self.proc = subprocess.Popen(
+                    self.cmd, cwd=self.pkg_dir,
+                    stdin=slave, stdout=slave, stderr=slave,
+                    start_new_session=True)
+            except Exception:
+                os.close(master)
+                rawf.close()
+                logf.close()
+                raise
+            finally:
+                os.close(slave)
+            pump, args = self._pump_pty, (master, logf, rawf)
         self.started_at = utcnow()
-        threading.Thread(target=self._pump, args=(self.proc, logf),
-                         daemon=True).start()
-        log(f"started {self.pool} pid={self.proc.pid} cmd={' '.join(self.cmd)}")
+        threading.Thread(target=pump, args=args, daemon=True).start()
+        _ensure_viewer(self.raw_path)
+        log(f"started {self.pool} pid={self.proc.pid} "
+            f"cmd={' '.join(self.cmd)}")
 
     @staticmethod
-    def _pump(proc, logf):
+    def _stamp(logf, raw):
+        line = qp.ANSI_RE.sub(
+            "", raw.decode("utf-8", errors="replace").rstrip("\r"))
+        logf.write(f"{utcnow()} {line}\n".encode())
+
+    @staticmethod
+    def _pump_pty(master, logf, rawf):
+        buf = b""
+        try:
+            while True:
+                try:
+                    chunk = os.read(master, 4096)
+                except OSError:
+                    break  # EIO once the child exits (Linux)
+                if not chunk:
+                    break
+                rawf.write(chunk)
+                buf += chunk
+                while b"\n" in buf:
+                    raw, buf = buf.split(b"\n", 1)
+                    MinerProc._stamp(logf, raw)
+            if buf:
+                MinerProc._stamp(logf, buf)
+        finally:
+            os.close(master)
+            rawf.close()
+            logf.close()
+
+    @staticmethod
+    def _pump_pipe(proc, logf):
         try:
             for raw in proc.stdout:
-                line = qp.ANSI_RE.sub(
-                    "", raw.decode("utf-8", errors="replace").rstrip("\n"))
-                entry = f"{utcnow()} {line}\n".encode()
-                logf.write(entry)
+                MinerProc._stamp(logf, raw.rstrip(b"\n"))
         finally:
             logf.close()
 
@@ -285,6 +375,11 @@ class MinerProc:
         return self.proc is not None and self.proc.poll() is None
 
     def stop(self, grace=15):
+        try:
+            subprocess.run(["screen", "-S", "miner", "-X", "quit"],
+                           capture_output=True, timeout=10)
+        except Exception:
+            pass
         if self.proc is None:
             return
         try:
