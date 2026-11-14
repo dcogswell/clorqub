@@ -601,7 +601,14 @@ def cmd_run(_args):
     save_state(rig_state)
     state["boot_count"] = rig_state["boot_count"]
     state["pool_source"] = pool_source
-    alias = os.environ.get("ALIAS") or f"cq-{os.uname().nodename}"
+    alias = os.environ.get("ALIAS")
+    if not alias:
+        _animals = ("badger", "bear", "cobra", "crow", "eagle",
+                    "falcon", "fox", "heron", "koala", "lemur",
+                    "lynx", "otter", "owl", "puma", "raven", "seal",
+                    "sloth", "tiger", "viper", "wolf")
+        _h = hashlib.sha256(os.uname().nodename.encode()).digest()
+        alias = f"rig-{_animals[_h[0] % len(_animals)]}"
     threads = env_int("CPU_THREADS", max(1, (os.cpu_count() or 2) - 1))
     gpu = os.environ.get("GPU", "off") == "on"
     packages = {}  # pool -> pkg info dict
