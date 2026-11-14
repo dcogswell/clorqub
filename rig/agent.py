@@ -280,6 +280,15 @@ def _ensure_viewer(raw_log_path):
         log(f"miner viewer setup failed: {e}")
 
 
+def _viewer_alive():
+    try:
+        return subprocess.run(
+            ["screen", "-S", "miner", "-Q", "select", "."],
+            capture_output=True, timeout=10).returncode == 0
+    except Exception:
+        return False
+
+
 class MinerProc:
     """Runs the miner in its own process group under a pty. The raw
     (colorized) stream is appended to logs/<pool>.raw.log for the `miner`
@@ -769,6 +778,8 @@ def cmd_run(_args):
                 write_status(build_status(miner, pkg), secrets)
             except Exception as e:
                 log(f"status write failed: {e}")
+            if not _viewer_alive():
+                _ensure_viewer(miner.raw_path)
 
             ctrl = read_control()
             if ctrl and ctrl.get("switch_to") in ("jetski", "qli") \
