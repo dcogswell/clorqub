@@ -304,9 +304,12 @@ downloaded at start, the same way HiveOS fetches custom miners.
   so HiveOS never starts.
 - **Bootstrap** (the order's `command`, a short shell one-liner kept in
   config):
-  1. download `agent.py` + `qubic_parse.py` from the clorqub GitHub repo at
-     a **pinned commit** (raw URLs);
-  2. verify their SHA-256 against values in the command itself;
+  1. download `rig/bootstrap.sh` from the public repo
+     **`github.com/dcogswell/clorqub`** at a **pinned commit**
+     (`https://raw.githubusercontent.com/dcogswell/clorqub/<commit>/rig/...`)
+     and check it against the SHA-256 in the command;
+  2. the bootstrap fetches `agent.py` + `qubic_parse.py` from the same commit
+     and checks them against `rig/SHA256SUMS` at that commit;
   3. lock down the image's defaults (see Security below), start `sshd`
      key-only;
   4. exec `agent.py`.
@@ -337,7 +340,7 @@ downloaded at start, the same way HiveOS fetches custom miners.
 - **CPU-only rentals** don't touch CUDA, so they work on the image as is.
 - **Fallback image (only if needed):** if `command` can't override the
   image's startup on Clore, or the CUDA issue can't be fixed at runtime,
-  build `ghcr.io/<github-user>/clorqub-miner` `FROM cloreai/hiveos:0.4`
+  build `ghcr.io/dcogswell/clorqub-miner` `FROM cloreai/hiveos:0.4`
   with a tiny layer (agent + `CMD`). Hosts that cache the base then pull
   only that layer. Pushing needs a GitHub token with `write:packages`
   (`GHCR_TOKEN` in the env file).
