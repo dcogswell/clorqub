@@ -203,6 +203,51 @@ Verified against the live Clore API (read-only calls) and docs.
   reads `appsettings.json`, so the agent writes that file. GPU runtime needs
   are untested (no GPU here).
 
+**Test rental (2026-11-14, server 120113: Moldova, RTX 3060, Ryzen 9 3900
+5/10, spot $0.95/day USD-Blockchain, `cloreai/hiveos:0.4` + bootstrap at
+`ab5b84c5`):**
+
+- **Startup:** order 15:53:52 → bootstrap running 15:54:02 (**10 s**; the
+  image was cached on the host) → agent files hash-verified 15:54:04 →
+  credentials pushed over SSH 15:54:56 → jetski package verified in 2.8 s
+  → miner 15:55:00 → **first it/s 15:55:20**.
+- **Order rules found:**
+  - `env` must **not** set `NVIDIA_VISIBLE_DEVICES` /
+    `NVIDIA_DRIVER_CAPABILITIES`: such orders are refused with a bare
+    `{"code":1}` (HTTP 500). Clore and the image set these anyway.
+  - With a custom `command`, Clore's `ssh_key` field doesn't install the
+    key (SSH refused), so the bootstrap installs it from
+    `CLORQUB_SSH_PUBKEY`.
+  - Orders return `pub_cluster` (e.g. `n1.de.clorecloud.net`) and
+    `tcp_ports` (`"22:2009"` = container 22 → proxy port 2009).
+  - `my_orders` also shows the user's earlier manual HiveOS rentals with
+    `image: cloreai/hiveos:0.4`, so the web UI's HiveOS option is this
+    image.
+- **Billing (actual):** `spend` = seconds running × price/day ÷ 86400 ×
+  1.0125 (spot renter fee). A test order cancelled after 75 s cost $0.0008
+  (no creation fee → **cancel inside 10 min is free** except time). The
+  main order cost $0.0094 for 841 s. Paused time isn't billed.
+- **GPU works on the HiveOS image:** RTX 3060 at 100% util, ~100 W, host
+  driver 620.70. The GPU trainers have no CUDA library dependencies, so
+  the image's baked CUDA 11.7 doesn't matter. No CUDA workaround needed.
+- **Hashrate:** jetski GPU **84–85 it/s**; jetski CPU (9 threads AVX2)
+  **1–4 it/s**, so the GPU produces nearly all the it/s on a rig like this.
+  qli GPU **41 it/s 2 min after start, still rising** (order paused before
+  it settled; qli CPU not measured).
+- **Pool switch:** jetski → qli in **3 s** (package prefetched in the
+  background).
+- **Spot outbid:** after ~14 min another bid took the server. The order
+  became **`paused: true`** (`offers[].active: false`), the container
+  stopped, SSH went away, billing stopped. The daemon must treat `paused`
+  as an interruption (rebid, wait, or cancel and replace), and the agent
+  state (`state.json`) must survive the resume.
+- **Log format:** jetski logs one line with both rates
+  (`[AVX2] 1 it/s | [CUDA] 84 it/s | 78 avg it/s`); qli logs separate
+  `[AVX2]` and `[CUDA]` lines. The agent v1 parser read only the first rate
+  (status showed `it: 1`); fix to record per-device rates.
+- **Pool dashboard:** the worker showed up on the jetski dashboard under
+  its alias, so the wallet/alias delivered over SSH work.
+
 **Still open from Phase 0:** see "Open questions".
 
 ## Reuse from mining_optimizer.py
@@ -327,19 +372,16 @@ downloaded at start, the same way HiveOS fetches custom miners.
   - **Host drivers are fine:** every available Clore server reports
     `cuda_version` 12.2–13.5 (1455 on 13.x, 190 on 12.x). A
     `min_cuda_version` filter (default 12.0) still guards the score.
-  - **Risk:** the image's baked CUDA 11.7 runtime and
-    `libnvidia-compute-515` may shadow the host driver's libraries or fail
-    to satisfy a CUDA 12 trainer. GPU test rental checks: `nvidia-smi`
-    works, `ldd` on both downloaded GPU trainers, and a few minutes of GPU
-    it/s.
-  - If that fails: the agent sets `LD_LIBRARY_PATH` to prefer the
-    host-injected driver libraries, and if a trainer needs
-    `libcudart.so.12`, the agent downloads the CUDA 12 runtime libs at start
-    (cached per rental). Last resort: our own image (`FROM cloreai/hiveos:0.4`
-    + a CUDA 12 runtime layer) on GHCR.
+  - **Verified on the test rental:** GPU mining works on the image as is
+    (RTX 3060, host driver 620.70, jetski GPU 84–85 it/s, qli GPU 41+ it/s
+    while ramping). The GPU trainers have no CUDA library dependencies, so
+    the image's baked CUDA 11.7 / `libnvidia-compute-515` don't matter.
+  - Do **not** pass `NVIDIA_VISIBLE_DEVICES` / `NVIDIA_DRIVER_CAPABILITIES`
+    in order `env`: Clore refuses the order (`code 1`); the image already
+    sets them.
 - **CPU-only rentals** don't touch CUDA, so they work on the image as is.
-- **Fallback image (only if needed):** if `command` can't override the
-  image's startup on Clore, or the CUDA issue can't be fixed at runtime,
+- **Fallback image (not needed so far):** `command` does override the
+  image's startup and GPU works, so this is only for future problems:
   build `ghcr.io/dcogswell/clorqub-miner` `FROM cloreai/hiveos:0.4`
   with a tiny layer (agent + `CMD`). Hosts that cache the base then pull
   only that layer. Pushing needs a GitHub token with `write:packages`
@@ -370,7 +412,9 @@ downloaded at start, the same way HiveOS fetches custom miners.
 - **Order:** `create_order` with `image=cloreai/hiveos:0.4` (configurable),
   `command=<bootstrap>`, `ports={"22":"tcp"}`,
   `ssh_key=<clorqub public key>`, and `env` with only
-  non-secret settings: `POOL=jetski|qli`, `ALIAS=clorqub-<server_id>-<order_id>`,
+  non-secret settings: `POOL=jetski|qli`, `ALIAS=cq-<server_id>-<order_id>`
+  (short `cq-` prefix: aliases are visible on pool dashboards, so they don't
+  name the project),
   `CPU_THREADS` (from `specs.cpus`, minus 1), `GPU=on|off`, `JETSKI_MODE`,
   and the package URLs.
 - **Credentials are pushed over SSH, not put in the order.** Order env is
@@ -446,12 +490,19 @@ Clients:
 
 - **Prices:** the API's `price.usd.on_demand_usd` is **USD per day**. Spot
   bids are per-currency (`spot_marketplace` gives `min_pricing` and competing
-  `offers`). Lowering a spot bid is limited to once per 600 s.
-- **Creation fee:** Clore charges a creation fee once a rental passes 10
-  minutes: **$0.01 for spot, $0.10 for on-demand**. A rental cancelled inside
-  the first 10 minutes is free (confirm the exact rule in Phase 0). Assumed
-  not charged again when a spot rental is outbid and re-won. The fees are in
-  config (`creation_fee_spot`, `creation_fee_on_demand`), not hardcoded.
+  `offers`); `spotprice` in `create_order` is per day in the order's
+  currency. A new bid must be ≥1% above the top bid (`below_min_raise_step`
+  returns the lowest accepted price); a bid below the floor returns
+  `too_low_price` with `min_price`. Lowering a spot bid is limited to once
+  per 600 s.
+- **Renter fee** on top of the price, from `GET renter_fees`: **5%
+  on-demand, 1.25% spot** (base; the account's `extra` is 0). The web UI's
+  $/h = API $/day ÷ 24 × (1 + fee) — checked on 5 servers. So
+  `cost_usd_per_hour = price_per_day / 24 × (1 + renter_fee)`.
+- **Creation fee**, also from `renter_fees` (USD-Blockchain): **$0.005 spot,
+  $0.10 on-demand**. Charged only if the order runs past 10 minutes: the
+  test order cancelled at 75 s was billed for time only. Read the fees live
+  from `renter_fees` rather than hardcoding them.
   - These are small next to hourly prices, so the fee matters mostly for
     churn: a few cents per swap. The bigger cost of replacing a rig is the
     unpaid image pull, boot and trainer-download time.
@@ -622,7 +673,7 @@ Share counts for **15m / 1h / 2h / 4h / 24h / epoch** (windows in config
 
 - **fleet**: all active rentals, plus total $/h, QUBIC/h, QUBIC per dollar and
   effective cost per QUBIC vs market price per window, split by pool;
-- **per worker**: one row per worker alias (`clorqub-<server>-<order>`), with
+- **per worker**: one row per worker alias (`cq-<server>-<order>`), with
   rental id, `server_id`, current pool, burst flag, hardware, it/s, uptime
   and $/h alongside the windows. Also includes workers clorqub didn't rent
   (e.g. your local rig) if a pool API reports them, marked as unmanaged;
@@ -790,20 +841,15 @@ spending anything.
   10 minutes.
 - Do hosts allow mining in Docker rentals (ToS or per-host flags), or only via
   the HiveOS image?
-- Exact creation-fee rule ($0.01 spot / $0.10 on-demand): is the fee waived
-  only if the order is cancelled before 10 minutes, and is the 10 minutes from
-  order creation or from the server starting? Why is the web price ~2–7% above
-  API USD/day ÷ 24 — a fee we should include in cost?
-- Spot: how bids are won and lost (outbid behavior, minimum increment), and
-  whether a spot rental that is outbid is paused or ended.
-- GPU on `cloreai/hiveos:0.4`: do the CUDA 12 trainers (qli `CUDA12`,
-  `JETSKI-TRAINER-GPU`) run with the image's baked CUDA 11.7 /
-  `libnvidia-compute-515`, or do those shadow the host driver? Check
-  `nvidia-smi`, `ldd` on the trainers, and real GPU it/s on a GPU test
-  rental.
-- Does the order's `command` override the image's `CMD` on Clore? Is the
-  web UI's HiveOS choice (CCR id `c9a4e2f6b7d488d8f0bab0ff`) the same image
-  as `cloreai/hiveos:0.4`, i.e. already cached on hosts? Measure pull time.
+- Spot after an outbid: does a `paused` order resume on its own when the
+  outbidding rental ends, and is the container's filesystem (agent
+  `state.json`, packages) kept? When should the daemon rebid (≥1% above
+  the top bid) vs cancel and rent elsewhere?
+- qli settled it/s on GPU and CPU (the test order was outbid while qli was
+  still ramping).
+- How often spot rentals get outbid at the minimum bid, per server/GPU
+  class, and whether on-demand is worth its 5% fee + $0.10 creation fee
+  for stability.
 - qli access token: can qubic.li issue more than one (a dedicated,
   revocable clorqub token)? Does it give per-worker stats by alias?
 - Does jetski expose per-worker stats and payout APIs? If not, rig stats +
