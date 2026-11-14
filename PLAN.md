@@ -6,8 +6,12 @@ Maximize Qubic mining shares per dollar of Clore.ai rental spend, mining to the
 **jetski pool**.
 
 ```text
-score(server) = expected_shares_per_hour(hardware) / price_usd_per_hour
+score(server) = expected_shares_per_hour(server) / price_usd_per_hour
 ```
+
+`expected_shares_per_hour(server)` is that Clore server's own measured history
+when there is enough of it, otherwise the hardware-model prior (see "Per-server
+tracking").
 
 Poll the marketplace, rank by score, rent the best rigs within budget, boot
 them on HiveOS with a jetski flight sheet, measure actual shares, and rotate
@@ -79,16 +83,54 @@ clorqub/
   clorqub/
     qubic_parse.py     # shared parsers (extracted from mining_optimizer.py)
     market.py          # Clore marketplace polling (CPU + GPU specs, price)
-    perf.py            # shares/hr model keyed by (cpu model, gpu model, trainer ver)
+    perf.py            # shares/hr: per-server history blended with hardware prior
+                       #   (cpu model, gpu model, trainer ver)
     scorer.py          # shares-per-cent ranking
     rentals.py         # Clore order lifecycle: rent, extend, release
     hive.py            # HiveOS API: find worker, assign flight sheet, read stats
     stats.py           # measured shares: HiveOS API, pool, rig stats files
     rotate.py          # drop/replace logic (adaptive stall + score threshold)
-    store.py           # SQLite: rentals, measurements, spend, decisions log
+    store.py           # SQLite: servers, rentals, measurements, blacklist,
+                       #   spend, decisions log
     daemon.py          # main loop
-    cli.py             # status / report / dry-run / pause / set-budget
+    cli.py             # status / report / dry-run / pause / set-budget /
+                       #   servers / server <id> / blacklist add|rm|list
 ```
+
+### Per-server tracking and blacklist
+
+Every rental is keyed by its **Clore server id**, so we can see how each
+physical server does over time, across rentals.
+
+SQLite tables:
+
+- `servers`: clore `server_id` (plus host/owner id if Clore exposes one),
+  hardware specs as listed, first/last seen, price history.
+- `rentals`: clore order id, `server_id`, HiveOS worker id, start/end, price,
+  spot/on-demand, end reason (rotated, stalled, interrupted, budget, manual).
+- `measurements`: `rental_id`, `server_id`, timestamp, epoch, trainer version,
+  it/s, found/submitted/invalid shares (cumulative per epoch, as in
+  `stats.<epoch>.lock`).
+- `blacklist`: `server_id` (or host id), reason, source (auto/manual), added
+  at, optional expiry.
+
+Use:
+
+- **Scoring**: blacklisted servers are dropped before ranking. For other
+  servers, blend that server's measured shares/hr with the hardware prior,
+  weighted by how much rented time we have on it. A known-good server can then
+  beat an untested one with the same specs, and the reverse.
+- **Auto-blacklist** (thresholds in config, every trigger logged with its data):
+  - measured shares/hr < X% of the hardware prior over >= N hours of rentals;
+  - never joined HiveOS or never produced a share within the boot grace period;
+  - repeated stalls (the adaptive stall detector) or spot interruptions;
+  - invalid/rejected share ratio above a threshold;
+  - listed specs don't match what the rig reports (CPU/GPU model, thread count).
+  Auto entries expire after a configurable period so a fixed server can come
+  back. Manual entries never expire.
+- **Reports**: `cli.py server <id>` gives a server's rental history, shares/hr
+  over time, cost per share and incidents. `cli.py servers` ranks every server
+  we've rented by lifetime shares-per-cent.
 
 ### Share data sources (in order of preference)
 
@@ -103,13 +145,15 @@ clorqub/
 
 ```text
 every N minutes:
-  1. snapshot marketplace (cpu/gpu specs, price/hr, availability)
+  1. snapshot marketplace (server_id, cpu/gpu specs, price/hr, availability);
+     drop blacklisted servers
   2. for each active rental: pull share stats, update perf model
   3. score all available servers
   4. rent top-scoring servers while under budget cap
      -> wait for HiveOS worker to appear -> assign jetski flight sheet
   5. release rentals whose measured score < threshold * market best, or that
-     tripped the adaptive stall detector after the warm-up grace period
+     tripped the adaptive stall detector after the warm-up grace period;
+     evaluate auto-blacklist rules for the released server
   6. log every decision with its inputs (scores, prices) to SQLite
 ```
 
@@ -135,7 +179,7 @@ every N minutes:
 | 0.5 | Extract `qubic_parse.py` from mining_optimizer.py, keep the TUI working on it | — |
 | 1 | Read-only scanner + scorer: rank marketplace by shares-per-cent, print table (seed perf table: it/s per CPU/GPU model) | 0 |
 | 2 | HiveOS custom miner package + single-rental path: rent one server, it joins farm, assign flight sheet, confirm shares | 0, 0.5 |
-| 3 | Stats collection + learned perf model (measured shares/hr per hardware) | 2 |
+| 3 | Stats collection + per-server history + learned perf model + blacklist (manual + auto rules, `servers`/`server <id>` reports) | 2 |
 | 4 | Full loop: budget-capped auto-rent + rotation | 1, 3 |
 | 5 | Optional: read-only web dashboard (FastAPI + single HTML page reading SQLite, localhost only); or a remote-rigs pane in the existing TUI | 4 |
 
@@ -143,6 +187,9 @@ Phase 1 is usable standalone — it answers "which Clore rig gives the most
 shares per cent right now" without spending anything.
 
 ## Open questions to resolve in Phase 0
+
+- Is the Clore server id stable across listings and re-listings? Does the
+  marketplace expose an owner/host id, so a whole host can be blacklisted?
 
 - Exact `clore-ai` order API (create/cancel/extend, min durations, deposit
   rules) and how the HiveOS image gets the farm hash / rig credentials.
