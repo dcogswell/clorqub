@@ -45,8 +45,9 @@ out underperformers.
 
 ## Reuse from mining_optimizer.py
 
-Move the pure, stdlib-only functions into a shared module (`qubic_parse.py`)
-that both the TUI and clorqub import, instead of copying them:
+`mining_optimizer.py` is **not modified**. The pure, stdlib-only functions
+clorqub needs are copied into `clorqub/qubic_parse.py`, with a header comment
+naming the source file so later fixes can be ported by hand:
 
 - `STATUS_RE` / `SHARES_ONLY_RE`: log line
   `E:<n> | SHARES: a/b (R:r) | [AVX2] X it/s | Y avg it/s`, with the
@@ -81,7 +82,7 @@ clorqub/
     h-run.sh           #   exec qubjetski-Client -start -pplns
     h-stats.sh         #   parse log/stats -> khs, ar[acc,rej], uptime JSON
   clorqub/
-    qubic_parse.py     # shared parsers (extracted from mining_optimizer.py)
+    qubic_parse.py     # parsers copied from mining_optimizer.py (original untouched)
     market.py          # Clore marketplace polling (CPU + GPU specs, price)
     perf.py            # shares/hr: per-server history blended with hardware prior
                        #   (cpu model, gpu model, trainer ver)
@@ -203,9 +204,8 @@ every N minutes:
 | Phase | Deliverable | Depends on |
 |-------|-------------|------------|
 | 0 | Verify: clore-ai order API + HiveOS-image params; HiveOS API v2 (worker auto-registration, flight sheet assign, stats fields, rate limits); qubjetski as HiveOS custom miner; jetski pool API | — |
-| 0.5 | Extract `qubic_parse.py` from mining_optimizer.py, keep the TUI working on it | — |
 | 1 | Read-only scanner + scorer: rank marketplace by shares-per-cent, print table (seed perf table: it/s per CPU/GPU model) | 0 |
-| 2 | HiveOS custom miner package + single-rental path: rent one server, it joins farm, assign flight sheet, confirm shares | 0, 0.5 |
+| 2 | `qubic_parse.py` (copied parsers + tests against real `stats.<epoch>.lock`/log samples) + HiveOS custom miner package + single-rental path: rent one server, it joins farm, assign flight sheet, confirm shares | 0 |
 | 3 | Stats collection + share summary windows (15m/1h/2h/4h/24h/epoch; fleet / worker / server) + per-server history + learned perf model + blacklist (manual + auto rules, `servers`/`server <id>` reports) | 2 |
 | 4 | Full loop: budget-capped auto-rent + rotation | 1, 3 |
 | 5 | Optional: read-only web dashboard (FastAPI + single HTML page reading SQLite, localhost only); or a remote-rigs pane in the existing TUI | 4 |
