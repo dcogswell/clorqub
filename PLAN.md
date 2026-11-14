@@ -70,16 +70,19 @@ rigs that aren't yielding, and rotate out underperformers.
 - **Rental limit: 2 concurrent**, extendable only for high-value rentals.
 - **Pools: jetski (primary) + qli/qubic.li (secondary), switchable per rig on
   yield.** jetski: `qubjetski-Client`, `wss://pplns.jtskxpool.ai/ws/`. qli:
-  `qli-Client` against the qubic.li pool, always PPS. Both clients are in the
-  same container image, so switching pools is a restart of the miner inside
-  the running rental — the rental stays up. A cheap rental that isn't
+  `qli-Client` against the qubic.li pool, always PPS. The agent downloads both
+  miner packages at container start (see "Rig runtime"), so switching pools
+  is a restart of the miner inside the running rental — the rental stays up. A cheap rental that isn't
   yielding on one pool gets tried on the other before we release it. Payout
   mode (jetski solo vs PPLNS) is not a design driver for now.
 - **Rig runtime: our own Docker image on Clore, no HiveOS.** The user is on
   the HiveOS free plan, which has no API access (Hiveon: "API Access will now
   be limited to paid farms only"). Rather than pay for HiveOS, clorqub ships
-  its own image (`clorqub-miner`) with both miners and a small in-container
-  agent, and controls it over SSH. Benefits: no HiveOS API, worker cap or
+  its own small image (`clorqub-miner`) with an in-container agent, and
+  controls it over SSH. Miners are **not baked in**: like HiveOS, the agent
+  downloads the pools' HiveOS custom-miner packages from their `latest`
+  release URLs on the fly, because both projects release often and
+  third-party Docker images (e.g. qli's) fall behind. Benefits: no HiveOS API, worker cap or
   bill; stats come straight from the miners' own files; boot, image pull and
   trainer download times are measured directly. Lost: HiveOS dashboards and
   GPU overclocking (not needed for v1).
@@ -152,12 +155,42 @@ Verified against the live Clore API (read-only calls) and docs.
 
 **HiveOS** — dropped (free plan has no API; see Decisions).
 
-**qli** — official Docker images exist: `qubicli/client:latest` (CPU) and
-`qubicli/client:cuda` (CPU + NVIDIA). Registerless pool mining via env:
-`ClientSettings__QubicAddress`, `ClientSettings__Alias`,
-`ClientSettings__Trainer__CpuThreads`. Latest release v3.13.6.0; Linux x64
-tarball 7.7 MB (runners download at runtime). Third-party images are ~2 GB
-(CUDA), so image size matters for boot time.
+**Miner packages** (HiveOS custom-miner tarballs, downloaded and inspected):
+
+| Pool | URL (`latest`) | Size | Version | Binary |
+|---|---|---|---|---|
+| qli | `https://github.com/qubic-li/hiveos/releases/download/latest/qubminer-latest.tar.gz` | 8.1 MB | 3.13.6 | `qubminer/qli-Client` |
+| jetski solo | `https://github.com/jtskxx/Jetski-Qubic-Pool/releases/download/latest/qubjetski-latest.tar.gz` | 6.5 MB | 4.5 | `qubjetski/qubjetski-Client` |
+| jetski PPLNS | `https://github.com/jtskxx/Jetski-Qubic-Pool/releases/download/latest/qubjetski.PPLNS-latest.tar.gz` | 6.5 MB | 4.5 | `qubjetski.PPLNS/qubjetski-Client` |
+
+- Each tarball has a sibling **`.hash`** (same URL, `.hash` instead of
+  `.tar.gz`) holding its SHA-256; all three matched the downloads. The
+  agent verifies every download against it, and uses it to detect a new
+  release.
+- Downloads took ~2 s each from here, so on a good host the miner is ready
+  within seconds; slow hosts show up directly in the boot timeline.
+- **The two jetski packages ship the identical binary.** They differ only in
+  `appsettings_global.json`: solo = `wss://solo.jtskxpool.ai/ws`,
+  `"pps": false`; PPLNS = `wss://pplns.jtskxpool.ai/ws`, `"pps": true` (the
+  local rig uses the PPLNS settings). So jetski solo vs PPLNS is a config
+  choice, not a separate miner.
+- jetski config (`appsettings.json`): `pool.url/wallet/alias/pps`,
+  `miner.cpu.enabled/version/threads`, `miner.gpu.enabled/version/cards`,
+  `api.bind 127.0.0.1:17899`. Its `h-stats.sh` reads
+  **`http://127.0.0.1:17899/summary`** (JSON: mode, epoch, cpu/gpu runner
+  versions, per-GPU stats), so the agent can use that instead of log
+  parsing for jetski.
+- qli config (`appsettings.json` under `ClientSettings`): `poolAddress`
+  (`wss://wps.qubic.li/ws`), `alias`, `accessToken` or `qubicAddress`,
+  `trainer.cpuThreads`, `trainer.cpu/gpu`, optional `Idling` commands.
+  Stats come from the log (`h-stats.sh` parses it). qli-Client downloads its
+  trainer runners at runtime.
+- Packages' `h-run.sh` need `ts` (moreutils) and jetski's `h-config.sh`
+  self-updates via the hash; both assume HiveOS paths (`/hive/...`). The
+  agent doesn't run the `h-*` scripts: it extracts the binary, writes
+  `appsettings.json` itself, and does its own timestamping and updates.
+- qli's config supports `Idling` pre/idle/post commands, so Qubic does have
+  idle phases; the schedule is still to be confirmed.
 
 **Still open from Phase 0:** see "Open questions".
 
@@ -206,11 +239,12 @@ Python. Headless daemon + clients, SQLite (WAL mode) for state.
 clorqub/
   config.toml          # max_rentals / burst settings, max_premium, budget cap,
                        #   intervals, country_blocklist, thresholds, image tag
-  image/               # clorqub-miner Docker image
+  image/               # clorqub-miner Docker image (no miner binaries)
     Dockerfile         #   two tags: cpu (small base) and cuda (NVIDIA)
-    agent.py           #   in-container supervisor: start/stop/switch miner,
+    agent.py           #   in-container supervisor: fetch + verify packages,
+                       #   start/stop/switch miner, update on new release,
                        #   write status.json, mirror .lock files, boot timeline
-    render_config.py   #   appsettings.json for jetski / qli from env
+    render_config.py   #   appsettings.json for jetski (solo/pplns) / qli from env
   clorqub/
     qubic_parse.py     # parsers copied from mining_optimizer.py (original untouched)
     market.py          # Clore marketplace polling (specs, country, price)
@@ -241,22 +275,48 @@ clorqub/
 
 ### Rig runtime: clorqub-miner image
 
-One image, both miners, one running at a time.
+One small image, miners downloaded at start, one miner running at a time.
 
-- **Contents:** `qubjetski-Client` and `qli-Client` binaries (pinned
-  versions, checksums verified at build), `agent.py`, `qubic_parse.py`,
-  `openssh-server`. Two tags: `cpu` (small base, fast pull) and `cuda`
-  (NVIDIA runtime base, for GPU mining). `scorer.py` picks the tag per
-  server: `cpu` unless GPU mining is expected to pay for the larger pull.
+- **Contents:** `agent.py`, `qubic_parse.py`, `openssh-server`, `curl`,
+  `jq`, `tar`. **No miner binaries.** Two tags: `cpu` (small base, fast
+  pull) and `cuda` (NVIDIA runtime base, for GPU mining). `scorer.py` picks
+  the tag per server: `cpu` unless GPU mining is expected to pay for the
+  larger pull.
+- **Miner packages, fetched on the fly** (URLs in config `packages`, one per
+  pool; defaults are the three `latest` URLs in "Phase 0 findings"):
+  1. At start, the agent downloads the active pool's package first, verifies
+     its SHA-256 against the `.hash` URL, extracts it, writes
+     `appsettings.json`, and starts the miner. It then downloads the other
+     pool's package in the background, so a later switch doesn't wait for a
+     download.
+  2. Every download records URL, version (`CUSTOM_VERSION` from
+     `h-manifest.conf`), SHA-256, size and download time in `status.json`.
+     The daemon stores them per pool run, so a new release isn't mistaken
+     for a rig getting faster or slower.
+  3. **Updates:** the agent checks the `.hash` URL every
+     `package_check_interval` (config, default 1h). If a new release appears,
+     it downloads and verifies it, then restarts the miner on it at the next
+     safe point (not inside a measurement the daemon has flagged as in
+     progress). `auto_update` can be turned off in config to hold a version
+     for a while.
+  4. A hash mismatch or failed download is retried, then reported; it never
+     runs an unverified binary.
+- **jetski solo vs PPLNS** is config only (same binary): `jetski_mode =
+  pplns | solo` sets `pool.url` and `pps`. Default `pplns` (matches the local
+  rig). The package URL used is the matching one, so the version stays in
+  step with jetski's releases.
 - **Order:** `create_order` with `image=<registry>/clorqub-miner:<tag>`,
   `ports={"22":"tcp"}`, `ssh_key=<clorqub public key>`, and `env`:
   `POOL=jetski|qli`, `QUBIC_WALLET`, `ALIAS=clorqub-<server_id>-<order_id>`,
-  `CPU_THREADS` (from `specs.cpus`, minus 1), `GPU=on|off`. The wallet is a
-  public address, so passing it in env is fine; no secret goes into env.
+  `CPU_THREADS` (from `specs.cpus`, minus 1), `GPU=on|off`, `JETSKI_MODE`,
+  and the package URLs. The wallet is a public address, so passing it in env
+  is fine; no secret goes into env.
 - **Agent:** supervises the active miner, restarts it on crash, and writes
-  `/clorqub/status.json` every few seconds: pool, miner pid/uptime, it/s,
-  shares (log + `.lock`), trainer version, epoch, and a **boot timeline**
-  (container start, trainer download start/end, first it/s, first share).
+  `/clorqub/status.json` every few seconds: pool, package version + SHA-256,
+  miner pid/uptime, it/s, shares (log + `.lock`), trainer version, epoch,
+  and a **boot timeline** (container start, package download start/end,
+  trainer runner download start/end, first it/s, first share). For jetski it
+  reads `127.0.0.1:17899/summary`; for qli it parses the log.
   It also reports actual hardware (`nproc`, `/proc/cpuinfo` model,
   `nvidia-smi` GPU list) and mirrors `.lock` files for both miners.
 - **Control over SSH** (dedicated key pair at `~/.config/clorqub/id_ed25519`):
@@ -430,9 +490,13 @@ SQLite tables (besides the hardware reference above):
   (order created, running, SSH up, trainer downloaded, first it/s, first
   share), end reason (rotated, stalled, interrupted, budget, burst-unwind,
   early-check failed, manual).
-- `pool_runs`: one row per (rental, pool) stretch: start/end, why it started
-  (initial, switch) and ended. Every switch closes one run and opens the
-  next, so per-pool yield is attributable.
+- `pool_runs`: one row per (rental, pool, package version) stretch:
+  start/end, jetski mode, package URL + version + SHA-256, why it started
+  (initial, switch, package update) and ended. Every switch or miner update
+  closes one run and opens the next, so yield is attributable to a pool and
+  a release.
+- `packages`: every package release seen (pool, version, SHA-256, size,
+  first seen), so `cli.py report` can compare it/s across releases.
 - `snapshots`: raw collector snapshots (see "Local stats capture").
 - `measurements`: `rental_id`, `server_id`, `pool_run_id`, `pool`, timestamp,
   epoch, trainer version, it/s, found/submitted/invalid shares, derived from
@@ -515,7 +579,8 @@ All sources are captured into local SQLite by `collector.py`.
 ### Pool switching
 
 jetski stays the default pool a new rental boots onto; qli is the alternate.
-Both clients are in the image, so a switch is `ssh <rig> agent switch <pool>`
+Both packages are on the rig (the second one is fetched in the background at
+start), so a switch is `ssh <rig> agent switch <pool>`
 — the agent stops one miner and starts the other; no rental churn.
 
 Rules (per rig, on yield):
@@ -611,7 +676,10 @@ Clore rate limits (1 req/s, `create_order` 1 per 5 s) are enforced in
   rental limit, dry-run, actor allowlist); spend-increasing commands need
   confirmation.
 - **Decision log**: every action + rationale persisted, so behavior is auditable.
-- **Image hygiene**: pinned miner versions with checksums; no secrets in the
+- **Package integrity**: every miner package is verified against its
+  published `.hash` before it runs; the version and SHA-256 are recorded per
+  pool run.
+- **Image hygiene**: no miner binaries in the image; no secrets in the
   image or in order env; the rig SSH key is dedicated to clorqub.
 - Secrets (`CLORE_API_KEY`, later the Discord bot token) only in
   `~/.config/clorqub/env` (mode 600) / env vars, never in config, SQLite, logs
@@ -621,7 +689,7 @@ Clore rate limits (1 req/s, `create_order` 1 per 5 s) are enforced in
 
 | Phase | Deliverable | Depends on |
 |-------|-------------|------------|
-| 0 | Done so far: Clore API auth/rate limits/endpoints, marketplace field meanings (cross-checked with web UI), price units, spot data, region/network data, HiveOS dropped. **Remaining:** (1) Docker order specifics — `ssh_key` / `command` / max-duration fields, time from order to SSH, whether hosts allow mining in Docker orders; (2) creation-fee rule and actual-charge reporting, via one cheap test rental (with user approval); (3) jetski client distribution for the image (download URL / license) and its env/CLI config; (4) jetski and qubic.li per-worker stats and payout APIs; (5) QUBIC/USD price source; (6) Qubic idle periods | — |
+| 0 | Done so far: Clore API auth/rate limits/endpoints, marketplace field meanings (cross-checked with web UI), price units, spot data, region/network data, HiveOS dropped, miner packages (URLs, `.hash` verification, config formats, jetski local API). **Remaining:** (1) Docker order specifics — `ssh_key` / `command` / max-duration fields, time from order to SSH, whether hosts allow mining in Docker orders; (2) creation-fee rule and actual-charge reporting, via one cheap test rental (with user approval); (3) both miners running outside HiveOS in a plain container, and a real jetski `/summary` response; (4) jetski and qubic.li per-worker stats and payout APIs; (5) QUBIC/USD price source; (6) Qubic idle-phase schedule | — |
 | 1 | Read-only scanner + scorer: marketplace -> `servers` / `server_specs` / `server_prices`; rank by QUBIC per dollar with premium ceiling and country filter, show effective cost per QUBIC vs market, print table. Seed `cpu_models` / `gpu_models` (it/s per thread / per card) from published benchmarks, the local rig, and/or a few short test rentals; seed QUBIC/share from current pool payouts | 0 |
 | 2 | `qubic_parse.py` (copied parsers for both miners + tests against real `stats.<epoch>.lock`/log samples) + `clorqub-miner` image (cpu + cuda tags, agent, both miners, `.lock` mirror) + SQLite schema incl. `commands`/`events` + collector + single-rental path: rent one server, early boot check, confirm shares — on each pool, with a switch between them that loses no data | 0 |
 | 3 | Share summary windows (15m/1h/2h/4h/24h/epoch; fleet / worker / server, split by pool run) + per-server history + learned perf model + payouts + blacklist (manual + auto rules, `servers`/`server <id>`/`hardware` reports) | 2 |
@@ -649,9 +717,9 @@ spending anything.
   API USD/day ÷ 24 — a fee we should include in cost?
 - Spot: how bids are won and lost (outbid behavior, minimum increment), and
   whether a spot rental that is outbid is paused or ended.
-- jetski client: where to download `qubjetski-Client` for the image (pinned
-  version, checksum), whether it can be configured from env/CLI instead of
-  `appsettings.json`, and whether GPU mining needs extra runtime libraries.
+- Miner packages run outside HiveOS: confirm both binaries run in a plain
+  container (any missing libraries, GPU runtime needs), and what qli's
+  `accessToken` vs `qubicAddress` means for pool-side stats.
 - Does jetski expose per-worker stats and payout APIs? If not, rig stats +
   wallet payouts only.
 - Does qubic.li expose a per-worker stats API suitable for yield measurement?
@@ -659,7 +727,9 @@ spending anything.
   `spot_marketplace` `currency_rates_in_usd`.
 - GPU vs. CPU share yield on each pool: decides when the `cuda` image and GPU
   mining are worth it.
-- `qubjetski-Client` has `api.bind 127.0.0.1:17899` in appsettings. Check what it
-  serves; it may be a cleaner stats source for the agent than log parsing.
+- jetski `127.0.0.1:17899/summary`: capture a real response to fix the
+  fields the agent reads (does it include share counts, or only versions and
+  hashrate?).
 - Confirm qli's `.lock` deletion behavior also happens inside the container.
-- Does Qubic have idle periods with no shares, and on what schedule?
+- Qubic idle phases exist (qli has `Idling` settings): on what schedule, and
+  do they need a "no shares expected" window in stall detection?
