@@ -298,17 +298,20 @@ class DecideTests(unittest.TestCase):
             db.close()
 
     def test_dry_cancels_and_rerents_same_server(self):
-        # a tree that stops producing is dead weight; restarts re-roll
-        # nothing (the assignment is pool-side per wallet+alias), so the
-        # runner cancels and schedules a same-server re-rent instead
+        # a proven rig that stops producing got handed a dead tree;
+        # restarts re-roll nothing (the assignment is pool-side per
+        # wallet+alias), so the runner cancels and schedules a
+        # same-server re-rent once the longer productive threshold passes
         db = make_db()
         try:
             phase = add_phase(db)
             add_snapshot(db, [])
             add_fleet(db, 1, 11)
-            add_rental(db, phase["phase_id"], 1, 11, 30)
-            add_obs(db, 1, 20, status(submitted=5))
+            add_rental(db, phase["phase_id"], 1, 11, 60)
+            add_obs(db, 1, 40, status(submitted=5))
             add_obs(db, 1, 0.5, status(submitted=5))
+            # 40 min quiet on a rig that HAS produced: still inside the
+            # produced_dry_min=35 threshold? no -- 40 > 35, cancel+rerent
             acts, _ = actions(db, phase)
             self.assertEqual(kinds(acts, "restart"), [])
             cancels = kinds(acts, "cancel")
@@ -317,6 +320,39 @@ class DecideTests(unittest.TestCase):
             self.assertEqual(
                 cancels[0]["rerent_at"],
                 (NOW + timedelta(minutes=2)).isoformat())
+            # a between-branches pause (~25 min observed on live trees)
+            # must NOT kill a productive rig
+            db2 = make_db()
+            try:
+                phase2 = add_phase(db2)
+                add_snapshot(db2, [])
+                add_fleet(db2, 1, 11)
+                add_rental(db2, phase2["phase_id"], 1, 11, 60)
+                add_obs(db2, 1, 25, status(submitted=5))
+                add_obs(db2, 1, 0.5, status(submitted=5))
+                acts, _ = actions(db2, phase2)
+                self.assertEqual(kinds(acts, "cancel"), [])
+            finally:
+                db2.close()
+        finally:
+            db.close()
+
+    def test_never_produced_replaced_not_rerented(self):
+        # a rig that has never found a share may simply be unable to
+        # hit; cancel fast but let the fill pick different hardware
+        db = make_db()
+        try:
+            phase = add_phase(db)
+            add_snapshot(db, [])
+            add_fleet(db, 1, 11)
+            add_rental(db, phase["phase_id"], 1, 11, 30)
+            add_obs(db, 1, 20, status(submitted=0))
+            add_obs(db, 1, 0.5, status(submitted=0))
+            acts, _ = actions(db, phase)
+            cancels = kinds(acts, "cancel")
+            self.assertEqual(len(cancels), 1)
+            self.assertEqual(cancels[0]["reason"], "dry")
+            self.assertIsNone(cancels[0]["rerent_at"])
         finally:
             db.close()
 
@@ -329,8 +365,8 @@ class DecideTests(unittest.TestCase):
             phase = add_phase(db)
             add_snapshot(db, [])
             add_fleet(db, 1, 11)
-            add_rental(db, phase["phase_id"], 1, 11, 30)
-            add_obs(db, 1, 20, status(submitted=5))
+            add_rental(db, phase["phase_id"], 1, 11, 60)
+            add_obs(db, 1, 40, status(submitted=5))
             add_obs(db, 1, 0.5, status(submitted=5))
             for _ in range(CFG["dry_rerent_max_per_day"]):
                 add_event(db, phase["phase_id"], 1, "cancel", order_id=1,
@@ -741,8 +777,8 @@ class ExecutorTests(unittest.TestCase):
 class BurstTests(unittest.TestCase):
     def _dry_slot(self, db, phase, order_id=1, server_id=11):
         add_fleet(db, order_id, server_id)
-        add_rental(db, phase["phase_id"], order_id, server_id, 30)
-        add_obs(db, order_id, 20, status(submitted=5))
+        add_rental(db, phase["phase_id"], order_id, server_id, 60)
+        add_obs(db, order_id, 40, status(submitted=5))
         add_obs(db, order_id, 0.5, status(submitted=5))
 
     def _cap_dry_rerents(self, db, phase, order_id=1, server_id=11):
@@ -1426,7 +1462,13 @@ class NextStepTests(unittest.TestCase):
         r = _next_step_r(t0=NOW - timedelta(minutes=20),
                          quiet_since=NOW - timedelta(minutes=20))
         self.assertEqual(experiment.next_step(r, NOW, CFG),
-                         "re-rent in now")
+                         "replace in now")
+        # produced rigs get the longer threshold before a re-rent
+        r = _next_step_r(t0=NOW - timedelta(minutes=60),
+                         last_share_at=NOW - timedelta(minutes=30),
+                         quiet_since=NOW - timedelta(minutes=30))
+        self.assertEqual(experiment.next_step(r, NOW, CFG),
+                         "re-rent in 5m")
         r = _next_step_r(t0=NOW - timedelta(minutes=100),
                          last_share_at=NOW - timedelta(minutes=10),
                          quiet_since=NOW - timedelta(minutes=10),

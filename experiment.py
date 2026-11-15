@@ -101,6 +101,7 @@ DEFAULT_CONFIG = {
     "fault_check_min": 6,
     "free_window_min": 10,
     "dry_after_min": 15,
+    "produced_dry_min": 35,
     "dry_rerent_delay_min": 2,
     "dry_rerent_max_per_day": 3,
     "restart_cooldown_min": 10,
@@ -842,18 +843,24 @@ def decide(now, state, cfg):
                             "server_id": r["server_id"],
                             "reason": "zero_its"})
             continue
-        if now - quiet >= _minutes(cfg["dry_after_min"]):
+        produced = r["last_share_at"] is not None
+        threshold = cfg["produced_dry_min"] if produced \
+            else cfg["dry_after_min"]
+        if now - quiet >= _minutes(threshold):
             if r["dry_rerents_24h"] < cfg["dry_rerent_max_per_day"]:
                 # tree assignments are pool-side sticky per wallet+alias;
-                # a restart reconnects as the same worker and gets the
-                # same tree back. Only a new order (new worker identity)
-                # buys a new draw, so cancel + re-rent the same server.
+                # only a new order (new worker identity) buys a new draw.
+                # A rig that produced before is proven -- re-rent the same
+                # server. One that never produced may just be unable to
+                # hit: leave rerent unset so the fill picks fresh hardware
+                # (the same server is still allowed if it wins).
                 actions.append({
                     "type": "cancel", "order_id": r["order_id"],
                     "server_id": r["server_id"], "tier": r["tier"],
                     "reason": "dry",
                     "rerent_at": _iso(now + _minutes(
-                        cfg["dry_rerent_delay_min"]))})
+                        cfg["dry_rerent_delay_min"])) if produced
+                        else None})
             elif auto_burst_ok and not burst_emitted:
                 # out of daily re-rents; a burst still shows whether the
                 # pool is dry everywhere or just our tree
@@ -1134,20 +1141,23 @@ def next_step(r, now, cfg):
     if r.get("its_total") == 0:
         when = base + _minutes(cfg["restart_cooldown_min"])
         return f"wedged restart in {_countdown(when, now)}"
-    dry_due = quiet + _minutes(cfg["dry_after_min"])
+    produced = r["last_share_at"] is not None
+    dry_due = quiet + _minutes(cfg["produced_dry_min"] if produced
+                               else cfg["dry_after_min"])
+    verb = "re-rent" if produced else "replace"
     if r["reroll_start"] is not None:
         give_due = r["reroll_start"] + _minutes(r["x_min"])
         if give_due <= dry_due:
             return f"gives up in {_countdown(give_due, now)}"
-        return f"re-rent in {_countdown(dry_due, now)}"
-    if r["last_share_at"] is not None and \
+        return f"{verb} in {_countdown(dry_due, now)}"
+    if produced and \
             now - r["last_share_at"] < _minutes(cfg["dry_after_min"]):
         ago = int((now - r["last_share_at"]).total_seconds() // 60)
         return f"mining (last share {ago}m ago)"
     if now >= dry_due and r.get("dry_rerents_24h", 0) \
             >= cfg["dry_rerent_max_per_day"]:
         return "dry; daily re-rent cap reached, riding the pool rotation"
-    return f"re-rent in {_countdown(dry_due, now)}"
+    return f"{verb} in {_countdown(dry_due, now)}"
 
 
 def summary(db, now, db_path=None):
