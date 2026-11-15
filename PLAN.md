@@ -1081,6 +1081,46 @@ x, y and the "no shares for" stretch are config values; defaults are set
 from the experiments below, not guessed. The rest of this section is the
 evidence and detail behind these rules.
 
+### Experiment phase first (user decision): data over value
+
+For the first day or two the algorithm runs to **collect data, not to
+maximise value**. Where the two conflict, pick the option that teaches more:
+
+- **Hardware coverage:** rent across CPU classes on purpose, not just the
+  cheapest. The first 12 rentals were mostly cheap rigs with weak CPUs, so
+  CPU it/s is barely sampled. Include AVX-512 Zen 4/5 rigs (7945HX, 7950X,
+  9950X) even when pricier, plus a few cheap AVX2 rigs as a control, and
+  re-rent the same server where possible.
+- **Longer rentals:** several hours each, so whole tree cycles (burst,
+  dry, next tree) are observed; no early release on value grounds.
+- **Exercise every rule:** start-up restarts, mid-rental restarts on dry
+  trees, and stop/re-rent, with x and y deliberately varied, so their
+  defaults come from measurements.
+- **Log everything:** tree ID/seed transitions, each restart with its tree
+  ID before/after, it/s per device, shares, cost, order-to-SSH and
+  first-share times.
+- **Hard limits still apply:** a phase budget set by the user, balance
+  check before each rental, max concurrent rentals, no auto-renew.
+
+CPU it/s measured so far (median after warm-up, agent-reported):
+
+| CPU | Threads | ISA | CPU it/s | Notes |
+|---|---|---|---|---|
+| Ryzen 9 7950X | 32 | AVX-512 | 46 (max 48) | 13 min run |
+| Ryzen 9 7945HX | 32 | AVX-512 | 13 and 24 | two short runs (35, 22 min) |
+| i9-10980XE | 36 | AVX-512 (Intel) | 9-11 | incl. the 10 h run |
+| Ryzen 9 9950X | 28 | AVX-512 | 9 | 26 min, no usable GPU |
+| Ryzen 9 5900X / 3900X | 24 | AVX2 | 7-9 | |
+| Xeon E5-2695 v4 | 36 | AVX2 | 3 | |
+| i3-10105 | 8 | AVX2 | 1 | |
+
+The user's manual runs put 7945HX/7950X at 30-40 it/s (`USER_RATE_CONTEXT`
+records ~35), and the 7950X rental matches. The AVX-512 flag alone is not
+the signal: the Intel AVX-512 chip and the 9950X (28 threads offered) were
+no better than AVX2 Ryzens, and both 7945HX rentals fell short of 30-40
+(short runs; warm-up or thread allocation not yet ruled out). The pre-rental
+it/s prior is therefore keyed by CPU model and threads offered, not ISA.
+
 ### What the first 12 rentals show (all jetski, epoch 239, package 4.5)
 
 - **Hashrate is a stable rig property; share rate is not.** The 10 h
