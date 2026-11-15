@@ -297,7 +297,10 @@ class DecideTests(unittest.TestCase):
         finally:
             db.close()
 
-    def test_dry_restart_and_cooldown(self):
+    def test_dry_cancels_and_rerents_same_server(self):
+        # a tree that stops producing is dead weight; restarts re-roll
+        # nothing (the assignment is pool-side per wallet+alias), so the
+        # runner cancels and schedules a same-server re-rent instead
         db = make_db()
         try:
             phase = add_phase(db)
@@ -307,14 +310,52 @@ class DecideTests(unittest.TestCase):
             add_obs(db, 1, 20, status(submitted=5))
             add_obs(db, 1, 0.5, status(submitted=5))
             acts, _ = actions(db, phase)
+            self.assertEqual(kinds(acts, "restart"), [])
+            cancels = kinds(acts, "cancel")
+            self.assertEqual(len(cancels), 1)
+            self.assertEqual(cancels[0]["reason"], "dry")
+            self.assertEqual(
+                cancels[0]["rerent_at"],
+                (NOW + timedelta(minutes=2)).isoformat())
+        finally:
+            db.close()
+
+    def test_dry_rerent_daily_cap(self):
+        # after dry_rerent_max_per_day dry cancels on one server, the
+        # runner stops paying fees and lets the rig ride the pool's own
+        # rotation instead
+        db = make_db()
+        try:
+            phase = add_phase(db)
+            add_snapshot(db, [])
+            add_fleet(db, 1, 11)
+            add_rental(db, phase["phase_id"], 1, 11, 30)
+            add_obs(db, 1, 20, status(submitted=5))
+            add_obs(db, 1, 0.5, status(submitted=5))
+            for _ in range(CFG["dry_rerent_max_per_day"]):
+                add_event(db, phase["phase_id"], 1, "cancel", order_id=1,
+                          server_id=11, detail={"reason": "dry"})
+            acts, _ = actions(db, phase)
+            self.assertEqual(kinds(acts, "cancel"), [])
+        finally:
+            db.close()
+
+    def test_zero_its_restart_instead_of_dry_rerent(self):
+        # a rig hashing nothing has a local fault, not a dead tree;
+        # a miner restart can still un-wedge it
+        db = make_db()
+        try:
+            phase = add_phase(db)
+            add_snapshot(db, [])
+            add_fleet(db, 1, 11)
+            add_rental(db, phase["phase_id"], 1, 11, 30)
+            add_obs(db, 1, 20, status(submitted=5, cpu=0, gpu=0))
+            add_obs(db, 1, 0.5, status(submitted=5, cpu=0, gpu=0))
+            acts, _ = actions(db, phase)
+            self.assertEqual(kinds(acts, "cancel"), [])
             self.assertEqual(kinds(acts, "restart"),
                              [{"type": "restart", "order_id": 1,
-                               "server_id": 11, "reason": "dry"}])
-            # a restart 5 min ago is inside the 10 min cooldown
-            add_event(db, phase["phase_id"], 5, "restart", order_id=1,
-                      server_id=11)
-            acts, _ = actions(db, phase)
-            self.assertEqual(kinds(acts, "restart"), [])
+                               "server_id": 11, "reason": "zero_its"}])
         finally:
             db.close()
 
@@ -704,14 +745,26 @@ class BurstTests(unittest.TestCase):
         add_obs(db, order_id, 20, status(submitted=5))
         add_obs(db, order_id, 0.5, status(submitted=5))
 
-    def test_auto_burst_on_dry_restart_and_guards(self):
+    def _cap_dry_rerents(self, db, phase, order_id=1, server_id=11):
+        for _ in range(CFG["dry_rerent_max_per_day"]):
+            add_event(db, phase["phase_id"], 1, "cancel",
+                      order_id=order_id, server_id=server_id,
+                      detail={"reason": "dry"})
+
+    def test_auto_burst_only_after_daily_rerent_cap(self):
         db = make_db()
         try:
             phase = add_phase(db)
             add_snapshot(db, [listing(server_id=20)])
             self._dry_slot(db, phase)
+            # below the daily cap: cancel + re-rent, no burst
             acts, _ = actions(db, phase)
-            self.assertEqual(kinds(acts, "restart")[0]["reason"], "dry")
+            self.assertEqual(kinds(acts, "restart"), [])
+            self.assertEqual(kinds(acts, "cancel")[0]["reason"], "dry")
+            self.assertEqual(kinds(acts, "burst"), [])
+            # at the cap: a dry slot triggers a burst instead
+            self._cap_dry_rerents(db, phase)
+            acts, _ = actions(db, phase)
             bursts = kinds(acts, "burst")
             self.assertEqual(len(bursts), 1)
             self.assertEqual(bursts[0]["trigger"], "dry")
@@ -727,10 +780,10 @@ class BurstTests(unittest.TestCase):
                 phase2 = add_phase(db2)
                 add_snapshot(db2, [listing(server_id=20)])
                 self._dry_slot(db2, phase2)
+                self._cap_dry_rerents(db2, phase2)
                 add_burst(db2, phase2["phase_id"], 30, judged=True)
                 acts, _ = actions(db2, phase2)
-                self.assertEqual(kinds(acts, "restart")[0]["reason"],
-                                 "dry")
+                self.assertEqual(kinds(acts, "cancel"), [])
                 self.assertEqual(kinds(acts, "burst"), [])
                 # past the cooldown: burst again
                 db2.execute(
@@ -1373,7 +1426,7 @@ class NextStepTests(unittest.TestCase):
         r = _next_step_r(t0=NOW - timedelta(minutes=20),
                          quiet_since=NOW - timedelta(minutes=20))
         self.assertEqual(experiment.next_step(r, NOW, CFG),
-                         "dry restart in now")
+                         "re-rent in now")
         r = _next_step_r(t0=NOW - timedelta(minutes=100),
                          last_share_at=NOW - timedelta(minutes=10),
                          quiet_since=NOW - timedelta(minutes=10),
