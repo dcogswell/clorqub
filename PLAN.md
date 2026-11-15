@@ -44,6 +44,24 @@ sol/hr in the observed view) are pool-wide totals, not rig benchmarks; they
 must not be used as per-server yield. Likewise, `it/s` from CPU and GPU logs
 has trainer-specific scales and is not directly additive/comparable.
 
+2026-11-15 observation: the dashboard showed ~50,000 sol/hr pool-wide, split
+AVX512 27,257 / AVX2 19,669 / ~3,074 third (likely CUDA), and the user reports
+the total sits near 50k ~99% of the time. Two snapshots days apart both total
+~50k but with a very different trainer split (CUDA-dominant earlier,
+AVX512-dominant now) — consistent with the algorithm changing per epoch.
+Implications, held as hypotheses until same-tree data confirms them:
+
+- Pool output looks like a **fixed-rate pie**: individual dry spells are
+  redistributive (the solutions went elsewhere), not pool-wide droughts.
+- Long-run rig yield ≈ share of pool work × ~50k sol/hr, so **it/s per USD
+  is the right ranking metric** and whole-rental shares/$ is meaningful
+  once several tree transitions are included — short windows still aren't.
+- Re-rolling a dry tree is a **variance trade** (a fresh lottery draw), not
+  expected gain, unless some assignments turn out persistently bad.
+- The trainer split shifting between observations means CPU-vs-GPU yield
+  comparisons must be **per-epoch**: a GPU-vs-CPU conclusion from one
+  algorithm may not carry to the next.
+
 The user's initial whole-rig jetski observations seed conservative priors:
 
 | GPU | CPU reference | Whole-rig yield prior |
