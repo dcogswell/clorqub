@@ -157,7 +157,7 @@ MKT_COLS = ("ID", "GPU", "CPU", "Price$/d", "SpotFlr", "Avail", "CC",
 EXP_COLS = ("Order", "Server", "Role", "Tier", "CPU", "GPU", "$/hr",
             "Age", "Shares", "Last share", "Restarts", "Tree", "Next")
 FLEET_COLS = ("Server", "Pool", "Health", "CPU it/s", "GPU it/s",
-              "Epoch", "Found", "Age", "$/hr", "Sh/h", "Spend$",
+              "Epoch", "Found", "Age", "$/hr", "Sh/h", "Sh/¢", "Spend$",
               "Clore$", "Online", "Control", "Up",
               "End", "Order", "GPU", "Worker", "Submitted", "Trainer")
 
@@ -599,8 +599,11 @@ fleet
   fetches the tail of its miner log once, on demand; if the live
   fetch fails the locally archived copy is shown instead. Rental control
   is the guarded `b` flow here or `rent.py` in a shell.
+  Sh/¢ is shares/hour per fee-inclusive cent/hour of rental cost.
   Clore$ and Online are reported (not verified) order fields from the
-  last successful Clore poll; Control is the order's control field.
+  last successful Clore poll. Control: experiment (rented by
+  experiment.py), managed (rent.py/TUI), enrolled (observe-only) or
+  unmanaged.
   Clore orders never enrolled as rigs (manual web-UI rentals, etc.)
   appear as 'unmanaged' rows with '-' telemetry cells -- Enter shows
   their reported order record."""
@@ -1864,6 +1867,9 @@ class MarketTui(App):
                       if r.get("rate_hr_usd") is not None else "-"),
                 plain(f"{r['shares_hr']:.1f}"
                       if r.get("shares_hr") is not None else "-"),
+                plain(f"{r['shares_hr'] / (r['rate_hr_usd'] * 100):.2f}"
+                      if r.get("shares_hr") is not None
+                      and r.get("rate_hr_usd") else "-"),
                 plain(f"{r['spend_usd']:.2f}"
                       if r.get("spend_usd") is not None else "-"),
                 plain(f"{r['spend_reported_native']:.2f}"
