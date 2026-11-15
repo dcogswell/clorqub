@@ -904,6 +904,172 @@ def _last_cancel_failed(db, phase_id, order_id):
     return _dt(row["ts"]) if row else None
 
 
+def runner_alive(db_path):
+    """True while a `run` process holds the exclusive experiment lock.
+    None of the live-db writes happen here: read-only flock probe."""
+    lock_path = os.path.expanduser(db_path) + ".experiment.lock"
+    try:
+        fd = os.open(lock_path, os.O_RDONLY)
+    except OSError:
+        return False
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True  # LOCK_EX held by the runner
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        return False
+    finally:
+        os.close(fd)
+
+
+def _countdown(when, now):
+    if when is None:
+        return None
+    mins = int((when - now).total_seconds() // 60)
+    return "now" if mins <= 0 else f"{mins}m"
+
+
+def next_step(r, now, cfg):
+    """The soonest upcoming action for one rental, as display text --
+    mirrors decide()'s per-rental rules without emitting anything."""
+    role = r["role"]
+    if role == "probe":
+        due = [(r["created_at"]
+                + _minutes(cfg["probe_cancel_by_min"]), "deadline")]
+        if r.get("t0") is not None:
+            due.append((r["t0"] + _minutes(cfg["probe_judge_min"]),
+                        "judged"))
+        when, label = min(due, key=lambda d: d[0])
+        return f"{label} in {_countdown(when, now)}"
+    if role in ("kept", "control"):
+        when = r.get("deadline_at")
+        if when is None:
+            return "runs to term end"
+        return f"runs to term end in {_countdown(when, now)}"
+    t0 = r["t0"]
+    if t0 is None:
+        return "booting"
+    base = r["last_restart_at"] or t0
+    if now - t0 < _minutes(cfg["startup_min"]) and (
+            r["last_share_at"] is None or r["last_share_at"] < t0):
+        when = base + _minutes(cfg["startup_restart_every_min"])
+        return f"startup restart in {_countdown(when, now)}"
+    quiet = r["quiet_since"] or t0
+    dry_due = max(quiet + _minutes(cfg["dry_after_min"]),
+                  base + _minutes(cfg["restart_cooldown_min"]))
+    if r["reroll_start"] is not None:
+        give_due = r["reroll_start"] + _minutes(r["x_min"])
+        if give_due <= dry_due:
+            return f"gives up in {_countdown(give_due, now)}"
+        return f"dry restart in {_countdown(dry_due, now)}"
+    if r["last_share_at"] is not None and \
+            now - r["last_share_at"] < _minutes(cfg["dry_after_min"]):
+        ago = int((now - r["last_share_at"]).total_seconds() // 60)
+        return f"mining (last share {ago}m ago)"
+    return f"dry restart in {_countdown(dry_due, now)}"
+
+
+def summary(db, now, db_path=None):
+    """Read-only snapshot of the experiment for the TUI. Returns None
+    when the experiment tables don't exist; never writes."""
+    if db.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table'"
+            " AND name='experiment_phases'").fetchone() is None:
+        return None
+    phase = db.execute(
+        "SELECT * FROM experiment_phases WHERE closed_at IS NULL"
+        " ORDER BY phase_id DESC LIMIT 1").fetchone()
+    if phase is None:
+        phase = db.execute(
+            "SELECT * FROM experiment_phases ORDER BY phase_id DESC"
+            " LIMIT 1").fetchone()
+    alive = runner_alive(db_path) if db_path else None
+    if phase is None:
+        return {"phase": None, "rentals": [], "pending_rerents": [],
+                "burst": None, "events": [], "runner_alive": alive}
+    cfg = validate_config(json.loads(phase["config_json"]))
+    state = build_state(db, phase, now, cfg, apply_endings=False,
+                        say=lambda *_a, **_k: None)
+    events = [{
+        "id": e["id"], "ts": e["ts"], "kind": e["kind"],
+        "order_id": e["order_id"], "server_id": e["server_id"],
+        "detail": json.loads(e["detail_json"])}
+        for e in db.execute(
+            "SELECT * FROM experiment_events WHERE phase_id=?"
+            " ORDER BY id DESC LIMIT 30", (phase["phase_id"],))]
+    server_docs = {}
+    if db.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table'"
+            " AND name='servers'").fetchone():
+        for row in db.execute(
+                "SELECT server_id, latest_json FROM servers"):
+            try:
+                server_docs[row["server_id"]] = json.loads(
+                    row["latest_json"] or "{}")
+            except ValueError:
+                server_docs[row["server_id"]] = {}
+    rentals = []
+    for r in state["rentals"]:
+        doc = server_docs.get(r["server_id"]) or {}
+        tree = trees.current_tree(db, r["order_id"])
+        rentals.append({
+            "order_id": r["order_id"], "server_id": r["server_id"],
+            "role": r["role"], "tier": r["tier"],
+            "cpu": (doc.get("specs") or {}).get("cpu"),
+            "gpu": market.offered_gpu(doc),
+            "hourly_usd": str(r["hourly_usd"]),
+            "age_s": r["age"].total_seconds(),
+            "t0": _iso(r["t0"]),
+            "last_share_at": _iso(r["last_share_at"]),
+            "shares": sum(n for _, n in r["share_arrivals"]),
+            "restarts": len(r["restarts"]),
+            "tree_id": (tree or {}).get("tree_id"),
+            "x_min": r["x_min"], "y_min": r["y_min"],
+            "next": next_step(r, now, cfg)})
+    burst = None
+    ub = state["unjudged_burst"]
+    if ub is not None:
+        probes = [{
+            "order_id": p["order_id"], "server_id": p["server_id"],
+            "role": p["role"],
+            "age_s": p["age"].total_seconds(),
+            "shares": sum(n for _, n in p.get("share_arrivals", []))}
+            for p in state["burst_probes"]]
+        judge_in = 0.0
+        for p in state["burst_probes"]:
+            if p["ended"]:
+                continue
+            waits = [(_minutes(cfg["probe_cancel_by_min"])
+                      - p["age"]).total_seconds()]
+            if p.get("t0") is not None:
+                waits.append(
+                    (p["t0"] + _minutes(cfg["probe_judge_min"])
+                     - now).total_seconds())
+            judge_in = max(judge_in, min(waits))
+        burst = {"burst_id": ub["burst_id"], "trigger": ub["trigger"],
+                 "started_at": _iso(ub["started_at"]),
+                 "n_target": ub["n_target"], "probes": probes,
+                 "judge_in_s": max(0.0, judge_in)}
+    return {
+        "phase": {
+            "phase_id": phase["phase_id"],
+            "started_at": phase["started_at"],
+            "ends_at": phase["ends_at"],
+            "budget": f"{_dec(phase['budget_usd']):.2f}",
+            "reserve": f"{_dec(phase['reserve_usd']):.2f}",
+            "committed": f"{state['committed']:.2f}",
+            "remaining": f"{state['remaining']:.2f}"},
+        "rentals": rentals,
+        "pending_rerents": [{
+            "server_id": p["server_id"],
+            "due_at": _iso(p["due_at"])}
+            for p in state["pending_rerents"]],
+        "burst": burst,
+        "events": events,
+        "runner_alive": alive}
+
+
 def execute(db, db_path, env_file, phase, cfg, actions, now, live,
             say=print):
     """Run the decided actions. Dry-run only records `dryrun` events

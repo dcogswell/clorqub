@@ -1324,5 +1324,138 @@ class RestartMinerTests(unittest.TestCase):
                                   "jetski")
 
 
+def _next_step_r(**kw):
+    r = {"role": "slot", "order_id": 1, "server_id": 11,
+         "created_at": NOW - timedelta(minutes=30),
+         "t0": None, "last_share_at": None, "last_restart_at": None,
+         "quiet_since": None, "reroll_start": None,
+         "deadline_at": NOW + timedelta(minutes=60), "x_min": 30}
+    r.update(kw)
+    return r
+
+
+class NextStepTests(unittest.TestCase):
+    def test_probe_deadline_and_judge(self):
+        r = _next_step_r(role="probe",
+                         created_at=NOW - timedelta(minutes=2),
+                         t0=NOW - timedelta(minutes=1, seconds=54))
+        self.assertEqual(experiment.next_step(r, NOW, CFG),
+                         "judged in 3m")
+        r = _next_step_r(role="probe",
+                         created_at=NOW - timedelta(minutes=2))
+        self.assertEqual(experiment.next_step(r, NOW, CFG),
+                         "deadline in 6m")
+
+    def test_kept_and_control_run_to_term_end(self):
+        for role in ("kept", "control"):
+            r = _next_step_r(role=role)
+            self.assertEqual(
+                experiment.next_step(r, NOW, CFG),
+                "runs to term end in 60m")
+        r = _next_step_r(role="kept", deadline_at=None)
+        self.assertEqual(experiment.next_step(r, NOW, CFG),
+                         "runs to term end")
+
+    def test_booting_and_startup(self):
+        self.assertEqual(
+            experiment.next_step(_next_step_r(), NOW, CFG), "booting")
+        r = _next_step_r(t0=NOW - timedelta(minutes=3))
+        self.assertEqual(experiment.next_step(r, NOW, CFG),
+                         "startup restart in now")
+
+    def test_mining_dry_and_gives_up(self):
+        r = _next_step_r(t0=NOW - timedelta(minutes=20),
+                         last_share_at=NOW - timedelta(minutes=2),
+                         quiet_since=NOW - timedelta(minutes=2))
+        self.assertEqual(experiment.next_step(r, NOW, CFG),
+                         "mining (last share 2m ago)")
+        r = _next_step_r(t0=NOW - timedelta(minutes=20),
+                         quiet_since=NOW - timedelta(minutes=20))
+        self.assertEqual(experiment.next_step(r, NOW, CFG),
+                         "dry restart in now")
+        r = _next_step_r(t0=NOW - timedelta(minutes=100),
+                         last_share_at=NOW - timedelta(minutes=10),
+                         quiet_since=NOW - timedelta(minutes=10),
+                         last_restart_at=NOW - timedelta(minutes=1),
+                         reroll_start=NOW - timedelta(minutes=1),
+                         x_min=5)
+        self.assertEqual(experiment.next_step(r, NOW, CFG),
+                         "gives up in 4m")
+
+
+class RunnerAliveTests(unittest.TestCase):
+    def test_lock_states(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = os.path.join(tmp, "db.sqlite3")
+            self.assertFalse(experiment.runner_alive(db_path))
+            open(db_path + ".experiment.lock", "w").close()
+            self.assertFalse(experiment.runner_alive(db_path))
+            fd = os.open(db_path + ".experiment.lock", os.O_RDONLY)
+            try:
+                import fcntl
+                fcntl.flock(fd, fcntl.LOCK_EX)
+                self.assertTrue(experiment.runner_alive(db_path))
+            finally:
+                os.close(fd)
+            self.assertFalse(experiment.runner_alive(db_path))
+
+
+class SummaryTests(unittest.TestCase):
+    def test_no_tables_returns_none(self):
+        db = sqlite3.connect(":memory:")
+        db.row_factory = sqlite3.Row
+        self.assertIsNone(experiment.summary(db, NOW))
+        db.close()
+
+    def test_seeded_phase_snapshot(self):
+        db = make_db()
+        try:
+            phase = add_phase(db, budget="5")
+            add_fleet(db, 10, 20)
+            add_rental(db, phase["phase_id"], 10, 20, 30)
+            add_obs(db, 10, 20, status(submitted=3))
+            add_obs(db, 10, 0.5, status(submitted=5))
+            add_event(db, phase["phase_id"], 1, "restart", order_id=10,
+                      server_id=20, detail={"reason": "dry",
+                                            "tree_id_before": "ABC"})
+            result = experiment.summary(db, NOW)
+            self.assertEqual(result["phase"]["phase_id"],
+                             phase["phase_id"])
+            self.assertEqual(result["phase"]["budget"], "5.00")
+            self.assertEqual(len(result["rentals"]), 1)
+            rental = result["rentals"][0]
+            for key in ("order_id", "server_id", "role", "tier",
+                        "hourly_usd", "age_s", "t0", "last_share_at",
+                        "shares", "restarts", "tree_id", "x_min",
+                        "y_min", "next"):
+                self.assertIn(key, rental)
+            self.assertEqual(rental["order_id"], 10)
+            self.assertEqual(rental["role"], "slot")
+            self.assertEqual(rental["shares"], 5)
+            self.assertEqual(rental["restarts"], 1)
+            self.assertIn("mining (last share", rental["next"])
+            self.assertEqual(result["events"][0]["kind"], "restart")
+            self.assertEqual(
+                result["events"][0]["detail"]["reason"], "dry")
+            self.assertFalse(result["runner_alive"] is True)
+            self.assertIsNone(result["burst"])
+            # never writes: no ended_at was applied
+            self.assertIsNone(db.execute(
+                "SELECT ended_at FROM experiment_rentals"
+            ).fetchone()["ended_at"])
+        finally:
+            db.close()
+
+    def test_no_phase(self):
+        db = make_db()
+        try:
+            result = experiment.summary(db, NOW)
+            self.assertIsNone(result["phase"])
+            self.assertEqual(result["rentals"], [])
+            self.assertIn("runner_alive", result)
+        finally:
+            db.close()
+
+
 if __name__ == "__main__":
     unittest.main()

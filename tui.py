@@ -71,6 +71,8 @@ Button.nudge { width: 4; min-width: 4; height: 1fr;
 Button.nudge:hover { background: #272c33; }
 Button.nudge:focus { text-style: bold; }
 #bench { height: auto; padding: 0 1; }
+#exp-scroll { height: 10; }
+#exp-log { height: auto; padding: 0 1; }
 .compact #search { display: none; }
 .compact #hdr { height: 2; }
 .compact #h3 { display: none; }
@@ -105,8 +107,9 @@ WARN_LINES = [
     "Indicative only -- not a winning-bid price or execution guarantee; "
     "ranking stays on-demand.",
     "No QUBIC conversion; CPU and GPU it/s are not additive.",
-    "Orders are observe-only (including web-UI rentals); reported spend is "
-    "cumulative, not epoch-verified.",
+    "Clore-reported spend/online columns are observe-only (including "
+    "unmanaged web-UI rentals); reported spend is cumulative, not "
+    "epoch-verified.",
 ]
 
 
@@ -151,10 +154,11 @@ CAND_COLS = ("ID", "GPU", "OD$/d", "SpotFlr", "sols/h", "ODsol/$", "CC",
 MKT_COLS = ("ID", "GPU", "CPU", "Price$/d", "SpotFlr", "Avail", "CC",
             "sols/h", "ODsol/$", "thr", "CPU model", "ISA", "Rel%",
             "Reason")
-ORDER_COLS = ("Order", "Server", "Type", "Online", "Curr", "Price/d",
-              "Spend", "Sh/h", "Sh/¢", "Control", "State")
+EXP_COLS = ("Order", "Server", "Role", "Tier", "CPU", "GPU", "$/hr",
+            "Age", "Shares", "Last share", "Restarts", "Tree", "Next")
 FLEET_COLS = ("Server", "Pool", "Health", "CPU it/s", "GPU it/s",
-              "Epoch", "Found", "Age", "$/hr", "Sh/h", "Spend$", "Up",
+              "Epoch", "Found", "Age", "$/hr", "Sh/h", "Spend$",
+              "Clore$", "Online", "Control", "Up",
               "End", "Order", "GPU", "Worker", "Submitted", "Trainer")
 
 # app actions that only make sense on some tabs -> the footer hides
@@ -164,8 +168,17 @@ PANE_ACTIONS = {
     "toggle_sort": ("candidates", "marketplace"),
     "rent_selected": ("candidates", "marketplace"),
     "toggle_fleet_all": ("fleet",),
-    "log_selected": ("fleet", "orders"),
+    "log_selected": ("fleet", "experiment"),
 }
+
+
+def age_s_label(age_s):
+    """'2h14m' from a duration in seconds; '-' when unknown."""
+    if age_s is None:
+        return "-"
+    return uptime_label(datetime.fromtimestamp(
+        datetime.now(timezone.utc).timestamp() - age_s,
+        timezone.utc).isoformat())
 
 
 def end_label(deadline_at):
@@ -521,7 +534,7 @@ HELP_TEXT = """keys
                Enter/Escape hides it again -- the filter still applies)
   b            rent setup -> in-TUI quote review -> Confirm & Rent
              (no terminal needed; nothing spends until you confirm)
-  l            (on Fleet or Orders) tail the rig's miner log -- one
+  l            (on Fleet or Experiment) tail the rig's miner log -- one
              explicit read-only SSH fetch, no polling; ended rigs show
              the locally archived copy instead
   a            toggle available-only
@@ -555,15 +568,18 @@ collector (run these in a shell, not here)
   python3 collector.py stop
   Foreground: cli.py scan --live --watch
 
-orders
-------
-  The Orders tab is observe-only: it lists reported Clore orders
-  (including manual web-UI rentals) from the last successful poll.
-  Online/spend fields are reported, not verified. Per-epoch accounting
-  and any rental control are not implemented here. Sh/h is the recent
-  submitted-shares/hour rate from enrolled-rig telemetry; orders with
-  no recorded agent show '-'. Sh/¢ is shares per fee-inclusive cent
-  of spend rate (native price assumed USD-denominated).
+experiment
+----------
+  The Experiment tab is a read-only view of experiment.py's tables:
+  phase budget/committed/remaining, each rental's role (slot, probe,
+  kept, control), and a Next column showing the runner's soonest
+  upcoming action (startup/dry restart, gives-up deadline, judge or
+  cancel deadline, term end). `runner:` shows whether `experiment.py
+  run` holds its lock. The event tail below the table mirrors the
+  runner's log (restart/cancel/rerent/burst decisions). Start or stop
+  the runner from a terminal (`experiment.py start-phase` /
+  `experiment.py run`), never from here -- this app never creates or
+  cancels orders. Enter on a rental row opens its Fleet detail.
 
 spot floors
 -----------
@@ -582,7 +598,12 @@ fleet
   never summed. Share counters are agent-cumulative. `l` on a rig
   fetches the tail of its miner log once, on demand; if the live
   fetch fails the locally archived copy is shown instead. Rental control
-  is the guarded `b` flow here or `rent.py` in a shell."""
+  is the guarded `b` flow here or `rent.py` in a shell.
+  Clore$ and Online are reported (not verified) order fields from the
+  last successful Clore poll; Control is the order's control field.
+  Clore orders never enrolled as rigs (manual web-UI rentals, etc.)
+  appear as 'unmanaged' rows with '-' telemetry cells -- Enter shows
+  their reported order record."""
 
 
 class HelpModal(ModalScreen):
@@ -1468,16 +1489,6 @@ class MarketTui(App):
                     yield Button("▶", id="mkt-right", classes="nudge")
             with TabPane("Benchmarks", id="benchmarks"):
                 yield VerticalScroll(Static(id="bench"))
-            with TabPane("Orders", id="orders"):
-                with Vertical():
-                    yield Static("", id="orders-status")
-                    with Horizontal(classes="twrap"):
-                        yield Button("◀", id="orders-table-left",
-                                     classes="nudge")
-                        yield DataTable(id="orders-table",
-                                        cursor_type="row")
-                        yield Button("▶", id="orders-table-right",
-                                     classes="nudge")
             with TabPane("Fleet", id="fleet"):
                 with Vertical():
                     yield Static("", id="fleet-status")
@@ -1488,12 +1499,24 @@ class MarketTui(App):
                                         cursor_type="row")
                         yield Button("▶", id="fleet-table-right",
                                      classes="nudge")
+            with TabPane("Experiment", id="experiment"):
+                with Vertical():
+                    yield Static("", id="exp-status")
+                    with Horizontal(classes="twrap"):
+                        yield Button("◀", id="exp-table-left",
+                                     classes="nudge")
+                        yield DataTable(id="exp-table",
+                                        cursor_type="row")
+                        yield Button("▶", id="exp-table-right",
+                                     classes="nudge")
+                    with VerticalScroll(id="exp-scroll"):
+                        yield Static("", id="exp-log")
         yield Footer()
 
     def on_mount(self):
         self.query_one("#cand", DataTable).add_columns(*CAND_COLS)
         self.query_one("#mkt", DataTable).add_columns(*MKT_COLS)
-        self.query_one("#orders-table", DataTable).add_columns(*ORDER_COLS)
+        self.query_one("#exp-table", DataTable).add_columns(*EXP_COLS)
         self.query_one("#fleet-table", DataTable).add_columns(*FLEET_COLS)
         self.set_interval(self.refresh_seconds, self.action_reload)
         self.action_reload()
@@ -1547,6 +1570,7 @@ class MarketTui(App):
                   dash.get("spot_signature"),
                   (dash.get("order_inventory") or {}).get("revision"),
                   dash.get("fleet_signature"),
+                  dash.get("experiment_signature"),
                   self.avail_only, self.sort_by_price,
                   self.fleet_show_all,
                   self._search_text())
@@ -1649,64 +1673,85 @@ class MarketTui(App):
         self._fill(cand, [r for r in rows if r.get("eligible")], CAND_COLS,
                    "cand")
         self._fill(mkt, rows, MKT_COLS, "mkt")
-        self.render_orders()
+        self.render_experiment()
         self.render_fleet()
 
-    def render_orders(self):
-        inv = (self.dash or {}).get("order_inventory") or {}
-        history = (self.dash or {}).get("order_history") or []
-        status = self.query_one("#orders-status", Static)
-        table = self.query_one("#orders-table", DataTable)
-        items = history
-        text = self._search_text()
-        if text:
-            items = [o for o in items if text in " ".join(str(v or "")
-                     for v in (o.get("order_id"), o.get("server_id"),
-                               o.get("cpu"), " ".join(o.get("gpus") or []),
-                               o.get("currency"), o.get("control"),
-                               o.get("state"), o.get("last_seen"))).lower()]
-        if not inv:
-            status.update(Text("no order inventory recorded"))
-        else:
-            captured = inv.get("captured_at")
-            if inv.get("ok") is False:
-                reason = inv.get("error") or "poll failed"
-                state = (f"STALE/unknown ({reason}); rows may be "
-                         "outdated -- never assume zero rentals")
-            elif not (inv.get("orders") or []):
-                state = "ok; no orders returned"
-            else:
-                state = "ok"
-            active = sum(o.get("state") == "active" for o in history)
-            status.update(Text(
-                f"orders captured {captured or '?'} "
-                f"({age_of(captured)})  {state}  "
-                f"{active} active, {len(history) - active} ended "
-                "(local history)  -- observe-only; "
-                "manual web-UI rentals appear here too"))
+    def render_experiment(self):
+        """Read-only view of experiment.py's tables; the runner itself
+        lives in a terminal (`experiment.py run`)."""
+        exp = (self.dash or {}).get("experiment")
+        status = self.query_one("#exp-status", Static)
+        table = self.query_one("#exp-table", DataTable)
+        logw = self.query_one("#exp-log", Static)
         table.clear()
-        for o in items:
-            kind = ("spot" if o.get("spot") is True else
-                    "on-demand" if o.get("spot") is False else "unknown")
-            online = o.get("online_reported")
+        logw.update(Text(""))
+        if not exp or not exp.get("phase"):
+            status.update(Text("no experiment phase"))
+            return
+        ph = exp["phase"]
+        alive = exp.get("runner_alive")
+        runner = {True: "running", False: "NOT RUNNING"}.get(
+            alive, "unknown")
+        parts = [
+            f"phase {ph['phase_id']}: {ph['started_at']} -> "
+            f"{ph['ends_at']}",
+            f"budget ${ph['budget']} committed ${ph['committed']} "
+            f"remaining ${ph['remaining']}",
+            f"runner: {runner}"]
+        if exp.get("pending_rerents"):
+            parts.append(
+                "rerents: " + ", ".join(
+                    f"{p['server_id']} due {end_label(p['due_at'])}"
+                    for p in exp["pending_rerents"]))
+        if exp.get("burst"):
+            b = exp["burst"]
+            parts.append(
+                f"burst {b['burst_id']} ({b['trigger']}) "
+                f"{len(b['probes'])}/{b['n_target']} probes "
+                f"judge in {int(b['judge_in_s'] // 60)}m")
+        status.update(Text("  |  ".join(parts)))
+        text = self._search_text()
+        items = exp.get("rentals") or []
+        if text:
+            items = [r for r in items if text in " ".join(str(v or "")
+                     for v in (r.get("server_id"), r.get("cpu"),
+                               r.get("gpu"), r.get("role"),
+                               r.get("tier"))).lower()]
+        for r in items:
             table.add_row(
-                plain(o.get("order_id")), plain(o.get("server_id") or "?"),
-                plain(kind),
-                plain("yes" if online is True else
-                      "no" if online is False else "?"),
-                plain(o.get("currency") or "?"),
-                plain(o.get("price_day_native")),
-                plain(f"{o['spend_reported_native']:.2f}"
-                      if o.get("spend_reported_native") is not None
-                      else "-"),
-                plain(f"{o['shares_hr']:.1f}"
-                      if o.get("shares_hr") is not None else "-"),
-                plain(f"{o['shares_per_cent']:.2f}"
-                      if o.get("shares_per_cent") is not None else "-"),
-                plain(o.get("control")),
-                plain(o.get("state")),
-                key=str(o.get("order_id")))
+                plain(r.get("order_id")), plain(r.get("server_id")),
+                plain(r.get("role")), plain(r.get("tier")),
+                plain(trunc(cpu_compact(r.get("cpu")), 16)),
+                plain(trunc(r.get("gpu"), 12)),
+                plain(f"{float(r['hourly_usd']):.3f}"
+                      if r.get("hourly_usd") is not None else "-"),
+                plain(age_s_label(r.get("age_s"))),
+                plain(r.get("shares")),
+                plain(age_of(r.get("last_share_at"))
+                      if r.get("last_share_at") else "-"),
+                plain(r.get("restarts")),
+                plain(trunc(r.get("tree_id"), 10)),
+                plain(r.get("next") or "-"),
+                key=str(r.get("order_id")))
         self._apply_sort(table)
+        lines = []
+        for e in exp.get("events") or []:
+            try:
+                hhmmss = datetime.fromisoformat(
+                    e["ts"].replace("Z", "+00:00")).strftime("%H:%M:%S")
+            except (ValueError, TypeError):
+                hhmmss = str(e.get("ts") or "")[:8]
+            detail = e.get("detail") or {}
+            extras = " ".join(
+                f"{k}={detail[k]}" for k in (
+                    "reason", "tier", "x_min", "y_min", "tree_id_before",
+                    "n", "trigger", "type") if k in detail)
+            lines.append(
+                f"{hhmmss} {e.get('kind')}"
+                f"{' ' + str(e['order_id']) if e.get('order_id') else ''}"
+                f"{' s' + str(e['server_id']) if e.get('server_id') else ''}"
+                f"{' ' + extras if extras else ''}")
+        logw.update(Text("\n".join(lines)))
 
     def _cells(self, r):
         return {
@@ -1821,6 +1866,12 @@ class MarketTui(App):
                       if r.get("shares_hr") is not None else "-"),
                 plain(f"{r['spend_usd']:.2f}"
                       if r.get("spend_usd") is not None else "-"),
+                plain(f"{r['spend_reported_native']:.2f}"
+                      if r.get("spend_reported_native") is not None
+                      else "-"),
+                plain("yes" if r.get("online_reported") is True else
+                      "no" if r.get("online_reported") is False else "?"),
+                plain(r.get("control") or "-"),
                 plain(uptime_label(r.get("created_at"),
                                    r.get("up_until"))),
                 plain(end_label(r.get("end_at"))
@@ -1981,7 +2032,7 @@ class MarketTui(App):
         closes -- otherwise `b`/`l` can land in a leftover Input."""
         pane = self._active_pane()
         table_id = {"candidates": "#cand", "marketplace": "#mkt",
-                    "orders": "#orders-table",
+                    "experiment": "#exp-table",
                     "fleet": "#fleet-table"}.get(pane, "#cand")
         try:
             self.query_one(table_id, DataTable).focus()
@@ -2131,15 +2182,15 @@ class MarketTui(App):
         self.reload_data()
 
     def action_log_selected(self):
-        """`l` on a Fleet or Orders row: read-only SSH tail; the
+        """`l` on a Fleet or Experiment row: read-only SSH tail; the
         archived copy is shown when the rig can't be reached."""
         if len(self.screen_stack) != 1:
             return
         pane = self._active_pane()
-        if pane not in ("fleet", "orders"):
+        if pane not in ("fleet", "experiment"):
             return
         table = self.query_one(
-            "#fleet-table" if pane == "fleet" else "#orders-table",
+            "#fleet-table" if pane == "fleet" else "#exp-table",
             DataTable)
         try:
             row_key = table.ordered_rows[table.cursor_row].key.value
@@ -2149,8 +2200,12 @@ class MarketTui(App):
             (self.dash or {}).get("fleet") or []
         rig = next((r for r in rigs
                     if str(r.get("order_id")) == str(row_key)), None)
+        if rig is not None and rig.get("unmanaged"):
+            self.notify("unmanaged order -- no rig telemetry",
+                        severity="warning")
+            return
         if rig is None:
-            if pane == "orders":
+            if pane == "experiment":
                 self.notify("no fleet record for that order",
                             severity="warning")
             return
@@ -2178,7 +2233,7 @@ class MarketTui(App):
                 self.query_one("#search").display = False
             pane = self._active_pane()
             table_id = {"candidates": "#cand", "marketplace": "#mkt",
-                        "orders": "#orders-table",
+                        "experiment": "#exp-table",
                         "fleet": "#fleet-table"}.get(pane, "#cand")
             try:
                 self.query_one(table_id, DataTable).focus()
@@ -2247,17 +2302,27 @@ class MarketTui(App):
         row = event.row_key.value if event.row_key else None
         if row is None:
             return
-        if table.id == "orders-table":
-            order = next(
-                (o for o in (self.dash or {}).get("order_history") or []
-                 if str(o.get("order_id")) == row), None)
-            if order is not None:
-                self.push_screen(OrderDetail(order))
+        if table.id == "exp-table":
+            rig = next((r for r in (self.dash or {}).get("fleet_all") or []
+                        if str(r.get("order_id")) == row), None)
+            if rig is not None:
+                self.push_screen(FleetDetail(rig, self.db_path))
+            else:
+                self.notify("no fleet record for that order",
+                            severity="warning")
             return
         if table.id == "fleet-table":
             rig = next((r for r in (self.dash or {}).get("fleet_all") or []
                         if str(r.get("order_id")) == row), None)
             if rig is not None:
+                if rig.get("unmanaged"):
+                    order = next(
+                        (o for o in (self.dash or {}).get(
+                            "order_history") or []
+                         if str(o.get("order_id")) == row), None)
+                    if order is not None:
+                        self.push_screen(OrderDetail(order))
+                    return
                 self.push_screen(FleetDetail(rig, self.db_path))
             return
         which = "cand" if table.id == "cand" else "mkt"
@@ -2274,7 +2339,7 @@ class MarketTui(App):
 
     def on_data_table_row_highlighted(self, event):
         if event.data_table.id not in ("cand", "mkt"):
-            return  # orders table has its own detail path
+            return  # fleet/experiment tables have their own detail paths
         if event.row_key:
             which = "cand" if event.data_table.id == "cand" else "mkt"
             try:

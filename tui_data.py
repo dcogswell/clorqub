@@ -6,6 +6,7 @@ from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
 
+import experiment
 import fleet_store
 from market import available, cuda_capable, score_listing
 from orders import latest_wallets, read_inventory
@@ -130,6 +131,9 @@ def _rig_cost(rig, order_index, price_index=None):
     rate, spend = None, None
     if record is not None:
         rig["order_gpus"] = record.get("gpus")
+        rig["spend_reported_native"] = record.get(
+            "spend_reported_native")
+        rig["online_reported"] = record.get("online_reported")
         if record.get("auto_renew") is not None:
             rig["auto_renew"] = 1 if record["auto_renew"] is True else 0
         end_unix = record.get("rental_end")
@@ -232,9 +236,61 @@ def read_dashboard(path):
                 rig["health"] = health(rig)
                 rig["shares_hr"] = _shares_per_hr(db, rig["order_id"])
                 _rig_cost(rig, order_index, price_index)
+            # Clore orders not enrolled as rigs (e.g. manual web-UI
+            # rentals): minimal rows so Fleet still shows them
+            fleet_ids = {rig["order_id"] for rig in fleet_all}
+            for o in history:
+                if o["order_id"] in fleet_ids:
+                    continue
+                price = o.get("price_day_native")
+                rate = None
+                if isinstance(price, (int, float)) \
+                        and not isinstance(price, bool):
+                    fee = (1.0125 if o.get("spot") is True else 1.05)
+                    rate = price / 24 * fee
+                fleet_all.append({
+                    "order_id": o["order_id"],
+                    "server_id": o.get("server_id"),
+                    "unmanaged": True,
+                    "health": "unmanaged",
+                    "spend_reported_native":
+                        o.get("spend_reported_native"),
+                    "online_reported": o.get("online_reported"),
+                    "price_day_native": price,
+                    "rate_hr_usd": rate,
+                    "gpus": o.get("gpus"),
+                    "order_gpus": o.get("gpus"),
+                    "created_at": None,
+                    "provision_state": (
+                        "ready" if o.get("state") == "active"
+                        else "cancelled"),
+                    "state": o.get("state"),
+                })
+            # order_inventory's own control field only describes the
+            # read-only poll; label who actually rents each rig
+            exp_ids = set()
+            if db.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table'"
+                    " AND name='experiment_rentals'").fetchone():
+                exp_ids = {row["order_id"] for row in db.execute(
+                    "SELECT order_id FROM experiment_rentals")}
+            for rig in fleet_all:
+                if rig.get("unmanaged"):
+                    rig["control"] = "unmanaged"
+                elif rig["order_id"] in exp_ids:
+                    rig["control"] = "experiment"
+                elif rig.get("provision_state") == "observe-only":
+                    rig["control"] = "enrolled"
+                else:
+                    rig["control"] = "managed"
             fleet = [rig for rig in fleet_all
                      if _fleet_visible(rig, inventory)]
             wallets = latest_wallets(db)
+            try:
+                exp = experiment.summary(
+                    db, datetime.now(timezone.utc), db_path=path)
+            except Exception:
+                exp = None
         listings = json.loads(latest["raw_json"])["servers"] if latest else []
         rows = []
         cuda_hidden = 0
@@ -270,9 +326,14 @@ def read_dashboard(path):
             "fleet": fleet,
             "fleet_all": fleet_all,
             "fleet_signature": tuple(
-                (rig["order_id"], rig["observation_id"], rig["provision_state"], rig["health"])
+                (rig["order_id"], rig.get("observation_id"), rig.get("provision_state"), rig["health"])
                 for rig in fleet_all
             ),
+            "experiment": exp,
+            "experiment_signature": (
+                (exp["events"][0]["id"] if exp["events"] else 0,
+                 len(exp["rentals"]))
+                if exp else None),
         }
     except (sqlite3.Error, OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
         raise DashboardError(
