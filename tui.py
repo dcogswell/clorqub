@@ -533,8 +533,8 @@ class ServerDetail(ModalScreen):
 
 HELP_TEXT = """keys
 ----
-  /            focus search filter (reveals the bar on small screens;
-               Enter/Escape hides it again -- the filter still applies)
+  /            reveal + focus search filter (Enter/Escape hides the bar
+               again on any screen size; the filter still applies)
   b            rent setup -> in-TUI quote review -> Confirm & Rent
              (no terminal needed; nothing spends until you confirm)
   l            (on Fleet or Experiment) tail the rig's miner log -- one
@@ -1484,7 +1484,8 @@ class MarketTui(App):
         self._rent_active = False
         self._rent_log = []
         self._rent_modal = None
-        self._search_pinned = False
+        self._search_pinned = True
+        self._compact = False
         self._drag_scroll = None
         # gentler horizontal pointer/trackpad scrolling (default is 4.0)
         self.scroll_sensitivity_x = 2.0
@@ -1553,15 +1554,17 @@ class MarketTui(App):
     def _update_compact(self, size=None):
         """Small viewports (phones, keyboard open): drop the search row
         and stats line so the table and tab status stay visible.
-        `/` still reveals the search row via _search_pinned."""
+        `/` reveals the search row again; Enter/Escape hides it."""
         size = size or self.screen.size
         compact = size.height < 15 or size.width < 50
-        if not compact:
+        if compact and not self._compact:
+            # entering a small viewport: reclaim the filter row once;
+            # after that the user controls it via `/` and Escape
             self._search_pinned = False
+        self._compact = compact
         self.set_class(compact, "compact")
         try:
-            self.query_one("#search").display = (
-                self._search_pinned if compact else True)
+            self.query_one("#search").display = self._search_pinned
         except Exception:
             pass
 
@@ -1707,6 +1710,8 @@ class MarketTui(App):
         status = self.query_one("#exp-status", Static)
         table = self.query_one("#exp-table", DataTable)
         logw = self.query_one("#exp-log", Static)
+        snap = self._snapshot(table)
+        keep_log_scroll = self._keep_scroll("#exp-scroll")
         table.clear()
         logw.update(Text(""))
         if not exp or not exp.get("phase"):
@@ -1758,6 +1763,7 @@ class MarketTui(App):
                 plain(r.get("next") or "-"),
                 key=str(r.get("order_id")))
         self._apply_sort(table)
+        self._restore(table, snap)
         lines = []
         for e in exp.get("events") or []:
             try:
@@ -1776,6 +1782,7 @@ class MarketTui(App):
                 f"{' s' + str(e['server_id']) if e.get('server_id') else ''}"
                 f"{' ' + extras if extras else ''}")
         logw.update(Text("\n".join(lines)))
+        keep_log_scroll()
 
     def _cells(self, r):
         return {
@@ -1798,8 +1805,40 @@ class MarketTui(App):
             "Reason": plain(r.get("ineligible_reason") or "matched"),
         }
 
+    def _snapshot(self, table):
+        """Cursor row key + scroll offsets, so a reload rebuild keeps
+        the user's view instead of snapping to the top-left."""
+        key = None
+        rows = table.ordered_rows
+        if rows and 0 <= table.cursor_row < len(rows):
+            key = rows[table.cursor_row].key.value
+        return (key, table.scroll_target_x, table.scroll_target_y)
+
+    def _restore(self, table, snap):
+        key, sx, sy = snap
+        if key is not None:
+            for i, row in enumerate(table.ordered_rows):
+                if row.key.value == key:
+                    table.move_cursor(row=i)
+                    break
+        if sx or sy:
+            self.call_after_refresh(
+                lambda: table.scroll_to(x=sx, y=sy, animate=False))
+
+    def _keep_scroll(self, widget_id):
+        """VerticalScroll regions reset to top on update; carry the
+        offset across a content refresh."""
+        try:
+            sv = self.query_one(widget_id)
+        except Exception:
+            return lambda: None
+        sy = sv.scroll_target_y
+        return lambda: self.call_after_refresh(
+            lambda: sv.scroll_to(y=sy, animate=False))
+
     def _fill(self, table, rows, cols, which):
         selected = self.sel_id[which]
+        snap = self._snapshot(table)
         table.clear()
         sel_row = None
         for i, r in enumerate(rows):
@@ -1814,6 +1853,7 @@ class MarketTui(App):
         if sel_row is not None:
             table.move_cursor(row=sel_row)
         self._apply_sort(table)
+        self._restore(table, snap)
 
     def _apply_sort(self, table):
         """Re-run the clicked-column sort after a table rebuild."""
@@ -1866,6 +1906,7 @@ class MarketTui(App):
                 f"({age_of(latest) if latest else 'unknown age'}); "
                 f"unreachable rigs keep last-good rates below; "
                 f"End* = auto-renewing term  |  {totals}"))
+        snap = self._snapshot(table)
         table.clear()
         for r in items:
             st = r.get("status") or {}
@@ -1912,9 +1953,12 @@ class MarketTui(App):
                 cells = [_dim(c) for c in cells]
             table.add_row(*cells, key=str(r.get("order_id")))
         self._apply_sort(table)
+        self._restore(table, snap)
 
     def render_benchmarks(self):
         bench = self.query_one("#bench", Static)
+        scroll = bench.parent
+        sy = scroll.scroll_target_y if scroll is not None else 0
         if self.dash is None:
             bench.update(Text("no data loaded"))
             return
@@ -1944,6 +1988,9 @@ class MarketTui(App):
                 lines.append(f"    {o['notes']}")
         lines += ["", "warnings", ""] + [f"- {w}" for w in WARN_LINES]
         bench.update(Text("\n".join(lines)))
+        if sy and scroll is not None:
+            self.call_after_refresh(
+                lambda: scroll.scroll_to(y=sy, animate=False))
 
     # -- input -------------------------------------------------------------
 
@@ -1970,10 +2017,8 @@ class MarketTui(App):
     def action_focus_search(self):
         if len(self.screen_stack) != 1:
             return
-        if self.has_class("compact"):
-            # phone-sized viewport: reveal the hidden filter bar
-            self._search_pinned = True
-            self.query_one("#search").display = True
+        self._search_pinned = True
+        self.query_one("#search").display = True
         self.query_one(Input).focus()
 
     def action_reset_filters(self):
@@ -2251,10 +2296,9 @@ class MarketTui(App):
 
     def action_leave_search(self):
         if isinstance(self.focused, Input):
-            if self.has_class("compact"):
-                # re-hide the filter bar; the typed filter still applies
-                self._search_pinned = False
-                self.query_one("#search").display = False
+            # re-hide the filter bar; the typed filter still applies
+            self._search_pinned = False
+            self.query_one("#search").display = False
             pane = self._active_pane()
             table_id = {"candidates": "#cand", "marketplace": "#mkt",
                         "experiment": "#exp-table",
