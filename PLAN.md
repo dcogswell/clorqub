@@ -830,6 +830,20 @@ and never relies on a remote counter staying alive.
   per-rig/pool byte cursor (`rig_log_cursors`); shrink/rotation re-reads
   the tail. The `l` log view falls back to this archive when the live
   SSH fetch fails, so logs survive rig death and web-UI cancellation.
+- **Storage growth finding (2026-11-15, decide at experiment end):**
+  `rig_log_chunks` is the largest table (~22 MB of a ~49 MB db) and grows
+  ~0.8 MB/hr per rig (~95 MB/day at ~6 rigs) -- the 1 s `SHARES:` heartbeat
+  dominates while the analytically valuable lines (tree `ID:` transitions,
+  `Share found`, errors, restart banners) are ~1% of volume. Candidate
+  strategies, to be chosen when the experiment phase ends:
+  (a) materialize tree events into a `rig_tree_events` table, then drop
+      chunks for rentals ended >24 h;
+  (b) cap retained bytes per active order (~2 MB tail for ad-hoc views
+      and parsing);
+  (c) zlib-compress chunks (~8x) if raw retention is still wanted;
+  (d) `PRAGMA wal_checkpoint`/`VACUUM` after deletes so space returns to
+      disk. Until decided, expect ~3 GB/month of log growth at current
+      rental scale.
 - **Stock `miner`/`miner log` on the rig (current):** the agent runs the
   miner under a pty, writes the raw ANSI stream to
   `/clorqub/logs/<pool>.raw.log`, and points HiveOS's stock commands at
