@@ -1264,11 +1264,11 @@ class ReviewModal(ModalScreen):
 
 
 class ProgressModal(ModalScreen):
-    """Live timestamped log of the guarded create flow. Escape/Close
-    only dismisses the view -- the worker keeps running (there is no
-    cancel path for a paid order from here)."""
+    """Live timestamped log of the guarded create flow. Escape/Hide
+    only hides the view -- the worker keeps running (there is no
+    cancel path for a paid order from here); `b` reopens it."""
 
-    BINDINGS = [Binding("escape", "close", "Close")]
+    BINDINGS = [Binding("escape", "close", "Hide")]
 
     def __init__(self, title="rent in progress -- guarded flow log"):
         super().__init__()
@@ -1280,8 +1280,12 @@ class ProgressModal(ModalScreen):
         with Vertical(id="progress"):
             yield Static(self._title, classes="dtitle")
             yield VerticalScroll(Static("", id="plog"))
-            yield Static("running...", id="pstatus")
-            yield Horizontal(Button("Close", id="p-close"))
+            yield Static("running... -- Hide keeps it going; "
+                         "press b to reopen", id="pstatus")
+            yield Horizontal(Button("Hide", id="p-close"))
+
+    def on_mount(self):
+        self._paint_log()
 
     def add_line(self, msg):
         self._lines.append(msg)
@@ -1298,6 +1302,7 @@ class ProgressModal(ModalScreen):
         self.done = True
         try:
             self.query_one("#pstatus", Static).update(Text(status))
+            self.query_one("#p-close", Button).label = "Close"
         except Exception:
             pass
 
@@ -1876,6 +1881,11 @@ class MarketTui(App):
         self.action_leave_search()
 
     async def action_quit(self):
+        if self._rent_active:
+            self.notify("rental in progress -- quit blocked until it "
+                        "finishes (b reopens the log)",
+                        severity="warning")
+            return
         # modal screens have their own close keys; a stray `q` while
         # a form field is unfocused must not kill the app
         if len(self.screen_stack) != 1:
@@ -1910,6 +1920,14 @@ class MarketTui(App):
     def action_rent_selected(self):
         # only on the default screen; modals swallow it themselves
         if len(self.screen_stack) != 1:
+            return
+        if self._rent_active and self._rent_modal is not None:
+            # progress view was hidden -- reopen a fresh modal on the
+            # same log rather than starting a second rental
+            modal = ProgressModal(title=self._rent_modal._title)
+            modal._lines = list(self._rent_log)
+            self._rent_modal = modal
+            self.push_screen(modal)
             return
         pane = self._active_pane()
         if pane not in ("candidates", "marketplace"):
@@ -1975,6 +1993,7 @@ class MarketTui(App):
             self.call_after_refresh(self._focus_pane_table)
             return
         self._rent_active = True
+        self._rent_log = []
         row = next(
             (r for r in (self.dash["rows"] if self.dash else [])
              if r.get("server_id") == result.get("server_id")), None)
@@ -1995,7 +2014,7 @@ class MarketTui(App):
         if modal is not None and hasattr(modal, "add_line"):
             modal.add_line(line)
 
-    @work(thread=True, exclusive=True)
+    @work(thread=True, exclusive=True, group="rent")
     def _rent_quote(self, result, row):
         """Phase 1 in-process: rent.quote_order (fresh guarded GETs,
         no lock held). On success shows the ReviewModal."""
@@ -2064,7 +2083,7 @@ class MarketTui(App):
                         "create_order POST (no retries)")
         self._rent_create(ctx)
 
-    @work(thread=True, exclusive=True)
+    @work(thread=True, exclusive=True, group="rent")
     def _rent_create(self, ctx):
         """Phase 2 in-process: the exact guarded create flow (operator
         lock, fresh re-verify, ONE POST, auto-cancel rules)."""
