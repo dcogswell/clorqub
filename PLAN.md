@@ -1100,6 +1100,13 @@ measured in a short window.
   minutes and is rig-specific, so it is what a trial measures. It is a
   necessary condition (miner runs, GPU used, hardware matches the listing),
   not a yield prediction.
+- **Price first; the tree matters more than the rig (user view).** Once a
+  rig passes the hardware bar (miner runs, it/s in the expected range for
+  its GPU, listing matches), ranking is mainly by fee-inclusive $/hr. The
+  data so far supports this over hour-long windows (hourly shares did not
+  follow it/s) but is too thin to rule out that a faster rig takes a larger
+  share of a rich tree; the it/s weight in ranking is left to tree-level
+  data to settle.
 - **Rig comparisons only within one tree ID.** When two of our rigs ever
   report the same ID at overlapping times, that window is a valid
   head-to-head comparison; otherwise rigs are compared only by price and
@@ -1117,17 +1124,22 @@ On-demand creation fee ($0.10) and spot ($0.005) apply only if an order
 runs past 10 minutes; cancelling earlier costs seconds of rent only (see
 "Clore billing"). With bimodal start-up this window is the cheapest lever:
 
-- **First-share gate:** the early boot check (hardware match, it/s > 0)
-  gains one rule: no submitted share by ~8 min -> cancel inside the free
-  window and try the next candidate. This changes the rule above ("miner
-  started and hardware matches", not "shares produced"). Cost of a false
-  negative (e.g. 2442776, first share at 16.5 min) is one re-roll, not a
-  lost rig; the server stays eligible.
-- **Restart re-rolls inside the window (user idea):** before cancelling,
-  restart the miner every ~2 min while it has no share: restarts at ~2, 4
-  and 6 min, cancel at ~8 min if still none. This re-rolls the tree on the
-  same order at no fee, and 9 of 12 rentals that got shares did so within
-  2 min of starting, so 2 min is a fair wait per roll. Whether a restart
+- **Keep a well-priced rig and re-roll the tree (user decision):** a miner
+  restart is preferred over moving to the next candidate. With no share
+  yet, restart the miner every ~2 min (at ~2, 4, 6 min). The early boot
+  check only *cancels* for rig faults: SSH/agent not up, it/s 0 or far
+  below the GPU's range, or hardware not matching the listing. This changes
+  the rule above ("miner started and hardware matches", not "shares
+  produced") by adding re-rolls, not a share requirement.
+- **The ~8 min decision** for a healthy rig with still no share: if its
+  price is good (top of the ranking, or within a margin of the best
+  available), keep it past 10 min, accept the creation fee and keep
+  re-rolling; otherwise cancel inside the free window. A false negative
+  under the cancel branch (e.g. 2442776, first share at 16.5 min) costs a
+  candidate, not the server: it stays eligible.
+- **Restart cadence:** ~2 min per roll; inside the window each roll is
+  free. 9 of the 12 rentals had a first share within 2 min of the miner
+  starting, so 2 min is a fair wait per roll. Whether a restart
   actually gets a new tree is experiment 2; the gate doubles as that test
   (log the tree ID before and after each restart).
   - On the stock HiveOS image, Ctrl+C in the miner terminal makes HiveOS
@@ -1147,11 +1159,13 @@ runs past 10 minutes; cancelling earlier costs seconds of rent only (see
   **dry tree** is one with ~0 shares for a configurable stretch after an
   initial burst. It is not a rig fault: no rotation or blacklist because of
   it.
-- Options when a tree goes dry, to be decided by experiment (below):
-  wait for the pool's next tree; restart the miner to ask for new work; or
-  release and rent a fresh rig if a new rig reliably gets a rich tree
-  first. Releasing costs a creation fee plus boot, which a 5 h dry stretch
-  at $0.10/hr ($0.50) exceeds.
+- Default when a tree goes dry on a well-priced rig: **restart the miner**
+  to ask for new work, the same re-roll as at start-up, with a cooldown so
+  a rig isn't restarted faster than a fresh tree can show shares. Waiting
+  for the pool's next tree is the fallback if restarts don't change the
+  tree (experiment 2). Releasing for a fresh rig is reserved for price
+  (a clearly cheaper candidate) or rig faults; it costs a creation fee plus
+  boot, which a 5 h dry stretch at $0.10/hr ($0.50) exceeds.
 - The share **curve** for a whole rental (early burst, slump, second burst)
   is recorded so the pattern can be checked across rentals rather than
   assumed.
@@ -1179,8 +1193,9 @@ Builds on rent.py's guarded flow and the existing Phase 4 rails, plus:
   balance was exhausted).
 - Hard daily budget, max concurrent rentals, no auto-renew until the
   scoring has been validated on real data.
-- Candidates ranked by price and the hardware check; yield priors from
-  tree-level history once it exists; first-share gate on every new order.
+- Candidates ranked by price after the hardware bar; yield priors from
+  tree-level history once it exists; restart re-rolls on every new order
+  and on dry trees, with cancel/release driven by rig faults and price.
 
 ### Open questions
 
