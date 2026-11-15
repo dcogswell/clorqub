@@ -729,6 +729,8 @@ Clients:
     `max_trainer_download_seconds` and the miner connected to the pool.
 
   The rule is "miner started and hardware matches", not "shares produced".
+  (Superseded in part: see "Benchmarking and auto-rental" for the planned
+  first-share gate.)
   Every timestamp in the boot timeline is stored, so slow pulls and downloads
   are visible per server and per country.
 - **Spend tracking** uses what Clore actually charged (fees + rental), not
@@ -1051,6 +1053,129 @@ every N minutes:
 
 Clore rate limits (1 req/s, `create_order` 1 per 5 s) are enforced in
 `clore.py`; the loop interval is 60 s or more.
+
+## Benchmarking and auto-rental (design, 2026-11-15)
+
+Design only; nothing here is implemented yet. It replaces the "learned perf
+model" assumption that a rig's share rate is a stable property that can be
+measured in a short window.
+
+### What the first 12 rentals show (all jetski, epoch 239, package 4.5)
+
+- **Hashrate is a stable rig property; share rate is not.** The 10 h
+  rental 2443365 (i9-10980XE + RTX 3080, $0.103/hr) held 184-220 GPU it/s
+  with zero miner restarts, while shares per hour went 421, 328, 137, 20,
+  28, 28, 28, 75, 281, 282 (1,628 total). In 10-minute windows the same rig
+  ranged 0-195 shares. During the 5 h slump the GPU it/s was at its
+  *highest*; it dips during share bursts (cause not established).
+- **Shares come from the pool's ant-colony "tree", not from raw it/s.**
+  jetski logs `E:<epoch> | ID: <id> | SEED: <seed>` whenever its work
+  changes. On 2443365 the seed stayed the same all epoch but the ID changed
+  7 times, and share rate followed the ID (counts are `Share found` log
+  lines, a subset of the submitted counter): YECRTS (02:06-03:51, 187), ATYLHH (0.5 h, 44), ZUNPZY (04:21-07:21, 11), AXASCB (1 h, 4),
+  UBHBBP (1 h, 2), HRIKFL (09:31-11:46, 116). User model: once a vein is
+  mined out, nothing more comes until the pool sends a new tree. *Hypothesis:
+  the logged ID identifies the tree.*
+- **Rigs running at the same time had different IDs** (2442490 UTRUSQ vs
+  2442569 GOSJBG, 21:00-21:40 on Nov 14), and their bursts did not line up.
+  So even concurrent rigs are not on the same tree. Per user: comparing rigs
+  is only meaningful on an identical tree.
+- **Hourly shares do not follow it/s.** i3-10105 + 3080 (83 GPU it/s) did
+  486 sh/h; i9-10980XE + 3080 (197 it/s) did 328 sh/h, each over its only
+  hour. Tree luck dominates short windows.
+- **Start-up is bimodal** (user experience, matches the data): 9 of 12
+  rentals had a first share within 2 min of the miner starting. 2442776 took
+  16.5 min; 3 had none after 8-22 min and were cancelled. (The rig agent
+  starts the miner within ~1.5 min of our record; true order-to-SSH time is
+  not measured yet.)
+- **No pool API exposes pool-wide or per-tree share data** (user), so tree
+  state has to be inferred from our own rigs' logs.
+
+### Model
+
+- **Score = shares per dollar over whole trees, not per hour of a rig.** A
+  rig's value is (its share of a tree) x (how often it gets rich trees) /
+  price. Short-window sh/h is not used for ranking or for dropping a rig.
+- **Hardware check, not yield check, for trials.** it/s settles within
+  minutes and is rig-specific, so it is what a trial measures. It is a
+  necessary condition (miner runs, GPU used, hardware matches the listing),
+  not a yield prediction.
+- **Rig comparisons only within one tree ID.** When two of our rigs ever
+  report the same ID at overlapping times, that window is a valid
+  head-to-head comparison; otherwise rigs are compared only by price and
+  it/s.
+- **Every measurement is keyed by epoch + package version/SHA + tree ID.**
+  The pool algorithm can change any epoch but often lasts a couple. Results
+  carry forward while the epoch's algorithm (package version and miner
+  behaviour) is unchanged; a change marks all yield-derived numbers stale
+  until re-measured. it/s per hardware model carries forward only if the
+  package version is unchanged.
+
+### Using Clore's free 10-minute window ("creation")
+
+On-demand creation fee ($0.10) and spot ($0.005) apply only if an order
+runs past 10 minutes; cancelling earlier costs seconds of rent only (see
+"Clore billing"). With bimodal start-up this window is the cheapest lever:
+
+- **First-share gate:** the early boot check (hardware match, it/s > 0)
+  gains one rule: no submitted share by ~8 min -> cancel inside the free
+  window and try the next candidate. This changes the rule above ("miner
+  started and hardware matches", not "shares produced"). Cost of a false
+  negative (e.g. 2442776, first share at 16.5 min) is one re-roll, not a
+  lost rig; the server stays eligible.
+- Count re-rolls per server; a server that fails the gate repeatedly is a
+  hardware/network suspect, not a tree-luck case.
+
+### Dry trees during a rental
+
+- Track per rental: current tree ID, when it started, shares on it. A
+  **dry tree** is one with ~0 shares for a configurable stretch after an
+  initial burst. It is not a rig fault: no rotation or blacklist because of
+  it.
+- Options when a tree goes dry, to be decided by experiment (below):
+  wait for the pool's next tree; restart the miner to ask for new work; or
+  release and rent a fresh rig if a new rig reliably gets a rich tree
+  first. Releasing costs a creation fee plus boot, which a 5 h dry stretch
+  at $0.10/hr ($0.50) exceeds.
+- The share **curve** for a whole rental (early burst, slump, second burst)
+  is recorded so the pattern can be checked across rentals rather than
+  assumed.
+
+### Experiments before any auto-rental logic
+
+1. **Tree ID = tree?** Parse ID/seed transitions from archived logs for
+   every rental; check that share-rate regime changes line up with ID
+   changes. Free (existing logs).
+2. **Does a miner restart get a new tree?** On a rig in a dry tree,
+   restart the miner once and see whether the ID changes and shares
+   resume. Costs nothing extra on an active rental.
+3. **Do fresh rentals get a rich tree first?** Across all rentals, compare
+   shares in the first tree ID with later IDs. If fresh connections are
+   favoured, short rentals that re-roll on dry trees may beat long ones.
+4. **Same tree, different hardware:** only possible if two of our rigs are
+   ever given the same ID; log and use any such overlap automatically.
+
+### Auto-rental (after the experiments)
+
+Builds on rent.py's guarded flow and the existing Phase 4 rails, plus:
+
+- Check the wallet balance before every rental and stop cleanly with
+  enough left to cover outstanding orders (the 10 h rental ran until the
+  balance was exhausted).
+- Hard daily budget, max concurrent rentals, no auto-renew until the
+  scoring has been validated on real data.
+- Candidates ranked by price and the hardware check; yield priors from
+  tree-level history once it exists; first-share gate on every new order.
+
+### Open questions
+
+- Is the logged `ID` the colony tree, and does the pool assign it per
+  connection, per rig, or per worker alias?
+- Does restarting the miner (or reconnecting) get a new tree?
+- How long do dry stretches last, and are they periodic?
+- What does the pool dashboard's sh/hr count (user saw ~700 sh/hr on the
+  last rental; the rig's own submitted counter never passed 421 in an
+  hour)? Rig-side counts are used until this is known.
 
 ## Safety rails
 
