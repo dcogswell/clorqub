@@ -1303,13 +1303,28 @@ runs past 10 minutes; cancelling earlier costs seconds of rent only (see
   **dry tree** is one with ~0 shares for a configurable stretch after an
   initial burst. It is not a rig fault: no rotation or blacklist because of
   it.
-- Default when a tree goes dry on a well-priced rig: **restart the miner**
-  to ask for new work, the same re-roll as at start-up, with a cooldown so
-  a rig isn't restarted faster than a fresh tree can show shares. Waiting
-  for the pool's next tree is the fallback if restarts don't change the
-  tree (experiment 2). Releasing for a fresh rig is reserved for price
-  (a clearly cheaper candidate) or rig faults; it costs a creation fee plus
-  boot, which a 5 h dry stretch at $0.10/hr ($0.50) exceeds.
+- **Miner restart does NOT re-roll the tree (confirmed 2026-11-15, epoch
+  239).** The assignment is held pool-side per worker identity
+  (wallet+alias): across 5 restarts of dry rig 2445525 the miner
+  reconnected as `rig-deer-96b3` and got the same tree `ID` back every
+  time, with the same `SEED`. The miner log shows the pool pushing
+  "Ant stream closed; active work cancelled ... durable result retained"
+  when IT rotates the assignment. This is deliberate anti-churn design by
+  the operator.
+- **New draw requires a new worker identity** (different alias, or a new
+  wallet) or a new rental — not a new IP or a process restart. Burst
+  probes work as tree draws because they are new aliases.
+- **Rotation is pool-scheduled, not a fixed ~70 min cadence.** Observed
+  assignment lifetimes across 21 rigs' logs: ~30 min to ~3 h, clustered
+  ~55-100 min (2443365: 100m/30m/185m/60m/65m/140m; 2445525:
+  ~40m/74m). Likely ends when the work unit is exhausted, not on a wall
+  clock. Multiple workers can share one tree (4090 rig 2445662 and
+  2442295 both held WQIOFC...DAK concurrently).
+- Policy implication: `restart on dry` is dead code for tree luck — every
+  restart costs ~30 s downtime for zero benefit. Keep miner restarts only
+  for genuinely wedged miners (zero it/s). The only real lever for a dead
+  tree is paying for a new draw (new rental/worker) vs waiting out the
+  pool's own rotation.
 - The share **curve** for a whole rental (early burst, slump, second burst)
   is recorded so the pattern can be checked across rentals rather than
   assumed.
@@ -1318,15 +1333,20 @@ runs past 10 minutes; cancelling earlier costs seconds of rent only (see
 
 1. **Tree ID = tree?** Parse ID/seed transitions from archived logs for
    every rental; check that share-rate regime changes line up with ID
-   changes. Free (existing logs).
+   changes. Free (existing logs). → Confirmed: share regime tracks `ID`
+   changes; the `SEED` is constant per worker.
 2. **Does a miner restart get a new tree?** On a rig in a dry tree,
    restart the miner once and see whether the ID changes and shares
-   resume. Costs nothing extra on an active rental.
+   resume. → Answered 2026-11-15: NO. Assignment is server-side durable
+   per wallet+alias; 5/5 restarts returned the same tree.
 3. **Do fresh rentals get a rich tree first?** Across all rentals, compare
-   shares in the first tree ID with later IDs. If fresh connections are
-   favoured, short rentals that re-roll on dry trees may beat long ones.
+   shares in the first tree ID with later IDs. → Partial: burst probes
+   (fresh aliases) found shares while the slot rig stayed dry — proving
+   dryness is assignment-specific, not pool-wide. No evidence yet that
+   fresh draws are favoured above a random draw.
 4. **Same tree, different hardware:** only possible if two of our rigs are
    ever given the same ID; log and use any such overlap automatically.
+   → Happened: 2445662 (4090) and 2442295 shared WQIOFC...DAK.
 
 ### Auto-rental (after the experiments)
 
