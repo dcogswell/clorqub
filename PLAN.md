@@ -1056,7 +1056,19 @@ Clore rate limits (1 req/s, `create_order` 1 per 5 s) are enforced in
 
 ## Benchmarking and auto-rental (design, 2026-11-15)
 
-Design only; nothing here is implemented yet. It replaces the "learned perf
+**Implemented (2026-11-15) as `experiment.py`** (with `trees.py` and
+`rig_ssh.restart_miner`): phases with a USD budget/reserve, dry-run by
+default, `--live` needs `--confirm-budget`. Re-rolls kill the miner over
+SSH (`pkill` of `/clorqub/pkgs/<pool>/`); the agent restarts it in ~5 s,
+so no agent change. Tier preference: at least half the slots go to Zen 4/5
+AVX-512 Ryzens when listed; otherwise least-covered (CPU, GPU) first, then
+it/s-per-USD prior. Value-based switching (rule 2) is not active in the
+experiment phase. Telemetry comes from the collector; if it goes stale the
+runner blocks all actions rather than cancelling rigs. `experiment.py
+report` prints per-rental shares/cost, restarts with tree changes and
+shares within minutes, tree segments, and per-x/y summaries.
+
+The design below replaces the "learned perf
 model" assumption that a rig's share rate is a stable property that can be
 measured in a short window.
 

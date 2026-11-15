@@ -88,6 +88,18 @@ def ssh_text(host, port, key_path, order_id, command):
     return _run(_argv(host, port, key_path, order_id, command))
 
 
+def restart_miner(host, port, key_path, order_id, pool):
+    """Kill the miner process; the rig agent restarts it ~5 s later
+    (that is the deliberate re-roll -- no agent change needed).
+    Returns stripped stdout ('restarted' or 'none')."""
+    if pool not in ("jetski", "qli"):
+        raise SSHError("invalid pool")
+    _check_endpoint(host, port)
+    command = (f"pkill -TERM -f '^/clorqub/pkgs/{pool}/' "
+               "&& echo restarted || echo none")
+    return _run(_argv(host, port, key_path, order_id, command)).strip()
+
+
 def ssh_json(host, port, key_path, order_id):
     """Read /clorqub/status.json; returns the parsed dict."""
     _check_endpoint(host, port)
