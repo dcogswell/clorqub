@@ -227,7 +227,7 @@ class ExperimentTabTests(unittest.IsolatedAsyncioTestCase):
                 fleet = app.query_one("#fleet-table", DataTable)
                 labels = [c.label.plain for c in
                           fleet.columns.values()]
-                for col in ("Clore$", "Online", "Control"):
+                for col in ("Sh/¢", "Spend$", "Online", "Control"):
                     self.assertIn(col, labels)
                 # unmanaged order 500 renders as a fleet row
                 keys = {r.key.value for r in fleet.ordered_rows}

@@ -158,7 +158,7 @@ EXP_COLS = ("Order", "Server", "Role", "Tier", "CPU", "GPU", "$/hr",
             "Age", "Shares", "Last share", "Restarts", "Tree", "Next")
 FLEET_COLS = ("Server", "Pool", "Health", "CPU it/s", "GPU it/s",
               "Epoch", "Found", "Age", "$/hr", "Sh/h", "Sh/¢", "Spend$",
-              "Clore$", "Online", "Control", "Up",
+              "Online", "Control", "Up",
               "End", "Order", "GPU", "Worker", "Submitted", "Trainer")
 
 # app actions that only make sense on some tabs -> the footer hides
@@ -600,8 +600,8 @@ fleet
   fetch fails the locally archived copy is shown instead. Rental control
   is the guarded `b` flow here or `rent.py` in a shell.
   Sh/¢ is shares/hour per fee-inclusive cent/hour of rental cost.
-  Clore$ and Online are reported (not verified) order fields from the
-  last successful Clore poll. Control: experiment (rented by
+  Spend$ is Clore's reported cumulative spend and Online its reported
+  online flag (not verified), from the last successful Clore poll. Control: experiment (rented by
   experiment.py), managed (rent.py/TUI), enrolled (observe-only) or
   unmanaged.
   Clore orders never enrolled as rigs (manual web-UI rentals, etc.)
@@ -1872,9 +1872,6 @@ class MarketTui(App):
                       and r.get("rate_hr_usd") else "-"),
                 plain(f"{r['spend_usd']:.2f}"
                       if r.get("spend_usd") is not None else "-"),
-                plain(f"{r['spend_reported_native']:.2f}"
-                      if r.get("spend_reported_native") is not None
-                      else "-"),
                 plain("yes" if r.get("online_reported") is True else
                       "no" if r.get("online_reported") is False else "?"),
                 plain(r.get("control") or "-"),

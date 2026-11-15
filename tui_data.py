@@ -255,6 +255,7 @@ def read_dashboard(path):
                     "health": "unmanaged",
                     "spend_reported_native":
                         o.get("spend_reported_native"),
+                    "spend_usd": o.get("spend_reported_native"),
                     "online_reported": o.get("online_reported"),
                     "price_day_native": price,
                     "rate_hr_usd": rate,
