@@ -381,6 +381,36 @@ def validate_marketplace(payload):
     return servers
 
 
+_DISK_FREE = re.compile(r"\s*\d+(?:\.\d+)?GB\s*$")
+VOLATILE_SPEC_KEYS = ("pl",)
+FX_USD_KEYS = ("on_demand_clore", "on_demand_btc")
+
+
+def spec_change_key(spec_doc):
+    """sha256 of the spec doc minus live readings (free disk, power draw)."""
+    specs = dict(spec_doc.get("specs") or {})
+    for key in VOLATILE_SPEC_KEYS:
+        specs.pop(key, None)
+    if isinstance(specs.get("disk"), str):
+        specs["disk"] = _DISK_FREE.sub("", specs["disk"])
+    doc = {**spec_doc, "specs": specs}
+    return hashlib.sha256(
+        json.dumps(doc, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+
+
+def price_change_key(price):
+    """Owner-set price only: drop the FX-converted CLORE/BTC amounts."""
+    p = json.loads(json.dumps(price or {}))
+    if isinstance(p.get("usd"), dict):
+        for key in FX_USD_KEYS:
+            p["usd"].pop(key, None)
+    for mode in ("on_demand", "spot"):
+        if isinstance(p.get(mode), dict):
+            p[mode] = {k: v for k, v in p[mode].items() if k == "USD-Blockchain"}
+    return json.dumps(p, sort_keys=True)
+
+
 def ingest_marketplace(db, payload, source="api", captured_at=None):
     validate_marketplace(payload)
     # An import is atomic: a malformed listing must not leave partial history.
@@ -391,10 +421,16 @@ def ingest_marketplace(db, payload, source="api", captured_at=None):
 def _ingest_marketplace(db, payload, source, captured_at):
     captured_at = captured_at or utcnow()
     servers = payload["servers"]
-    db.execute(
+    cursor = db.execute(
         "INSERT INTO marketplace_snapshots(captured_at, source, server_count, raw_json) "
         "VALUES (?, ?, ?, ?)",
         (captured_at, source, len(servers), json.dumps(payload, sort_keys=True)),
+    )
+    # Only the newest snapshot keeps the multi-MB payload; older rows
+    # keep their timestamps and counts.
+    db.execute(
+        "UPDATE marketplace_snapshots SET raw_json='' WHERE id<? AND raw_json!=''",
+        (cursor.lastrowid,),
     )
     for server in servers:
         server_id = int(server["id"])
@@ -410,16 +446,21 @@ def _ingest_marketplace(db, payload, source, captured_at):
             (server_id, server.get("owner"), country, captured_at, captured_at, encoded),
         )
         gpu_array = server.get("gpu_array") or []
-        spec_json = json.dumps(
-            {"specs": specs, "gpu_array": gpu_array, "cuda_version": server.get("cuda_version")},
-            sort_keys=True, separators=(",", ":"),
-        )
-        spec_hash = hashlib.sha256(spec_json.encode()).hexdigest()
+        spec_doc = {
+            "specs": specs, "gpu_array": gpu_array,
+            "cuda_version": server.get("cuda_version"),
+        }
+        spec_json = json.dumps(spec_doc, sort_keys=True, separators=(",", ":"))
+        spec_hash = spec_change_key(spec_doc)
         previous = db.execute(
-            "SELECT id, spec_hash FROM server_specs WHERE server_id=? AND valid_to IS NULL",
+            "SELECT id, specs_json FROM server_specs WHERE server_id=? AND valid_to IS NULL",
             (server_id,),
         ).fetchone()
-        if previous is None or previous["spec_hash"] != spec_hash:
+        prev_key = (
+            spec_change_key(json.loads(previous["specs_json"]))
+            if previous is not None else None
+        )
+        if previous is None or prev_key != spec_hash:
             if previous is not None:
                 db.execute("UPDATE server_specs SET valid_to=? WHERE id=?",
                            (captured_at, previous["id"]))
@@ -440,7 +481,11 @@ def _ingest_marketplace(db, payload, source, captured_at):
             "SELECT id, price_json FROM server_prices WHERE server_id=? AND valid_to IS NULL",
             (server_id,),
         ).fetchone()
-        if previous is None or previous["price_json"] != price_json:
+        prev_price_key = (
+            price_change_key(json.loads(previous["price_json"]))
+            if previous is not None else None
+        )
+        if previous is None or prev_price_key != price_change_key(server["price"]):
             if previous is not None:
                 db.execute("UPDATE server_prices SET valid_to=? WHERE id=?",
                            (captured_at, previous["id"]))

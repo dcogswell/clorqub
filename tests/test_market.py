@@ -186,6 +186,121 @@ class TestMarketplaceStorage(unittest.TestCase):
         finally:
             db.close()
 
+    def test_fx_and_owner_price_versioning(self):
+        db = market.connect_db(":memory:")
+        try:
+            server = listing()
+            server["price"] = {
+                "usd": {"on_demand_usd": 2.4, "spot": 0,
+                        "on_demand_clore": 100.0, "on_demand_btc": 0.001},
+                "on_demand": {"USD-Blockchain": 2.4,
+                              "CLORE-Blockchain": 100.0, "bitcoin": 0.001},
+                "spot": {"USD-Blockchain": 0, "CLORE-Blockchain": 0,
+                         "bitcoin": 0},
+                "original_usd": {"CLORE-Blockchain": {"on_demand": 2.4,
+                                                    "spot": 0},
+                                 "bitcoin": {"on_demand": 2.4, "spot": 0}},
+            }
+            market.ingest_marketplace(
+                db, {"servers": [server]}, captured_at="2026-11-14T00:00:00Z"
+            )
+            # FX re-conversion only: same owner USD price, new CLORE/BTC amounts
+            fx_only = listing()
+            fx_only["price"] = json.loads(json.dumps(server["price"]))
+            fx_only["price"]["usd"]["on_demand_clore"] = 101.5
+            fx_only["price"]["usd"]["on_demand_btc"] = 0.0011
+            fx_only["price"]["on_demand"]["CLORE-Blockchain"] = 101.5
+            fx_only["price"]["on_demand"]["bitcoin"] = 0.0011
+            fx_only["price"]["spot"]["CLORE-Blockchain"] = 0.5
+            market.ingest_marketplace(
+                db, {"servers": [fx_only]}, captured_at="2026-11-14T01:00:00Z"
+            )
+            self.assertEqual(
+                db.execute("SELECT COUNT(*) FROM server_prices").fetchone()[0], 1
+            )
+            # Owner price change: new version, previous closed out
+            owner_change = listing()
+            owner_change["price"] = json.loads(json.dumps(server["price"]))
+            owner_change["price"]["usd"]["on_demand_usd"] = 3.0
+            market.ingest_marketplace(
+                db, {"servers": [owner_change]}, captured_at="2026-11-14T02:00:00Z"
+            )
+            self.assertEqual(
+                db.execute("SELECT COUNT(*) FROM server_prices").fetchone()[0], 2
+            )
+            self.assertIsNotNone(
+                db.execute(
+                    "SELECT valid_to FROM server_prices ORDER BY id LIMIT 1"
+                ).fetchone()[0]
+            )
+            # original_usd alone still versions: it is owner-set
+            orig = listing()
+            orig["price"] = json.loads(json.dumps(owner_change["price"]))
+            orig["price"]["original_usd"]["CLORE-Blockchain"]["on_demand"] = 3.0
+            market.ingest_marketplace(
+                db, {"servers": [orig]}, captured_at="2026-11-14T03:00:00Z"
+            )
+            self.assertEqual(
+                db.execute("SELECT COUNT(*) FROM server_prices").fetchone()[0], 3
+            )
+        finally:
+            db.close()
+
+    def test_volatile_spec_fields_do_not_version(self):
+        db = market.connect_db(":memory:")
+        try:
+            server = listing()
+            server["specs"]["disk"] = "BC901 NVMe SK hynix 1024 24.0848GB"
+            server["specs"]["pl"] = [261]
+            market.ingest_marketplace(
+                db, {"servers": [server]}, captured_at="2026-11-14T00:00:00Z"
+            )
+            churned = listing()
+            churned["specs"]["disk"] = "BC901 NVMe SK hynix 1024 24.0712GB"
+            churned["specs"]["pl"] = [256]
+            market.ingest_marketplace(
+                db, {"servers": [churned]}, captured_at="2026-11-14T01:00:00Z"
+            )
+            self.assertEqual(
+                db.execute("SELECT COUNT(*) FROM server_specs").fetchone()[0], 1
+            )
+            model = listing()
+            model["specs"]["disk"] = "Samsung 980 1024 24.0712GB"
+            model["specs"]["pl"] = [256]
+            market.ingest_marketplace(
+                db, {"servers": [model]}, captured_at="2026-11-14T02:00:00Z"
+            )
+            self.assertEqual(
+                db.execute("SELECT COUNT(*) FROM server_specs").fetchone()[0], 2
+            )
+        finally:
+            db.close()
+
+    def test_only_latest_snapshot_keeps_raw_json(self):
+        db = market.connect_db(":memory:")
+        try:
+            for index in range(3):
+                market.ingest_marketplace(
+                    db, {"servers": [listing()]},
+                    captured_at=f"2026-11-14T0{index}:00:00Z",
+                )
+            rows = db.execute(
+                "SELECT id, captured_at, server_count, raw_json "
+                "FROM marketplace_snapshots ORDER BY id"
+            ).fetchall()
+            self.assertEqual(len(rows), 3)
+            self.assertEqual(rows[0]["raw_json"], "")
+            self.assertEqual(rows[1]["raw_json"], "")
+            self.assertEqual(rows[0]["captured_at"], "2026-11-14T00:00:00Z")
+            self.assertEqual(rows[0]["server_count"], 1)
+            latest = rows[2]
+            self.assertEqual(latest["server_count"], 1)
+            payload = json.loads(latest["raw_json"])
+            self.assertEqual(len(payload["servers"]), 1)
+            self.assertEqual(payload["servers"][0]["id"], 1)
+        finally:
+            db.close()
+
     def test_bad_import_does_not_leave_partial_history(self):
         db = market.connect_db(":memory:")
         try:
