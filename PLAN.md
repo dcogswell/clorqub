@@ -1123,6 +1123,21 @@ runs past 10 minutes; cancelling earlier costs seconds of rent only (see
   started and hardware matches", not "shares produced"). Cost of a false
   negative (e.g. 2442776, first share at 16.5 min) is one re-roll, not a
   lost rig; the server stays eligible.
+- **Restart re-rolls inside the window (user idea):** before cancelling,
+  restart the miner every ~2 min while it has no share: restarts at ~2, 4
+  and 6 min, cancel at ~8 min if still none. This re-rolls the tree on the
+  same order at no fee, and 9 of 12 rentals that got shares did so within
+  2 min of starting, so 2 min is a fair wait per roll. Whether a restart
+  actually gets a new tree is experiment 2; the gate doubles as that test
+  (log the tree ID before and after each restart).
+  - On the stock HiveOS image, Ctrl+C in the miner terminal makes HiveOS
+    restart the miner. On our rigs the `miner` screen session is only a log
+    viewer, so Ctrl+C there kills the viewer, not the miner. The agent
+    already restarts jetski 5 s after it exits (backoff doubling to 60 s,
+    reset once it is running again), so a deliberate restart needs only a
+    small agent change: a `restart` request in `/clorqub/control.json`
+    (like the existing `switch_to`) that stops and restarts the miner,
+    counted separately from crash restarts, with no re-download.
 - Count re-rolls per server; a server that fails the gate repeatedly is a
   hardware/network suspect, not a tree-luck case.
 
@@ -1173,9 +1188,11 @@ Builds on rent.py's guarded flow and the existing Phase 4 rails, plus:
   connection, per rig, or per worker alias?
 - Does restarting the miner (or reconnecting) get a new tree?
 - How long do dry stretches last, and are they periodic?
-- What does the pool dashboard's sh/hr count (user saw ~700 sh/hr on the
-  last rental; the rig's own submitted counter never passed 421 in an
-  hour)? Rig-side counts are used until this is known.
+- *Resolved:* the ~700 sh/hr the user saw on 2443365 was a short-window
+  rate at 30-40 min uptime. The rig counter matches: 732/h over the
+  10 minutes ending at 40 min, versus 421 shares in the whole first hour.
+  Other rentals show the same swing (0 to ~790/h between adjacent
+  10-minute windows), another reason not to judge on short windows.
 
 ## Safety rails
 
