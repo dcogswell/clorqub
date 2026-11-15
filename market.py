@@ -9,7 +9,7 @@ import urllib.request
 from datetime import datetime, timezone
 
 API_URL = "https://api.clore.ai/v1/marketplace"
-DEFAULT_COUNTRY_BLOCKLIST = {"RU", "UA"}
+DEFAULT_COUNTRY_BLOCKLIST = {"RU", "UA", "BY"}
 DEFAULT_MIN_CUDA = (12, 0)
 RENTER_FEES = {"on-demand": 0.05, "spot": 0.0125}
 

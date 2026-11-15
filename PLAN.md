@@ -96,7 +96,7 @@ import timestamp is not its original observation time or fresh availability.
 The initial ranking uses on-demand pricing
 plus an assumed 5% renter fee from the earlier API observation (not a fresh
 fee lookup), excludes the creation fee and boot opportunity cost,
-and filters RU/UA plus CUDA listings below 12.0. Spot ranking is intentionally
+and filters RU/UA/BY plus CUDA listings below 12.0. Spot ranking is intentionally
 not shown until the scanner fetches and converts each server's live spot
 minimum; the marketplace USD spot field is a zero placeholder, not a free
 quote. This stage never creates or cancels orders.
@@ -761,8 +761,10 @@ Servers in **Russia and Ukraine** often have major bandwidth problems
 available servers.
 
 - `country_blocklist` in config (country = `specs.net.cc`), default
-  `["RU", "UA"]`: these servers are dropped before scoring, like blacklisted
-  servers. Editable via config or a command.
+  `["RU", "UA", "BY"]`: these servers are dropped before scoring, like
+  blacklisted servers. Editable via config or a command. Belarus was added
+  2026-11-15 after the first experiment rig there (order 2445525) failed
+  about half its SSH reads while mining.
 - **Listed speed is stale** (median speed test 52 days old).
   `min_network_mbps` is only a loose pre-filter for very low listings, off by
   default.
