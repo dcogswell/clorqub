@@ -145,5 +145,29 @@ class TestScanLive(unittest.TestCase):
         self.assertNotIn("Traceback", err)
 
 
+class TestTickInterval(unittest.TestCase):
+    def test_tick_interval_requires_watch(self):
+        with self.assertRaises(SystemExit):
+            cli.main(["scan", "--live", "--tick-interval", "15"])
+
+    def test_tick_interval_minimum(self):
+        with self.assertRaises(SystemExit):
+            cli.main(["scan", "--live", "--watch",
+                      "--tick-interval", "5"])
+        with self.assertRaises(SystemExit):
+            cli.main(["scan", "--live", "--watch",
+                      "--tick-interval", "nan"])
+
+
+class TestStartCommand(unittest.TestCase):
+    def test_tick_interval_appended_only_when_set(self):
+        import collector_service
+        argv = collector_service.start_command("/tmp/db", "/tmp/env", 300)
+        self.assertNotIn("--tick-interval", argv)
+        argv = collector_service.start_command(
+            "/tmp/db", "/tmp/env", 300, tick_interval=10)
+        self.assertEqual(argv[-2:], ["--tick-interval", "10"])
+
+
 if __name__ == "__main__":
     unittest.main()

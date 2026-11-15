@@ -186,6 +186,10 @@ def main(argv=None):
                         help="Seconds between watch-mode scans "
                         f"(finite, >= {scanner_watch.MIN_INTERVAL:g}, "
                         f"default {scanner_watch.DEFAULT_INTERVAL:g})")
+    parser.add_argument("--tick-interval", type=float, default=None,
+                        help="Watch mode: seconds between telemetry "
+                        f"ticks (finite, >= 10, "
+                        f"default {POLL_SECONDS:g})")
     parser.add_argument("--spot-limit", type=int,
                         default=spot.DEFAULT_SPOT_LIMIT,
                         help="Live mode: also fetch up to N spot floors "
@@ -204,14 +208,20 @@ def main(argv=None):
                      "(snapshots never call the API)")
     if args.interval is not None and not args.watch:
         parser.error("--interval only makes sense with --watch")
+    if args.tick_interval is not None and not args.watch:
+        parser.error("--tick-interval only makes sense with --watch")
     interval = (args.interval if args.interval is not None
                 else scanner_watch.DEFAULT_INTERVAL)
+    tick_interval = (args.tick_interval if args.tick_interval is not None
+                     else POLL_SECONDS)
     if args.watch:
         if not math.isfinite(interval) \
                 or interval < scanner_watch.MIN_INTERVAL:
             parser.error(
                 f"--interval must be finite and "
                 f">= {scanner_watch.MIN_INTERVAL:g} seconds")
+        if not math.isfinite(tick_interval) or tick_interval < 10:
+            parser.error("--tick-interval must be finite and >= 10 seconds")
         if os.path.expanduser(args.db) == ":memory:":
             parser.error("--watch with --db :memory: discards every scan")
 
@@ -239,7 +249,7 @@ def main(argv=None):
         args.stop_event = stop
         return scanner_watch.run_watch(
             lambda: scan_once(args), interval, stop,
-            tick=_telemetry_tick, tick_interval=POLL_SECONDS)
+            tick=_telemetry_tick, tick_interval=tick_interval)
     finally:
         signal.signal(signal.SIGINT, old_int)
         signal.signal(signal.SIGTERM, old_term)

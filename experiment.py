@@ -55,7 +55,18 @@ CREATE TABLE IF NOT EXISTS experiment_rentals (
     quoted_cost_usd TEXT NOT NULL,
     created_at TEXT NOT NULL,
     ended_at TEXT,
-    end_reason TEXT
+    end_reason TEXT,
+    role TEXT NOT NULL DEFAULT 'slot',
+    burst_id INTEGER
+);
+CREATE TABLE IF NOT EXISTS experiment_bursts (
+    burst_id INTEGER PRIMARY KEY,
+    phase_id INTEGER NOT NULL,
+    started_at TEXT NOT NULL,
+    trigger TEXT NOT NULL,
+    trigger_order_id INTEGER,
+    n_target INTEGER NOT NULL,
+    judged_at TEXT
 );
 CREATE TABLE IF NOT EXISTS experiment_events (
     id INTEGER PRIMARY KEY,
@@ -73,6 +84,10 @@ POOL = "jetski"
 ZEN_RE = re.compile(
     r"\bRyzen \d+ (?:7\d{2}[05]|9\d{2}[05])(?:X3D|X|HX3D|HX)?\b")
 CANCEL_RETRY_MIN = 10
+# A rent blocks inside create_order_flow for up to the provision wait;
+# freeze new rentals this long before any probe's free-window deadline
+# so the wait can't push a deadline cancel past the window.
+PROBE_RENT_GUARD_MIN = 4
 
 DEFAULT_CONFIG = {
     "max_rentals": 2,
@@ -90,6 +105,13 @@ DEFAULT_CONFIG = {
     "rerent_grace_min": 60,
     "stale_obs_sec": 120,
     "stale_market_min": 15,
+    "burst_max": 4,
+    "burst_hours": 1,
+    "burst_cooldown_min": 60,
+    "burst_fill_min": 5,
+    "probe_judge_min": 5,
+    "probe_cancel_by_min": 8,
+    "burst_keep_control": True,
 }
 
 
@@ -119,12 +141,23 @@ def open_db(path):
     db = market.connect_db(os.path.expanduser(path))
     fleet_store.initialize(db)
     db.executescript(SCHEMA)
+    # migration: role/burst_id on experiment_rentals for burst probing
+    cols = {row[1] for row in
+            db.execute("PRAGMA table_info(experiment_rentals)")}
+    if "role" not in cols:
+        db.execute(
+            "ALTER TABLE experiment_rentals ADD COLUMN role "
+            "TEXT NOT NULL DEFAULT 'slot'")
+    if "burst_id" not in cols:
+        db.execute(
+            "ALTER TABLE experiment_rentals ADD COLUMN "
+            "burst_id INTEGER")
     db.commit()
     return db
 
 
 def validate_config(cfg):
-    cfg = dict(cfg)
+    cfg = {**DEFAULT_CONFIG, **cfg}
     if cfg["max_rentals"] < 1 or \
             cfg["max_rentals"] > rental_policy.MAX_AUTO_RENTALS:
         raise ValueError(
@@ -136,6 +169,18 @@ def validate_config(cfg):
     if not cfg["x_min"] or not cfg["y_min"]:
         raise ValueError("x_min/y_min lists must be nonempty")
     _dec(cfg["max_price_hr"])
+    if cfg["burst_max"] < 1 or \
+            cfg["burst_max"] > rental_policy.MAX_BURST_PROBES:
+        raise ValueError(
+            f"burst_max must be 1..{rental_policy.MAX_BURST_PROBES}")
+    if isinstance(cfg["burst_hours"], bool) \
+            or not isinstance(cfg["burst_hours"], int) \
+            or not 1 <= cfg["burst_hours"] <= rental_policy.MAX_HOURS:
+        raise ValueError(
+            f"burst_hours must be 1..{rental_policy.MAX_HOURS}")
+    if cfg["probe_cancel_by_min"] >= cfg["free_window_min"]:
+        raise ValueError(
+            "probe_cancel_by_min must be < free_window_min")
     return cfg
 
 
@@ -260,6 +305,8 @@ def _rental_state(db, phase, row, now, cfg, listings):
         "server_id": row["server_id"],
         "tier": row["tier"],
         "reason": row["reason"],
+        "role": row["role"],
+        "burst_id": row["burst_id"],
         "x_min": row["x_min"],
         "y_min": row["y_min"],
         "hourly_usd": _dec(row["hourly_usd"]),
@@ -460,6 +507,43 @@ def build_state(db, phase, now, cfg, apply_endings=True, say=print):
                      {"reason": ended_reason}, say=say)
             continue
         rentals.append(state)
+    bursts = [dict(b) for b in db.execute(
+        "SELECT * FROM experiment_bursts WHERE phase_id=? "
+        "ORDER BY burst_id", (phase_id,))]
+    for b in bursts:
+        b["started_at"] = _dt(b["started_at"])
+        b["judged_at"] = _dt(b["judged_at"])
+    unjudged = next((b for b in bursts if b["judged_at"] is None), None)
+    last_burst_at = (max(b["started_at"] for b in bursts)
+                     if bursts else None)
+    last_started_event = db.execute(
+        "SELECT MAX(id) FROM experiment_events WHERE phase_id=? "
+        "AND kind='burst_started'", (phase_id,)).fetchone()[0]
+    burst_request = db.execute(
+        "SELECT detail_json FROM experiment_events WHERE phase_id=? "
+        "AND kind='burst_requested' AND id>? ORDER BY id DESC LIMIT 1",
+        (phase_id, last_started_event or 0)).fetchone()
+    burst_probes = []
+    if unjudged is not None:
+        by_order = {r["order_id"]: r for r in rentals}
+        for prow in db.execute(
+                "SELECT order_id, server_id, role, hourly_usd,"
+                " created_at, ended_at FROM experiment_rentals"
+                " WHERE phase_id=? AND burst_id=?",
+                (phase_id, unjudged["burst_id"])):
+            active = by_order.get(prow["order_id"])
+            if active is not None:
+                probe = dict(active)
+                probe["ended"] = False
+            else:
+                probe = {"order_id": prow["order_id"],
+                         "server_id": prow["server_id"],
+                         "role": prow["role"],
+                         "hourly_usd": _dec(prow["hourly_usd"]),
+                         "age": now - _dt(prow["created_at"]),
+                         "t0": None, "share_arrivals": [],
+                         "ended": True}
+            burst_probes.append(probe)
     last_obs = [r["last_obs_at"] for r in rentals
                 if r["last_obs_at"] is not None]
     telemetry_age_s = ((now - max(last_obs)).total_seconds()
@@ -482,6 +566,12 @@ def build_state(db, phase, now, cfg, apply_endings=True, say=print):
         "listings": listings,
         "scored": scored,
         "snapshot_at": snapshot_at,
+        "bursts": bursts,
+        "unjudged_burst": unjudged,
+        "last_burst_started_at": last_burst_at,
+        "burst_request_n": (json.loads(burst_request["detail_json"])
+                            .get("n") if burst_request else None),
+        "burst_probes": burst_probes,
         "telemetry_age_s": telemetry_age_s,
         "snapshot_age_s": ((now - snapshot_at).total_seconds()
                            if snapshot_at else None),
@@ -511,9 +601,38 @@ def decide(now, state, cfg):
     telemetry_stale = bool(state["rentals"]) and (
         state["telemetry_age_s"] is None
         or state["telemetry_age_s"] > cfg["stale_obs_sec"])
+    blocks = []
+    if telemetry_stale:
+        blocks.append("telemetry_stale")
+    if now >= state["phase_ends_at"]:
+        blocks.append("phase")
+    if state["snapshot_age_s"] is None \
+            or state["snapshot_age_s"] > cfg["stale_market_min"] * 60:
+        blocks.append("stale_market")
+    if state["pending_attempts"]:
+        blocks.append("pending")
+    if state["remaining"] <= 0:
+        blocks.append("budget")
+
+    burst_ok = (state["unjudged_burst"] is None
+                and now < state["phase_ends_at"] and not blocks)
+    auto_burst_ok = burst_ok and (
+        state["last_burst_started_at"] is None or now - state[
+            "last_burst_started_at"] >= _minutes(
+                cfg["burst_cooldown_min"]))
+    burst_emitted = False
+
     for r in [] if telemetry_stale else state["rentals"]:
         t0 = r["t0"]
         obs_age = r["obs_age"]
+        role = r["role"]
+        if role == "probe" \
+                and r["age"] >= _minutes(cfg["probe_cancel_by_min"]):
+            actions.append({"type": "cancel", "order_id": r["order_id"],
+                            "server_id": r["server_id"],
+                            "tier": r["tier"],
+                            "reason": "probe_deadline", "rerent_at": None})
+            continue
         if r["recent_errors_only"]:
             actions.append({"type": "cancel", "order_id": r["order_id"],
                             "server_id": r["server_id"],
@@ -535,6 +654,8 @@ def decide(now, state, cfg):
                     "server_id": r["server_id"], "tier": r["tier"],
                     "reason": f"fault:{fault}", "rerent_at": None})
                 continue
+        if role != "slot":
+            continue
         if now - t0 < _minutes(cfg["startup_min"]):
             if r["last_share_at"] is None and now - (
                     r["last_restart_at"] or t0) >= _minutes(
@@ -560,25 +681,85 @@ def decide(now, state, cfg):
                     cfg["restart_cooldown_min"]):
             actions.append({"type": "restart", "order_id": r["order_id"],
                             "server_id": r["server_id"], "reason": "dry"})
+            if auto_burst_ok and not burst_emitted:
+                actions.append({
+                    "type": "burst", "trigger": "dry",
+                    "trigger_order_id": r["order_id"],
+                    "n": cfg["burst_max"]})
+                burst_emitted = True
 
-    blocks = []
-    if telemetry_stale:
-        blocks.append("telemetry_stale")
-    if now >= state["phase_ends_at"]:
-        blocks.append("phase")
-    if state["snapshot_age_s"] is None \
-            or state["snapshot_age_s"] > cfg["stale_market_min"] * 60:
-        blocks.append("stale_market")
-    if state["pending_attempts"]:
-        blocks.append("pending")
-    if state["remaining"] <= 0:
-        blocks.append("budget")
+    if not burst_emitted and burst_ok and state["burst_request_n"]:
+        actions.append({"type": "burst", "trigger": "manual",
+                        "trigger_order_id": None,
+                        "n": state["burst_request_n"]})
+        burst_emitted = True
+
+    burst = state["unjudged_burst"]
+    if burst is not None:
+        probes = state["burst_probes"]
+
+        def _matured(p):
+            return p["ended"] or (
+                p.get("t0") is not None
+                and now - p["t0"] >= _minutes(cfg["probe_judge_min"])) \
+                or p["age"] >= _minutes(cfg["probe_cancel_by_min"] - 1)
+        if probes:
+            judge_now = all(_matured(p) for p in probes)
+        else:
+            judge_now = now - burst["started_at"] >= _minutes(
+                cfg["burst_fill_min"])
+        if judge_now:
+            finder_ids = {
+                p["order_id"] for p in probes
+                if p.get("t0") is not None
+                and any(ts >= p["t0"] for ts, _ in
+                        p.get("share_arrivals", []))}
+            # probes at/past the deadline are left to the probe_deadline
+            # cancel; they can't be kept or judged-cancelled.
+            active_probes = [
+                p for p in probes
+                if not p["ended"] and p["role"] == "probe"
+                and p["age"] < _minutes(cfg["probe_cancel_by_min"])]
+            keep = [p["order_id"] for p in active_probes
+                    if p["order_id"] in finder_ids]
+            rest = sorted(
+                (p for p in active_probes
+                 if p["order_id"] not in finder_ids),
+                key=lambda p: p["hourly_usd"])
+            control = None
+            if cfg["burst_keep_control"] and rest:
+                control = rest[0]["order_id"]
+                rest = rest[1:]
+            actions.append({
+                "type": "judge", "burst_id": burst["burst_id"],
+                "finders": sorted(finder_ids), "keep": keep,
+                "control": control,
+                "cancel": [p["order_id"] for p in rest]})
 
     rent_actions = []
     if not blocks and now < state["phase_ends_at"]:
         active_ids = {r["server_id"] for r in state["rentals"]}
         chosen = []
+        n_chosen_slots = 0
         rerented_ids = set()
+        # an unjudged burst fills with probes, one per cycle
+        if burst is not None \
+                and now - burst["started_at"] < _minutes(
+                    cfg["burst_fill_min"]):
+            if sum(1 for p in state["burst_probes"]
+                   if not p["ended"]) < burst["n_target"] \
+                    and len(state["rentals"]) + len(chosen) < \
+                    cfg["max_rentals"] + cfg["burst_max"]:
+                probes_now = _probe_candidates(state, cfg, active_ids,
+                                               chosen)
+                if probes_now:
+                    pick = probes_now[0]
+                    chosen.append(pick)
+                    rent_actions.append({
+                        "type": "rent", "server_id": pick["server_id"],
+                        "reason": "probe", "tier": "other",
+                        "role": "probe", "burst_id": burst["burst_id"],
+                        "hours": cfg["burst_hours"]})
         # pending rerents due: re-rent the same server while it is
         # still listed, acceptable and in budget
         for pending in state["pending_rerents"]:
@@ -604,25 +785,57 @@ def decide(now, state, cfg):
                 chosen.append({"server_id": sid,
                                "tier": pending["tier"]})
                 rerented_ids.add(sid)
-        # fill empty slots with the least-explored acceptable listings
-        while len(state["rentals"]) + sum(
+                n_chosen_slots += 1
+        # fill empty slots with the least-explored acceptable listings;
+        # probes/kept/control don't consume max_rentals slots
+        n_slots = sum(1 for r in state["rentals"] if r["role"] == "slot")
+        while n_slots + sum(
                 1 for p in state["pending_rerents"]
                 if p["server_id"] not in rerented_ids) \
-                + len(chosen) < cfg["max_rentals"]:
+                + n_chosen_slots < cfg["max_rentals"]:
             candidates = _candidates(state, cfg, active_ids, chosen)
             if not candidates:
                 break
             pick = candidates[0]
             chosen.append(pick)
+            n_chosen_slots += 1
             rent_actions.append({"type": "rent",
                                  "server_id": pick["server_id"],
                                  "reason": "fill", "tier": pick["tier"]})
+    # a probe near its free-window deadline freezes rentals: a blocking
+    # provision wait could push its cancel past the window.
+    if any(r["role"] == "probe"
+           and r["age"] >= _minutes(
+               cfg["probe_cancel_by_min"] - PROBE_RENT_GUARD_MIN)
+           for r in state["rentals"]):
+        blocks.append("probe_guard")
     if blocks:
         actions.extend({"type": "blocked", "reason": reason}
                        for reason in blocks)
     else:
         actions.extend(rent_actions)
     return actions
+
+
+def _probe_candidates(state, cfg, active_ids, chosen):
+    """Cheapest acceptable listings for burst probes: same filters as
+    _candidates but no zen/coverage preference -- lottery tickets."""
+    pending_ids = {p["server_id"] for p in state["pending_rerents"]}
+    chosen_ids = {c["server_id"] for c in chosen}
+    pool = []
+    for sid, row in state["scored"].items():
+        if sid in active_ids or sid in pending_ids or sid in chosen_ids \
+                or sid in state["excluded"]:
+            continue
+        if row["ineligible_reason"] not in (None, "no matching benchmark"):
+            continue
+        hourly = row["hourly_cost_usd"]
+        if hourly is None or hourly > _dec(cfg["max_price_hr"]):
+            continue
+        pool.append({"server_id": sid, "tier": "other",
+                     "hourly": hourly})
+    pool.sort(key=lambda c: (c["hourly"], c["server_id"]))
+    return pool
 
 
 def _candidates(state, cfg, active_ids, chosen):
@@ -718,6 +931,11 @@ def execute(db, db_path, env_file, phase, cfg, actions, now, live,
             emit(db, now, phase_id, None, action["server_id"],
                  "rerent_expired", {"server_id": action["server_id"]},
                  say=say)
+        elif kind == "burst":
+            _exec_burst(db, phase_id, action, now, say)
+        elif kind == "judge":
+            _exec_judge(db, db_path, env_file, phase_id, action, now,
+                        say)
         elif kind == "restart":
             _exec_restart(db, phase_id, action, now, say)
         elif kind == "cancel":
@@ -731,6 +949,53 @@ def execute(db, db_path, env_file, phase, cfg, actions, now, live,
             _exec_rent(db, db_path, env_file, phase, cfg, action, now,
                        say)
             rented = True
+
+
+def _exec_burst(db, phase_id, action, now, say):
+    """Record the burst; renting probes happens via decide's fill."""
+    with db:
+        cur = db.execute(
+            "INSERT INTO experiment_bursts(phase_id, started_at,"
+            " trigger, trigger_order_id, n_target)"
+            " VALUES (?,?,?,?,?)",
+            (phase_id, _iso(now), action["trigger"],
+             action.get("trigger_order_id"), action["n"]))
+    emit(db, now, phase_id, action.get("trigger_order_id"), None,
+         "burst_started",
+         {"burst_id": cur.lastrowid, "trigger": action["trigger"],
+          "n": action["n"]}, say=say)
+
+
+def _exec_judge(db, db_path, env_file, phase_id, action, now, say):
+    burst_id = action["burst_id"]
+    for order_id in action["keep"]:
+        db.execute(
+            "UPDATE experiment_rentals SET role='kept' "
+            "WHERE order_id=? AND role='probe'", (order_id,))
+    if action.get("control") is not None:
+        db.execute(
+            "UPDATE experiment_rentals SET role='control' "
+            "WHERE order_id=? AND role='probe'", (action["control"],))
+    db.execute(
+        "UPDATE experiment_bursts SET judged_at=? WHERE burst_id=?",
+        (_iso(now), burst_id))
+    db.commit()
+    for order_id in action["cancel"]:
+        prow = db.execute(
+            "SELECT server_id, tier FROM experiment_rentals "
+            "WHERE order_id=?", (order_id,)).fetchone()
+        if prow is None:
+            continue
+        _exec_cancel(db, db_path, env_file, phase_id,
+                     {"order_id": order_id,
+                      "server_id": prow["server_id"],
+                      "tier": prow["tier"],
+                      "reason": "probe_no_share", "rerent_at": None},
+                     now, say)
+    emit(db, now, phase_id, None, None, "burst_judged",
+         {"burst_id": burst_id, "finders": action["finders"],
+          "kept": action["keep"], "control": action.get("control"),
+          "cancelled": action["cancel"]}, say=say)
 
 
 def _exec_restart(db, phase_id, action, now, say):
@@ -808,10 +1073,11 @@ def _exec_rent(db, db_path, env_file, phase, cfg, action, now, say):
     balance = next((_dec(w["balance"]) for w in wallets
                     if w["name"] == "USD-Blockchain"), None)
     estimate = None
+    hours = action.get("hours", cfg["hours"])
     row = market.score_listing((latest_listings(db)[0] or {}).get(sid)
                                or {})
     if row["hourly_cost_usd"]:
-        estimate = _dec(row["hourly_cost_usd"]) * cfg["hours"]
+        estimate = _dec(row["hourly_cost_usd"]) * hours
     need = _active_burn(db, phase_id, now) + _dec(phase["reserve_usd"]) \
         + (estimate or Decimal(0))
     if balance is None or balance < need:
@@ -821,7 +1087,7 @@ def _exec_rent(db, db_path, env_file, phase, cfg, action, now, say):
         return
     try:
         ctx = rent.quote_order(
-            server_id=sid, hours=cfg["hours"],
+            server_id=sid, hours=hours,
             max_cost_usd=str(remaining.quantize(Decimal("0.01"))),
             pool=POOL, cpu_threads=None, db_path=db_path,
             env_file=env_file, key_path=rent.DEFAULT_KEY,
@@ -851,12 +1117,14 @@ def _exec_rent(db, db_path, env_file, phase, cfg, action, now, say):
         db.execute(
             "INSERT INTO experiment_rentals(order_id, phase_id, "
             "server_id, tier, reason, x_min, y_min, hourly_usd, "
-            "creation_fee_usd, quoted_cost_usd, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "creation_fee_usd, quoted_cost_usd, created_at, "
+            "role, burst_id) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (order_id, phase_id, sid, action["tier"], action["reason"],
              x_min, y_min, str(quote["hourly_cost_usd"]),
              str(quote["creation_fee_usd"]),
-             str(quote["cost_bound_usd"]), _iso(now)))
+             str(quote["cost_bound_usd"]), _iso(now),
+             action.get("role", "slot"), action.get("burst_id")))
     emit(db, now, phase_id, order_id, sid, "rent",
          {"tier": action["tier"], "reason": action["reason"],
           "x_min": x_min, "y_min": y_min,
@@ -888,10 +1156,14 @@ def _config_from_args(args):
                 "free_window_min", "dry_after_min",
                 "restart_cooldown_min", "unreachable_min",
                 "rerent_grace_min", "stale_obs_sec",
-                "stale_market_min"):
+                "stale_market_min", "burst_max", "burst_hours",
+                "burst_cooldown_min", "burst_fill_min",
+                "probe_judge_min", "probe_cancel_by_min"):
         value = getattr(args, key, None)
         if value is not None:
             cfg[key] = value
+    if getattr(args, "no_burst_keep_control", False):
+        cfg["burst_keep_control"] = False
     if isinstance(cfg["x_min"], str):
         cfg["x_min"] = [int(v) for v in cfg["x_min"].split(",")]
     if isinstance(cfg["y_min"], str):
@@ -992,6 +1264,27 @@ def cmd_run(args):
         db.close()
 
 
+def cmd_burst(args):
+    db = open_db(args.db)
+    try:
+        phase = open_phase(db, utcnow())
+        if phase is None:
+            print("no open experiment phase; run start-phase first",
+                  file=sys.stderr)
+            return 2
+        cfg = validate_config(json.loads(phase["config_json"]))
+        n = args.n if args.n is not None else cfg["burst_max"]
+        if not 1 <= n <= cfg["burst_max"]:
+            print(f"--n must be 1..{cfg['burst_max']}",
+                  file=sys.stderr)
+            return 2
+        emit(db, utcnow(), phase["phase_id"], None, None,
+             "burst_requested", {"n": n})
+        return 0
+    finally:
+        db.close()
+
+
 def cmd_status(args):
     db = open_db(args.db)
     try:
@@ -1009,7 +1302,8 @@ def cmd_status(args):
               f"remaining ${state['remaining'].quantize(Decimal('0.01'))}")
         for r in state["rentals"]:
             print(f"  order {r['order_id']} server {r['server_id']} "
-                  f"[{r['tier']}] age {str(r['age']).split('.')[0]} "
+                  f"[{r['tier']}/{r['role']}] "
+                  f"age {str(r['age']).split('.')[0]} "
                   f"t0 {_iso(r['t0'])} obs_age "
                   f"{str(r['obs_age']).split('.')[0] if r['obs_age'] else '-'} "
                   f"its={r['its_total']} shares "
@@ -1018,6 +1312,11 @@ def cmd_status(args):
         for pending in state["pending_rerents"]:
             print(f"  pending rerent: server {pending['server_id']} "
                   f"due {_iso(pending['due_at'])}")
+        if state["unjudged_burst"] is not None:
+            b = state["unjudged_burst"]
+            print(f"  burst {b['burst_id']} ({b['trigger']}) unjudged "
+                  f"since {_iso(b['started_at'])}: "
+                  f"{len(state['burst_probes'])}/{b['n_target']} probes")
         return 0
     finally:
         db.close()
@@ -1111,6 +1410,47 @@ def _report(db, phase, cfg):
                   f"shares={seg_count}")
         xy.setdefault(("x", row["x_min"]), []).append((shares, cost))
         xy.setdefault(("y", row["y_min"]), []).append((shares, cost))
+    for burst in db.execute(
+            "SELECT * FROM experiment_bursts WHERE phase_id=? "
+            "ORDER BY burst_id", (phase_id,)):
+        print(f"burst {burst['burst_id']} ({burst['trigger']}) "
+              f"started {burst['started_at']} "
+              f"judged {burst['judged_at'] or '-'}")
+        first_trees = set()
+        for prow in db.execute(
+                "SELECT * FROM experiment_rentals WHERE burst_id=? "
+                "ORDER BY order_id", (burst["burst_id"],)):
+            p_order = prow["order_id"]
+            p_good = _observations(db, p_order)
+            p_arrivals = share_arrivals(p_good)
+            p_t0 = p_good[0][0] if p_good else None
+            judge_shares = sum(
+                a for ts, a in p_arrivals
+                if p_t0 is not None and ts >= p_t0
+                and ts <= p_t0 + _minutes(cfg["probe_judge_min"]))
+            p_shares = sum(a for _, a in p_arrivals)
+            p_segs = trees.tree_segments(db, p_order)
+            first_tree = p_segs[0]["tree_id"] if p_segs else None
+            if first_tree:
+                first_trees.add(first_tree)
+            p_listing = listings.get(prow["server_id"]) or {}
+            p_cpu = (p_listing.get("specs") or {}).get("cpu") or "-"
+            p_gpu = market.offered_gpu(p_listing) or "-"
+            print(f"    probe {p_order} server {prow['server_id']} "
+                  f"[{prow['role']}] cpu={p_cpu} gpu={p_gpu} "
+                  f"hourly=${prow['hourly_usd']} "
+                  f"shares_judge={judge_shares} "
+                  f"first_tree={first_tree or '-'} shares={p_shares}")
+            if prow["role"] in ("kept", "control"):
+                kept_cost = _dec(prow["hourly_usd"]) * Decimal(str(
+                    max(0.0, (_dt(prow["ended_at"]) or now)
+                        .timestamp() - _dt(prow["created_at"])
+                        .timestamp()) / 3600.0))
+                per_usd = (Decimal(p_shares) / kept_cost).quantize(
+                    Decimal("0.01")) if kept_cost else "-"
+                print(f"      {prow['role']}: shares/USD={per_usd}")
+        if first_trees:
+            print(f"    distinct first trees: {len(first_trees)}")
     for (axis, value), rows in sorted(xy.items()):
         total_shares = sum(s for s, _ in rows)
         total_cost = sum(c for _, c in rows)
@@ -1145,17 +1485,31 @@ def main(argv=None):
     sp.add_argument("--rerent-grace-min", type=int)
     sp.add_argument("--stale-obs-sec", type=int)
     sp.add_argument("--stale-market-min", type=int)
+    sp.add_argument("--burst-max", type=int)
+    sp.add_argument("--burst-hours", type=int)
+    sp.add_argument("--burst-cooldown-min", type=int)
+    sp.add_argument("--burst-fill-min", type=int)
+    sp.add_argument("--probe-judge-min", type=int)
+    sp.add_argument("--probe-cancel-by-min", type=int)
+    sp.add_argument("--no-burst-keep-control", action="store_true")
     _add_db_arg(sp)
     sp.set_defaults(func=cmd_start_phase)
 
     rp = sub.add_parser("run", help="run the decision loop")
     rp.add_argument("--live", action="store_true")
     rp.add_argument("--confirm-budget")
-    rp.add_argument("--interval", type=float, default=60)
+    rp.add_argument("--interval", type=float, default=15)
     rp.add_argument("--once", action="store_true")
     rp.add_argument("--env-file", default=DEFAULT_ENV)
     _add_db_arg(rp)
     rp.set_defaults(func=cmd_run)
+
+    bp = sub.add_parser(
+        "burst", help="request a probe burst (event only; decide rents)")
+    bp.add_argument("--n", type=int, default=None,
+                    help="probes to rent (<= phase burst_max)")
+    _add_db_arg(bp)
+    bp.set_defaults(func=cmd_burst)
 
     st = sub.add_parser("status", help="phase + rental state")
     _add_db_arg(st)

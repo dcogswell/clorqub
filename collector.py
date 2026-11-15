@@ -89,6 +89,11 @@ def cmd_start(args):
     if not 0 <= args.spot_limit <= spot.MAX_SPOT_LIMIT:
         err(f"--spot-limit must be 0..{spot.MAX_SPOT_LIMIT}")
         return 2
+    if args.tick_interval is not None and (
+            not math.isfinite(args.tick_interval)
+            or args.tick_interval < 10):
+        err("--tick-interval must be finite and >= 10 seconds")
+        return 2
 
     props, error = query_unit()
     if error:
@@ -112,7 +117,8 @@ def cmd_start(args):
         return 2
 
     argv = collector_service.start_command(
-        db_path, env_file, interval, spot_limit=args.spot_limit)
+        db_path, env_file, interval, spot_limit=args.spot_limit,
+        tick_interval=args.tick_interval)
     try:
         cp = subprocess.run(argv, capture_output=True, text=True,
                             timeout=30)
@@ -195,6 +201,9 @@ def main(argv=None):
                     help="seconds between scans "
                     f"(finite, >= {scanner_watch.MIN_INTERVAL:g}, "
                     f"default {scanner_watch.DEFAULT_INTERVAL:g})")
+    sp.add_argument("--tick-interval", type=float, default=None,
+                    help="seconds between telemetry ticks "
+                    "(finite, >= 10, default 30)")
     sp.add_argument("--spot-limit", type=int,
                     default=spot.DEFAULT_SPOT_LIMIT,
                     help="also fetch up to N spot floors per cycle "

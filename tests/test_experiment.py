@@ -4,6 +4,7 @@ calls, no SSH, dry-run by default."""
 
 import json
 import os
+import sqlite3
 import sys
 import tempfile
 import unittest
@@ -91,14 +92,28 @@ def add_fleet(db, order_id, server_id, state="ready",
 
 
 def add_rental(db, phase_id, order_id, server_id, created_min,
-               x_min=30, y_min=15, tier="other", reason="fill"):
+               x_min=30, y_min=15, tier="other", reason="fill",
+               role="slot", burst_id=None, hourly="0.10"):
     db.execute(
         "INSERT INTO experiment_rentals(order_id, phase_id, server_id,"
         " tier, reason, x_min, y_min, hourly_usd, creation_fee_usd,"
-        " quoted_cost_usd, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+        " quoted_cost_usd, created_at, role, burst_id)"
+        " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (order_id, phase_id, server_id, tier, reason, x_min, y_min,
-         "0.10", "0.10", "0.70", iso(created_min)))
+         hourly, "0.10", "0.70", iso(created_min), role, burst_id))
     db.commit()
+
+
+def add_burst(db, phase_id, started_min, trigger="manual", n_target=3,
+              trigger_order_id=None, judged=False):
+    cur = db.execute(
+        "INSERT INTO experiment_bursts(phase_id, started_at, trigger,"
+        " trigger_order_id, n_target, judged_at)"
+        " VALUES (?,?,?,?,?,?)",
+        (phase_id, iso(started_min), trigger, trigger_order_id,
+         n_target, iso(0) if judged else None))
+    db.commit()
+    return cur.lastrowid
 
 
 def add_obs(db, order_id, minutes_ago, st):
@@ -679,6 +694,472 @@ class ExecutorTests(unittest.TestCase):
                 json.loads(sched["detail_json"])["tier"], "zen")
         finally:
             db.close()
+
+
+class BurstTests(unittest.TestCase):
+    def _dry_slot(self, db, phase, order_id=1, server_id=11):
+        add_fleet(db, order_id, server_id)
+        add_rental(db, phase["phase_id"], order_id, server_id, 30)
+        add_obs(db, order_id, 20, status(submitted=5))
+        add_obs(db, order_id, 0.5, status(submitted=5))
+
+    def test_auto_burst_on_dry_restart_and_guards(self):
+        db = make_db()
+        try:
+            phase = add_phase(db)
+            add_snapshot(db, [listing(server_id=20)])
+            self._dry_slot(db, phase)
+            acts, _ = actions(db, phase)
+            self.assertEqual(kinds(acts, "restart")[0]["reason"], "dry")
+            bursts = kinds(acts, "burst")
+            self.assertEqual(len(bursts), 1)
+            self.assertEqual(bursts[0]["trigger"], "dry")
+            self.assertEqual(bursts[0]["trigger_order_id"], 1)
+            self.assertEqual(bursts[0]["n"], CFG["burst_max"])
+            # an unjudged burst blocks new bursts
+            add_burst(db, phase["phase_id"], 2)
+            acts, _ = actions(db, phase)
+            self.assertEqual(kinds(acts, "burst"), [])
+            # a judged burst inside the cooldown blocks too
+            db2 = make_db()
+            try:
+                phase2 = add_phase(db2)
+                add_snapshot(db2, [listing(server_id=20)])
+                self._dry_slot(db2, phase2)
+                add_burst(db2, phase2["phase_id"], 30, judged=True)
+                acts, _ = actions(db2, phase2)
+                self.assertEqual(kinds(acts, "restart")[0]["reason"],
+                                 "dry")
+                self.assertEqual(kinds(acts, "burst"), [])
+                # past the cooldown: burst again
+                db2.execute(
+                    "UPDATE experiment_bursts SET started_at=?",
+                    (iso(61),))
+                db2.commit()
+                acts, _ = actions(db2, phase2)
+                self.assertEqual(len(kinds(acts, "burst")), 1)
+            finally:
+                db2.close()
+        finally:
+            db.close()
+
+    def test_manual_burst_consumed_once(self):
+        db = make_db()
+        try:
+            phase = add_phase(db)
+            add_snapshot(db, [listing(server_id=20)])
+            add_event(db, phase["phase_id"], 1, "burst_requested",
+                      detail={"n": 2})
+            acts, _ = actions(db, phase)
+            bursts = kinds(acts, "burst")
+            self.assertEqual(len(bursts), 1)
+            self.assertEqual(bursts[0]["trigger"], "manual")
+            self.assertEqual(bursts[0]["n"], 2)
+            add_event(db, phase["phase_id"], 0.5, "burst_started",
+                      detail={"burst_id": 1})
+            acts, _ = actions(db, phase)
+            self.assertEqual(kinds(acts, "burst"), [])
+        finally:
+            db.close()
+
+    def test_probe_renting_one_per_cycle_cheapest(self):
+        db = make_db()
+        try:
+            phase = add_phase(db)
+            add_snapshot(db, [
+                listing(server_id=20, price=2.4),
+                listing(server_id=21, price=4.0),
+            ])
+            burst_id = add_burst(db, phase["phase_id"], 1, n_target=3)
+            acts, _ = actions(db, phase)
+            probes = [r for r in kinds(acts, "rent")
+                      if r.get("role") == "probe"]
+            self.assertEqual(len(probes), 1)
+            self.assertEqual(probes[0]["burst_id"], burst_id)
+            self.assertEqual(probes[0]["server_id"], 20)
+            self.assertEqual(probes[0]["hours"], CFG["burst_hours"])
+            for oid, sid in ((10, 20), (11, 21), (12, 9)):
+                add_fleet(db, oid, sid)
+                add_rental(db, phase["phase_id"], oid, sid, 1,
+                           role="probe", burst_id=burst_id)
+                add_obs(db, oid, 0.5, status(submitted=0))
+                acts, _ = actions(db, phase)
+                probes_now = [r for r in kinds(acts, "rent")
+                              if r.get("role") == "probe"]
+                if oid == 10:
+                    self.assertEqual(len(probes_now), 1)
+                    self.assertEqual(probes_now[0]["server_id"], 21)
+            acts, _ = actions(db, phase)
+            self.assertEqual(kinds(acts, "rent"), [])
+        finally:
+            db.close()
+
+    def test_probes_exceed_slots_not_total_cap(self):
+        db = make_db()
+        try:
+            phase = add_phase(db)
+            add_snapshot(db, [listing(server_id=20)])
+            burst_id = add_burst(db, phase["phase_id"], 1, n_target=4)
+            # 2 slot + 4 probe active = max_rentals + burst_max cap
+            for oid in (30, 31):
+                add_fleet(db, oid, 30 + oid - 30)
+                add_rental(db, phase["phase_id"], oid, 30 + oid - 30,
+                           20)
+                add_obs(db, oid, 0.5, status(submitted=1))
+            for oid, sid in ((40, 40), (41, 41), (42, 42), (43, 43)):
+                add_fleet(db, oid, sid)
+                add_rental(db, phase["phase_id"], oid, sid, 3,
+                           role="probe", burst_id=burst_id)
+                add_obs(db, oid, 0.5, status(submitted=1))
+            acts, _ = actions(db, phase)
+            self.assertEqual(kinds(acts, "rent"), [])
+            # one probe ending frees a total slot: probes still rent
+            # even though both max_rentals slots are full
+            db.execute(
+                "UPDATE experiment_rentals SET ended_at=? WHERE "
+                "order_id=43", (iso(0),))
+            db.commit()
+            acts, _ = actions(db, phase)
+            rents = kinds(acts, "rent")
+            self.assertEqual(len(rents), 1)
+            self.assertEqual(rents[0]["role"], "probe")
+        finally:
+            db.close()
+
+    def test_no_restarts_for_probes(self):
+        db = make_db()
+        try:
+            phase = add_phase(db)
+            add_snapshot(db, [])
+            burst_id = add_burst(db, phase["phase_id"], 3)
+            add_fleet(db, 10, 20)
+            add_rental(db, phase["phase_id"], 10, 20, 6, role="probe",
+                       burst_id=burst_id)
+            add_obs(db, 10, 2, status(submitted=0))
+            add_obs(db, 10, 0.5, status(submitted=0))
+            acts, _ = actions(db, phase)
+            self.assertEqual(kinds(acts, "restart"), [])
+            # and a dry probe still gets none
+            add_obs(db, 10, 30, status(submitted=5))
+            add_fleet(db, 11, 21)
+            add_rental(db, phase["phase_id"], 11, 21, 30, role="probe",
+                       burst_id=burst_id)
+            add_obs(db, 11, 20, status(submitted=5))
+            add_obs(db, 11, 0.5, status(submitted=5))
+            acts, _ = actions(db, phase)
+            self.assertEqual(kinds(acts, "restart"), [])
+        finally:
+            db.close()
+
+    def test_judging_keeps_finder_and_control(self):
+        db = make_db()
+        try:
+            phase = add_phase(db)
+            add_snapshot(db, [])
+            burst_id = add_burst(db, phase["phase_id"], 10, n_target=3)
+            add_fleet(db, 10, 20)
+            add_fleet(db, 11, 21)
+            add_fleet(db, 12, 22)
+            add_rental(db, phase["phase_id"], 10, 20, 7, role="probe",
+                       burst_id=burst_id, hourly="0.15")
+            add_rental(db, phase["phase_id"], 11, 21, 7, role="probe",
+                       burst_id=burst_id, hourly="0.05")
+            add_rental(db, phase["phase_id"], 12, 22, 7, role="probe",
+                       burst_id=burst_id, hourly="0.10")
+            add_obs(db, 10, 6, status(submitted=1))   # finder
+            add_obs(db, 10, 0.5, status(submitted=3))
+            add_obs(db, 11, 6, status(submitted=0))
+            add_obs(db, 11, 0.5, status(submitted=0))
+            add_obs(db, 12, 6, status(submitted=0))
+            add_obs(db, 12, 0.5, status(submitted=0))
+            acts, _ = actions(db, phase)
+            judges = kinds(acts, "judge")
+            self.assertEqual(len(judges), 1)
+            judge = judges[0]
+            self.assertEqual(judge["burst_id"], burst_id)
+            self.assertEqual(judge["finders"], [10])
+            self.assertEqual(judge["keep"], [10])
+            self.assertEqual(judge["control"], 11)
+            self.assertEqual(judge["cancel"], [12])
+            with mock.patch.object(
+                    experiment.rent, "cancel_managed_order",
+                    return_value=(0, {})) as cancel_mock:
+                experiment.execute(
+                    db, ":memory:", "/tmp/env", phase, CFG, [judge],
+                    NOW, live=True, say=lambda *_a: None)
+            cancel_mock.assert_called_once()
+            roles = {r["order_id"]: (r["role"], r["end_reason"])
+                     for r in db.execute(
+                         "SELECT order_id, role, end_reason FROM "
+                         "experiment_rentals")}
+            self.assertEqual(roles[10][0], "kept")
+            self.assertEqual(roles[11][0], "control")
+            self.assertEqual(roles[12], ("probe", "probe_no_share"))
+            burst = db.execute(
+                "SELECT judged_at FROM experiment_bursts WHERE "
+                "burst_id=?", (burst_id,)).fetchone()
+            self.assertIsNotNone(burst["judged_at"])
+            event = db.execute(
+                "SELECT detail_json FROM experiment_events WHERE "
+                "kind='burst_judged'").fetchone()
+            self.assertEqual(json.loads(event["detail_json"])
+                             ["cancelled"], [12])
+        finally:
+            db.close()
+
+    def test_past_deadline_probe_excluded_from_judge(self):
+        db = make_db()
+        try:
+            phase = add_phase(db)
+            add_snapshot(db, [])
+            burst_id = add_burst(db, phase["phase_id"], 10,
+                                 n_target=3)
+            add_fleet(db, 10, 20)
+            # age 8.5 min: inside [cancel_by-1, cancel_by) maturity
+            # band it would judge, but past deadline it must not be
+            # kept or judged-cancelled.
+            add_rental(db, phase["phase_id"], 10, 20, 8.5,
+                       role="probe", burst_id=burst_id)
+            add_obs(db, 10, 6, status(submitted=1))
+            add_obs(db, 10, 0.5, status(submitted=2))
+            acts, _ = actions(db, phase)
+            cancels = kinds(acts, "cancel")
+            self.assertEqual([c["reason"] for c in cancels],
+                             ["probe_deadline"])
+            judges = kinds(acts, "judge")
+            self.assertEqual(len(judges), 1)
+            self.assertNotIn(10, judges[0]["keep"])
+            self.assertNotIn(10, judges[0]["cancel"])
+            self.assertNotEqual(judges[0]["control"], 10)
+        finally:
+            db.close()
+
+    def test_probe_guard_blocks_rents(self):
+        db = make_db()
+        try:
+            phase = add_phase(db)
+            add_snapshot(db, [listing(server_id=20)])
+            burst_id = add_burst(db, phase["phase_id"], 1, n_target=3)
+            add_fleet(db, 10, 30)
+            # 4.5 min is past cancel_by(8) - PROBE_RENT_GUARD_MIN(4)
+            add_rental(db, phase["phase_id"], 10, 30, 4.5,
+                       role="probe", burst_id=burst_id)
+            add_obs(db, 10, 0.5, status(submitted=0))
+            acts, _ = actions(db, phase)
+            self.assertEqual(kinds(acts, "rent"), [])
+            self.assertEqual([b["reason"] for b in
+                              kinds(acts, "blocked")],
+                             ["probe_guard"])
+            # a younger probe leaves renting open
+            db.execute(
+                "UPDATE experiment_rentals SET created_at=? WHERE "
+                "order_id=10", (iso(3),))
+            db.commit()
+            acts, _ = actions(db, phase)
+            rents = kinds(acts, "rent")
+            self.assertEqual(len(rents), 1)
+            self.assertEqual(rents[0]["role"], "probe")
+            self.assertEqual(kinds(acts, "blocked"), [])
+        finally:
+            db.close()
+
+    def test_probe_deadline_cancels_regardless(self):
+        db = make_db()
+        try:
+            phase = add_phase(db)
+            add_snapshot(db, [])
+            burst_id = add_burst(db, phase["phase_id"], 3)
+            add_fleet(db, 10, 20)
+            add_rental(db, phase["phase_id"], 10, 20,
+                       CFG["probe_cancel_by_min"], role="probe",
+                       burst_id=burst_id)
+            add_obs(db, 10, 0.5, status(submitted=0))
+            acts, _ = actions(db, phase)
+            cancels = kinds(acts, "cancel")
+            self.assertEqual(len(cancels), 1)
+            self.assertEqual(cancels[0]["reason"], "probe_deadline")
+        finally:
+            db.close()
+
+    def test_kept_and_control_get_no_rerolls(self):
+        db = make_db()
+        try:
+            phase = add_phase(db)
+            add_snapshot(db, [])
+            for oid, role in ((10, "kept"), (11, "control")):
+                add_fleet(db, oid, 20 + oid - 10)
+                add_rental(db, phase["phase_id"], oid, 20 + oid - 10,
+                           30, role=role)
+                add_obs(db, oid, 20, status(submitted=5))
+                add_obs(db, oid, 0.5, status(submitted=5))
+            acts, _ = actions(db, phase)
+            self.assertEqual(kinds(acts, "restart"), [])
+            self.assertEqual(kinds(acts, "cancel"), [])
+        finally:
+            db.close()
+        # term end still ends them
+        db = make_db()
+        try:
+            phase = add_phase(db)
+            add_snapshot(db, [])
+            add_fleet(db, 10, 20, deadline_min=1)
+            add_rental(db, phase["phase_id"], 10, 20, 30, role="kept")
+            _, state = actions(db, phase)
+            self.assertEqual(state["rentals"], [])
+            row = db.execute(
+                "SELECT end_reason FROM experiment_rentals WHERE "
+                "order_id=10").fetchone()
+            self.assertEqual(row["end_reason"], "term_end")
+        finally:
+            db.close()
+
+    def test_trivial_judge_zero_probes(self):
+        db = make_db()
+        try:
+            phase = add_phase(db)
+            add_snapshot(db, [])
+            burst_id = add_burst(db, phase["phase_id"], 6)
+            acts, _ = actions(db, phase)
+            judges = kinds(acts, "judge")
+            self.assertEqual(len(judges), 1)
+            self.assertEqual(judges[0]["finders"], [])
+            self.assertEqual(judges[0]["keep"], [])
+            self.assertIsNone(judges[0]["control"])
+            self.assertEqual(judges[0]["cancel"], [])
+        finally:
+            db.close()
+
+    def test_probe_cancel_by_must_be_under_free_window(self):
+        with self.assertRaises(ValueError):
+            experiment.validate_config(
+                dict(CFG, probe_cancel_by_min=CFG["free_window_min"]))
+        with self.assertRaises(ValueError):
+            experiment.validate_config(
+                dict(CFG, probe_cancel_by_min=99))
+
+    def test_dry_run_burst_makes_no_calls(self):
+        db = make_db()
+        try:
+            phase = add_phase(db)
+            acts = [
+                {"type": "burst", "trigger": "manual",
+                 "trigger_order_id": None, "n": 4},
+                {"type": "judge", "burst_id": 1, "finders": [10],
+                 "keep": [10], "control": 11, "cancel": [12]},
+                {"type": "rent", "server_id": 5, "reason": "probe",
+                 "tier": "other", "role": "probe", "burst_id": 1,
+                 "hours": 1},
+            ]
+            with mock.patch.object(
+                    experiment.rig_ssh, "restart_miner") as ssh_mock, \
+                    mock.patch.object(
+                        experiment.rent, "cancel_managed_order"
+                    ) as cancel_mock, \
+                    mock.patch.object(
+                        experiment.rent, "quote_order") as quote_mock, \
+                    mock.patch.object(
+                        experiment.rent, "create_order_flow"
+                    ) as create_mock, \
+                    mock.patch.object(
+                        experiment.orders, "fetch_wallets"
+                    ) as wallet_mock:
+                experiment.execute(
+                    db, ":memory:", "/tmp/env", phase, CFG, acts, NOW,
+                    live=False, say=lambda *_a: None)
+            for m in (ssh_mock, cancel_mock, quote_mock, create_mock,
+                      wallet_mock):
+                m.assert_not_called()
+            self.assertEqual(
+                db.execute("SELECT COUNT(*) FROM experiment_bursts"
+                           ).fetchone()[0], 0)
+            self.assertEqual(
+                db.execute("SELECT COUNT(*) FROM experiment_events "
+                           "WHERE kind='dryrun'").fetchone()[0], 3)
+        finally:
+            db.close()
+
+    def test_quote_always_auto_renew_false(self):
+        db = make_db()
+        try:
+            phase = add_phase(db)
+            add_snapshot(db, [listing(server_id=5)])
+            with open(experiment.__file__) as fh:
+                self.assertNotIn("set_renewal", fh.read())
+            ctx = {"quote": {"cost_bound_usd": "0.30",
+                             "hourly_cost_usd": "0.10",
+                             "creation_fee_usd": "0.10"}}
+            with mock.patch.object(
+                    experiment.rent, "load_secrets",
+                    return_value=("KEY", None)), \
+                    mock.patch.object(
+                        experiment.orders, "fetch_wallets",
+                        return_value={"code": 0, "wallets": [
+                            {"name": "USD-Blockchain", "balance": 999}
+                        ]}), \
+                    mock.patch.object(
+                        experiment.rent, "quote_order",
+                        return_value=ctx) as quote_mock, \
+                    mock.patch.object(
+                        experiment.rent, "create_order_flow",
+                        side_effect=[(0, {"order_id": 42}),
+                                     (0, {"order_id": 43})]):
+                for role, hours in (("slot", None), ("probe", 1)):
+                    action = {"type": "rent", "server_id": 5,
+                              "reason": "probe" if role == "probe"
+                              else "fill", "tier": "other",
+                              "role": role}
+                    if role == "probe":
+                        action["burst_id"] = 1
+                        action["hours"] = hours
+                    experiment.execute(
+                        db, ":memory:", "/tmp/env", phase, CFG,
+                        [action], NOW, live=True,
+                        say=lambda *_a: None)
+            for call in quote_mock.call_args_list:
+                self.assertIs(call.kwargs["auto_renew"], False)
+            probe_call = quote_mock.call_args_list[1]
+            self.assertEqual(probe_call.kwargs["hours"],
+                             CFG["burst_hours"])
+            row = db.execute(
+                "SELECT role, burst_id FROM experiment_rentals WHERE "
+                "order_id=43").fetchone()
+            self.assertEqual((row["role"], row["burst_id"]),
+                             ("probe", 1))
+        finally:
+            db.close()
+
+    def test_migration_adds_role_and_burst_id(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = os.path.join(tmp, "old.sqlite3")
+            old = sqlite3.connect(db_path)
+            old.execute(
+                "CREATE TABLE experiment_rentals("
+                "order_id INTEGER PRIMARY KEY, phase_id INTEGER NOT NULL,"
+                " server_id INTEGER NOT NULL, tier TEXT NOT NULL,"
+                " reason TEXT NOT NULL, x_min INTEGER NOT NULL,"
+                " y_min INTEGER NOT NULL, hourly_usd TEXT NOT NULL,"
+                " creation_fee_usd TEXT NOT NULL,"
+                " quoted_cost_usd TEXT NOT NULL, created_at TEXT NOT NULL,"
+                " ended_at TEXT, end_reason TEXT)")
+            old.execute(
+                "INSERT INTO experiment_rentals VALUES"
+                "(1, 1, 5, 'zen', 'fill', 30, 15, '0.1', '0.1', '0.7',"
+                " '2026-11-15T00:00:00+00:00', NULL, NULL)")
+            old.commit()
+            old.close()
+            db = experiment.open_db(db_path)
+            try:
+                cols = {r[1] for r in db.execute(
+                    "PRAGMA table_info(experiment_rentals)")}
+                self.assertIn("role", cols)
+                self.assertIn("burst_id", cols)
+                row = db.execute(
+                    "SELECT role, burst_id FROM experiment_rentals"
+                    ).fetchone()
+                self.assertEqual((row["role"], row["burst_id"]),
+                                 ("slot", None))
+            finally:
+                db.close()
 
 
 class CliTests(unittest.TestCase):
