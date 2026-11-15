@@ -89,7 +89,8 @@ Initial scanner implementation: `python3 cli.py scan` is read-only. A saved
 marketplace response can be ranked with `python3 cli.py scan --snapshot
 marketplace.json --db path/to/clorqub.sqlite3`; live mode reads
 `CLORE_API_KEY` from the environment or `~/.config/clorqub/env`. The SQLite
-database stores raw marketplace snapshots, server/spec/price history, and
+database stores the latest raw marketplace response (older scans keep only
+time/source/server count), change-only server/spec/price history, and
 these sourced benchmark anchors plus raw it/s context. An offline file's
 import timestamp is not its original observation time or fresh availability.
 The initial ranking uses on-demand pricing
@@ -502,6 +503,18 @@ clorqub/
     tui.py             # Textual viewer (Phase 5)
 ```
 
+Current layout (Phase 1, flat at the repo root; the package split above is
+the target): `cli.py` (scan CLI), `market.py` (marketplace ingest, change
+keys, scorer), `spot.py` (bounded spot-floor observations), `orders.py`
+(`my_orders`/wallet inventory), `scanner_watch.py` + `collector.py` +
+`collector_service.py` (opt-in transient systemd `--user` scanner),
+`rent.py` + `rental_policy.py` (guarded operator rentals), `fleet_store.py`
+(rental records, rig observations, log chunks), `rig_ssh.py` (validated SSH
+transport), `telemetry.py` + `telemetry_policy.py` (enrolled-rig polling and
+presentation), `rig_logs.py` (miner-log tail), `tui.py` + `tui_data.py`
+(TUI and its read-only views), `clipboard.py`, `formatting.py`; rig side in
+`rig/` (`bootstrap.sh`, `agent.py`, `qubic_parse.py`).
+
 ### Rig runtime: Clore's HiveOS image + bootstrap
 
 No image of our own. Rentals use Clore's own **`cloreai/hiveos:0.4`** image
@@ -803,11 +816,14 @@ and never relies on a remote counter staying alive.
 - **Vanished orders:** a managed rig absent from a fresh (<15 min) good
   `my_orders` snapshot whose SSH is failing is marked `missing` and no
   longer polled. This is detection only; it does not cancel anything.
-- **TUI fleet/orders views:** the Fleet tab lists only active rigs
-  (cancelled/missing/failed states and orders vanished from a later
-  good inventory are hidden) and shows burn $/hr plus reported spend;
-  the Orders tab keeps every order ever seen in snapshot history,
-  marked active or ended.
+- **TUI fleet/orders views:** the Fleet tab lists only active rigs by
+  default (cancelled/missing/failed states and orders vanished from a
+  later good inventory are hidden) and shows burn $/hr plus reported
+  spend; `f` toggles to all rigs, with ended rigs dimmed and their
+  uptime frozen at the end time. The Orders tab keeps every order ever
+  seen in snapshot history, marked active or ended, with Sh/h (recent
+  submitted shares/hour from rig telemetry) and Sh/¢ (shares per
+  fee-inclusive cent of spend rate).
 - **Finding (2026-11):** a rented rig was unreachable for ~78 min while
   still billing before the user cancelled it by hand -- and its miner
   log was lost because nothing persisted it. Log archiving now covers
@@ -827,8 +843,23 @@ or not we rented it.
   offered is visible: CPU model, `cpus` cores/threads offered, RAM, disk +
   speed, motherboard, PCIe rev/width, GPU models (`gpu_array`), GPU count,
   VRAM, CUDA, power limits, listed net down/up + latest speed-test time.
+  A new interval opens only on a real spec change: the free-space figure
+  appended to `specs.disk` and live GPU power draw (`specs.pl`) are ignored
+  when comparing (`market.spec_change_key`).
 - `server_prices`: price history (on-demand and spot min, per currency, plus
-  USD/day), sampled each poll when changed.
+  USD/day). A new version opens only when an owner-set USD field changes
+  (`usd.on_demand_usd`, `usd.spot`, `original_usd`, `USD-Blockchain`); the
+  CLORE/BTC amounts Clore re-converts at the live rate every poll are
+  ignored (`market.price_change_key`). Each version keeps the full price
+  JSON from its first sighting.
+- `marketplace_snapshots`: one row per scan (time, source, server count);
+  only the newest row keeps the full raw response. `servers.latest_json`
+  always holds each server's current raw listing (live FX amounts, disk).
+- **Finding (2026-11-15):** storing every 5-minute scan in full grew the db
+  ~1.7 GB/day (4.3 MB raw payload per scan; ~99% of price versions were
+  FX-only and ~95% of spec versions were free-disk-only). After the
+  change-only rules and a one-off compaction of existing history the db
+  went from 1.78 GB to ~35 MB; a scan now adds tens of rows, not ~2,500.
 - `rig_reports`: what the rig actually reported at boot (CPU model, `nproc`,
   CPU flags such as AVX2/AVX-512, `nvidia-smi` GPUs, driver/CUDA). Compared
   with the listing for the spec-mismatch check.
@@ -1070,11 +1101,11 @@ Clore rate limits (1 req/s, `create_order` 1 per 5 s) are enforced in
 | Phase | Deliverable | Depends on |
 |-------|-------------|------------|
 | 0 | Done so far: Clore API auth/rate limits/endpoints, marketplace field meanings (cross-checked with web UI), price units, spot data, region/network data, HiveOS dropped, miner packages (URLs, `.hash` verification, config formats, jetski local API). **Remaining:** (1) Docker order specifics — `ssh_key` / `command` / max-duration fields, time from order to SSH, whether hosts allow mining in Docker orders; (2) creation-fee rule and actual-charge reporting, via one cheap test rental (with user approval); (3) a real jetski `/summary` response and GPU runtime needs (both binaries already confirmed to run in plain `ubuntu:24.04`); (4) jetski and qubic.li per-worker stats and payout APIs; (5) QUBIC/USD price source; (6) Qubic idle-phase schedule | — |
-| 1 | **In progress:** read-only on-demand marketplace scanner (`cli.py`/`market.py`) persists marketplace snapshots, server/spec/price history, and user-supplied whole-rig benchmark anchors in SQLite; provisionally ranks only matching RTX 3070 / 3080 Ti / 3090 Ti + Ryzen 9 7945HX or 7950X profiles by sols/hour per dollar. Opt-in `--watch`/`--interval` rescan loop (`scanner_watch.py`, 300 s default, never auto-started) plus `collector.py` controls for a transient systemd-run `--user` service (no install/autostart) feed the read-only `tui.py` viewer. Live scans also poll `my_orders` (observe-only inventory incl. manual web-UI rentals); optional `--spot-limit` adds bounded spot-floor observations (indicative only, no bids). Guarded operator rentals exist via `rent.py` (dry-run default, confirmed --live, on-demand bounded term, one POST, reconcile/adopt, observe-only enroll), and the TUI runs the same guarded flow in-process on `b` (setup -> live quote review -> explicit Confirm & Rent, no terminal handoff) plus one on-demand read-only miner-log tail fetch on `l`; watch/collector cycles also SSH-read enrolled rigs every 30 s into `rig_observations` shown on the TUI Fleet tab (no extra Clore API calls). Remaining: live spot ranking, pool payout conversion, broader CPU/GPU/thread-allocation calibration, and price-premium display | 0 |
+| 1 | **In progress:** read-only on-demand marketplace scanner (`cli.py`/`market.py`) persists the latest raw marketplace response, change-only server/spec/price history (FX-only price moves and free-disk/power-draw spec moves are not new versions), and user-supplied whole-rig benchmark anchors in SQLite; provisionally ranks only matching RTX 3070 / 3080 Ti / 3090 Ti + Ryzen 9 7945HX or 7950X profiles by sols/hour per dollar. Opt-in `--watch`/`--interval` rescan loop (`scanner_watch.py`, 300 s default, never auto-started) plus `collector.py` controls for a transient systemd-run `--user` service (no install/autostart) feed the read-only `tui.py` viewer. Live scans also poll `my_orders` (observe-only inventory incl. manual web-UI rentals); optional `--spot-limit` adds bounded spot-floor observations (indicative only, no bids). Guarded operator rentals exist via `rent.py` (dry-run default, confirmed --live, on-demand bounded term, one POST, reconcile/adopt, observe-only enroll), and the TUI runs the same guarded flow in-process on `b` (setup -> live quote review -> explicit Confirm & Rent, no terminal handoff; the progress log can be hidden and reopened with `b` while the rental keeps running, and quit is blocked until it finishes) plus one on-demand read-only miner-log tail fetch on `l`; watch/collector cycles also SSH-read enrolled rigs every 30 s into `rig_observations` shown on the TUI Fleet tab (no extra Clore API calls). Remaining: live spot ranking, pool payout conversion, broader CPU/GPU/thread-allocation calibration, and price-premium display | 0 |
 | 2 | `qubic_parse.py` (copied parsers for both miners + tests against real `stats.<epoch>.lock`/log samples) + rig bootstrap + agent (package fetch/verify, both miners, `.lock` mirror; tested locally in `cloreai/hiveos:0.4`) + SQLite schema incl. `commands`/`events` + collector + single-rental path: rent one server, early boot check, confirm shares — on each pool, with a switch between them that loses no data | 0 |
 | 3 | Share summary windows (15m/1h/2h/4h/24h/epoch; fleet / worker / server, split by pool run) + per-server history + learned perf model + payouts + blacklist (manual + auto rules, `servers`/`server <id>`/`hardware` reports) | 2 |
 | 4 | Full loop: spend policy (2-rental limit, burst, premium ceiling, daily + epoch budgets with reserves/rollover accounting) + exploration + pool switching + rotation with hysteresis + watchdog | 1, 3 |
-| 5 | Textual TUI client (reads SQLite, sends `commands`). **Partial, delivered early:** `tui.py` + `tui_data.py` = read-only marketplace viewer over the scanner db (Candidates / Marketplace / Benchmarks, server detail). Fleet table, share windows and `commands` controls still come later | 4 |
+| 5 | Textual TUI client (reads SQLite, sends `commands`). **Partial, delivered early:** `tui.py` + `tui_data.py` over the scanner db: Candidates / Marketplace / Benchmarks / Orders / Fleet tabs, server/order/rig detail, guarded rent and order cancel/auto-renew modals, miner-log view, click-to-sort columns, column nudge buttons and drag scrolling, and a compact layout for small (phone/SSH) viewports. Share windows and `commands` controls still come later | 4 |
 | 6 | Later: web view (FastAPI, localhost/auth); Discord bot (posts `events`, accepts allowlisted `commands`) | 4 |
 | 7 | Future: read-only local non-rental PC monitoring; shared stats/epoch earnings with explicit machine identity and separate local/rental costs. Optional local controls only after per-machine opt-in | 2, 3, 5 |
 
