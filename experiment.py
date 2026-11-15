@@ -23,6 +23,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
+import blacklist
 import fleet_store
 import market
 import orders
@@ -140,6 +141,7 @@ def utcnow():
 def open_db(path):
     db = market.connect_db(os.path.expanduser(path))
     fleet_store.initialize(db)
+    blacklist.initialize(db)
     db.executescript(SCHEMA)
     # migration: role/burst_id on experiment_rentals for burst probing
     cols = {row[1] for row in
@@ -339,6 +341,7 @@ def _rental_state(db, phase, row, now, cfg, listings):
         "reroll_start": reroll_start,
         "quiet_since": quiet_since,
         "good_obs": good,
+        "spec_mismatch": spec_mismatch(listing, last_status),
     }
 
 
@@ -411,7 +414,8 @@ def server_listings(db):
     return result
 
 
-def history_stats(db, known_listings):
+def history_stats(db, known_listings, exclude_order_id=None,
+                  compatible=None):
     """Per-hardware history from all past fleet_rentals:
     coverage {(cpu, gpu): observed hours},
     cpu_prior {cpu: median its.cpu after the rental's first third},
@@ -419,7 +423,10 @@ def history_stats(db, known_listings):
     coverage = {}
     cpu_samples = {}
     gpu_samples = {}
+    rental_counts = {"cpu": {}, "gpu": {}}
     for fleet in db.execute("SELECT * FROM fleet_rentals"):
+        if fleet["order_id"] == exclude_order_id:
+            continue
         listing = known_listings.get(fleet["server_id"])
         if listing is None:
             continue
@@ -433,18 +440,35 @@ def history_stats(db, known_listings):
         coverage[key] = coverage.get(key, 0.0) + \
             max(0.0, (last - t0).total_seconds() / 3600.0)
         cutoff = t0 + (last - t0) / 3
+        samples = {"cpu": [], "gpu": []}
         for ts, status in good:
             if ts < cutoff:
                 continue
+            if compatible is not None and benchmark_context(
+                    status) != compatible:
+                continue
             its = status.get("its") or {}
-            if its.get("cpu") is not None:
-                cpu_samples.setdefault(cpu, []).append(its["cpu"])
-            if gpu is not None and its.get("gpu") is not None:
-                gpu_samples.setdefault(gpu, []).append(its["gpu"])
+            for device in samples:
+                value = its.get(device)
+                if isinstance(value, (int, float)) and not isinstance(
+                        value, bool) and math.isfinite(value) and value >= 0:
+                    samples[device].append(value)
+        for device, key, target in (
+                ("cpu", cpu, cpu_samples), ("gpu", gpu, gpu_samples)):
+            if key is not None and samples[device]:
+                # Fault comparisons give each rental equal weight; preserve
+                # the existing sample-weighted priors for candidate ranking.
+                values = ([_median(samples[device])] if compatible is not None
+                          else samples[device])
+                target.setdefault(key, []).extend(values)
+                counts = rental_counts[device]
+                counts[key] = counts.get(key, 0) + 1
     return {
         "coverage": coverage,
         "cpu_prior": {k: _median(v) for k, v in cpu_samples.items()},
         "gpu_prior": {k: _median(v) for k, v in gpu_samples.items()},
+        "cpu_rentals": rental_counts["cpu"],
+        "gpu_rentals": rental_counts["gpu"],
     }
 
 
@@ -562,7 +586,8 @@ def build_state(db, phase, now, cfg, apply_endings=True, say=print):
         "remaining": budget - committed,
         "rentals": rentals,
         "pending_rerents": pending_rerents(db, phase_id),
-        "excluded": excluded_servers(db, phase_id),
+        "excluded": excluded_servers(db, phase_id) | set(
+            blacklist.active(db, now)),
         "listings": listings,
         "scored": scored,
         "snapshot_at": snapshot_at,
@@ -580,8 +605,130 @@ def build_state(db, phase, now, cfg, apply_endings=True, say=print):
     }
 
 
+def spec_mismatch(listing, status):
+    """Only flag explicit, comparable CPU model/allocation differences."""
+    specs = (listing or {}).get("specs") or {}
+    hardware = status.get("hardware") or {}
+    tokens = lambda s: set(re.findall(r"\b\d{4,5}[a-z]{0,3}\b",
+                                     str(s or "").lower()))
+    offered = tokens(specs.get("cpu"))
+    seen = tokens(hardware.get("cpu_model"))
+    if offered and seen and offered.isdisjoint(seen):
+        return ("spec_mismatch:cpu", {
+            "listed": specs["cpu"], "observed": hardware["cpu_model"]})
+    threads = rental_policy.offered_threads(specs)
+    nproc = hardware.get("nproc")
+    if threads and isinstance(nproc, int) and nproc < threads:
+        return ("spec_mismatch:threads", {
+            "listed": threads, "observed": nproc})
+    return None
+
+
+def benchmark_context(status):
+    """Conservative compatibility key for automatic low-it/s decisions."""
+    package = status.get("package") or {}
+    hardware = status.get("hardware") or {}
+    trainer = status.get("trainer") or {}
+    return ((status.get("shares") or {}).get("epoch"),
+            package.get("sha256") or package.get("version"),
+            status.get("pool"), hardware.get("nproc"),
+            len(hardware["gpus"]) if isinstance(hardware.get("gpus"), list)
+            else None, trainer.get("variant"), trainer.get("version"))
+
+
+def blacklist_checks(db, state, now, cfg):
+    """Evidence for new blocks; reads only and never uses share yield."""
+    results = []
+    blocked = blacklist.active(db, now)
+    listings = {**server_listings(db), **state["listings"]}
+    cutoff = now - _minutes(30)
+    # A stopped collector supplies no new evidence about a server.
+    if state["telemetry_age_s"] is None or \
+            state["telemetry_age_s"] > cfg["stale_obs_sec"]:
+        return results
+    for r in state["rentals"]:
+        sid, oid = r["server_id"], r["order_id"]
+        if sid in blocked:
+            continue
+        # Removing an entry deliberately allows retry; don't recreate it
+        # from the same rental's old evidence.
+        if db.execute(
+                "SELECT 1 FROM experiment_events WHERE order_id=? "
+                "AND kind='blacklisted' LIMIT 1", (oid,)).fetchone():
+            continue
+        recent = r["last_obs_at"]
+        if recent is None or (now - recent).total_seconds() > cfg["stale_obs_sec"]:
+            continue
+        evidence = None
+        if r["age"] >= _minutes(30):
+            rows = db.execute(
+                "SELECT status_json FROM rig_observations WHERE order_id=? "
+                "AND captured_at>=? AND captured_at<=?",
+                (oid, _iso(cutoff), _iso(now))).fetchall()
+            failed = sum(row["status_json"] is None for row in rows)
+            if len(rows) >= 20 and failed / len(rows) > 0.40:
+                evidence = ("flaky_ssh", {"failed": failed, "total": len(rows),
+                                         "window_minutes": 30})
+        fresh = r["obs_age"] is not None and r["obs_age"].total_seconds() \
+            <= cfg["stale_obs_sec"]
+        listing = listings.get(sid)
+        if evidence is None and fresh:
+            evidence = spec_mismatch(listing, r["good_obs"][-1][1])
+        if evidence is None and fresh and listing and r["t0"] and \
+                now - r["t0"] >= _minutes(30):
+            latest = r["good_obs"][-1][1]
+            context = benchmark_context(latest)
+            # Unknown algorithm/allocation is not evidence of bad hardware.
+            if all(value is not None for value in context[:5]):
+                stats = history_stats(db, listings, exclude_order_id=oid,
+                                      compatible=context)
+                for device, key in (
+                        ("cpu", (listing.get("specs") or {}).get("cpu")),
+                        ("gpu", market.offered_gpu(listing))):
+                    values = []
+                    times = []
+                    for ts, status in r["good_obs"]:
+                        if not cutoff <= ts <= now or \
+                                benchmark_context(status) != context:
+                            continue
+                        if ts < r["t0"] + _minutes(2) or any(
+                                restart <= ts < restart + _minutes(2)
+                                for restart in r["restarts"]):
+                            continue
+                        value = (status.get("its") or {}).get(device)
+                        if isinstance(value, (int, float)) and not isinstance(
+                                value, bool) and math.isfinite(value) and value >= 0:
+                            values.append(value)
+                            times.append(ts)
+                    prior = stats[f"{device}_prior"].get(key)
+                    count = stats[f"{device}_rentals"].get(key, 0)
+                    if len(values) >= 20 and max(times) - min(times) >= \
+                            _minutes(20) and count >= 3 and prior and \
+                            _median(values) < prior * 0.5:
+                        evidence = (f"low_its:{device}", {
+                            "median": _median(values), "prior": prior,
+                            "n_rentals": count, "samples": len(values),
+                            "context": context})
+                        break
+        if evidence:
+            results.append((oid, sid, *evidence))
+    return results
+
+
+def _exec_blacklist(db, phase_id, action, now, say):
+    bid = blacklist.add(db, action["server_id"], action["reason"], "auto",
+                        detail=action.get("detail"), now=now)
+    if bid is not None:
+        emit(db, now, phase_id, action.get("order_id"), action["server_id"],
+             "blacklisted", {"reason": action["reason"],
+                             "detail": action.get("detail") or {},
+                             "ttl_days": blacklist.AUTO_TTL_DAYS}, say=say)
+
+
 def _fault_reason(rental):
     """Fault checks for the free window; returns a short tag or None."""
+    if rental.get("spec_mismatch"):
+        return "spec"
     if rental["last_two_zero_its"]:
         return "zero_its"
     if rental["listing_gpu_count"]:
@@ -1093,6 +1240,8 @@ def execute(db, db_path, env_file, phase, cfg, actions, now, live,
         if kind == "blocked":
             emit(db, now, phase_id, None, None, "blocked",
                  {"reason": action["reason"]}, say=say)
+        elif kind == "blacklist":
+            _exec_blacklist(db, phase_id, action, now, say)
         elif kind == "rerent_expired":
             emit(db, now, phase_id, None, action["server_id"],
                  "rerent_expired", {"server_id": action["server_id"]},
@@ -1204,6 +1353,11 @@ def _exec_cancel(db, db_path, env_file, phase_id, action, now, say):
                 (_iso(now), action["reason"], order_id))
         emit(db, now, phase_id, order_id, action["server_id"], "cancel",
              {"reason": action["reason"]}, say=say)
+        if action["reason"].startswith("fault:") or \
+                action["reason"] == "unreachable":
+            _exec_blacklist(db, phase_id, {
+                **action, "detail": {"order_id": order_id,
+                                    "cancel_confirmed": True}}, now, say)
         if action.get("rerent_at"):
             emit(db, now, phase_id, order_id, action["server_id"],
                  "rerent_scheduled",
@@ -1223,6 +1377,10 @@ def _safe_info(info):
 def _exec_rent(db, db_path, env_file, phase, cfg, action, now, say):
     phase_id = phase["phase_id"]
     sid = action["server_id"]
+    if sid in blacklist.active(db, now):
+        emit(db, now, phase_id, None, sid, "blocked",
+             {"reason": "blacklisted"}, say=say)
+        return
     committed = committed_usd(db, phase_id, now, cfg)
     remaining = _dec(phase["budget_usd"]) - committed
     if remaining <= 0:
@@ -1271,6 +1429,12 @@ def _exec_rent(db, db_path, env_file, phase, cfg, action, now, say):
     if rc != 0 or not info.get("order_id"):
         emit(db, now, phase_id, info.get("order_id"), sid,
              "rent_failed", {"info": _safe_info(info)}, say=say)
+        if rc != 0 and info.get("order_id") and \
+                info.get("stage") == "provision":
+            _exec_blacklist(db, phase_id, {
+                "server_id": sid, "order_id": info["order_id"],
+                "reason": "provision_failed", "detail": _safe_info(info)},
+                now, say)
         return
     order_id = info["order_id"]
     count = db.execute(
@@ -1301,8 +1465,13 @@ def run_cycle(db, db_path, env_file, phase, cfg, live, now=None,
               say=print):
     now = now or utcnow()
     state = build_state(db, phase, now, cfg, say=say)
+    checks = [{"type": "blacklist", "order_id": oid, "server_id": sid,
+               "reason": reason, "detail": detail}
+              for oid, sid, reason, detail in
+              blacklist_checks(db, state, now, cfg)]
+    state["excluded"].update(a["server_id"] for a in checks)
     execute(db, db_path, env_file, phase, cfg,
-            decide(now, state, cfg), now, live, say=say)
+            checks + decide(now, state, cfg), now, live, say=say)
 
 
 # ---------------------------------------------------------------- CLI

@@ -881,6 +881,44 @@ or not we rented it.
 Every rental is keyed by its **Clore server id**, so we can see how each
 physical server does over time, across rentals.
 
+**Implemented (2026-11-15):** `blacklist.py` stores server blocks with
+reason, source, evidence, added/expiry/removal timestamps. Automatic blocks
+last **3 days**; manual blocks do not expire. The experiment runner writes
+automatic entries for:
+
+- Confirmed fault or unreachable cancellations.
+- Failed provisioning after an order was created (not quote, API, or
+  bounded-term receipt failures).
+- More than 40% failed telemetry reads in the last 30 minutes, with at least
+  20 reads and a rental age of at least 30 minutes.
+- CPU model-number mismatch, or fewer visible CPU threads than the listing's
+  offered allocation (parsed the same way as the order's default thread count).
+- CPU or GPU median it/s below 50% of a compatible model prior from at least
+  **3 other rentals**, excluding the current order. Requires 30 minutes since
+  first telemetry, at least 20 usable readings spanning 20 minutes within the
+  last 30 minutes, and excludes the first 2 minutes after start/restart.
+  Compare only matching epoch, package, pool, visible CPU count, GPU count
+  and trainer variant/version; skip unknown epoch/package/allocation.
+
+Stale collection supplies no new blacklist evidence. Low shares, dry trees
+and slow first shares never trigger a block. Flaky SSH means unreliable
+controller access, not proof of lost pool shares. Flaky SSH, low it/s, and
+late spec mismatches block future automatic rentals without cancelling the
+current order. Spec mismatches also join the existing free-window fault check.
+New blocks are recorded once per rental; removing one does not immediately
+recreate it from that rental's old evidence.
+
+Blocked servers are excluded from automatic fills, probes and re-rents and
+from TUI Candidates. Marketplace/server detail shows the reason. Manual
+`rent.py` and TUI rental review warns but allows confirmation; country and
+other rental safeguards still apply. Use `python3 blacklist.py list [--all]`,
+`add --server ID --reason TEXT`, or `rm --server ID`; all accept `--db PATH`.
+Dry-run logs proposed blocks without inserting blacklist entries. Restart an
+already-running experiment process to load these rules. Existing per-phase
+fault/rent-failure exclusions still apply independently of blacklist expiry.
+
+The broader tables and hoster-level policy below remain the target design.
+
 SQLite tables (besides the hardware reference above):
 
 - `rentals`: clore order id, `server_id`, rig image + agent commit,
@@ -933,10 +971,10 @@ Use:
   Instead, an untested server whose prior-based score is close to the best
   (within a configurable margin) may take a slot, at most one at a time, so a
   wrong prior for a hardware model gets corrected.
-- **Auto-blacklist** (thresholds in config, every trigger logged with its data):
+- **Future extensions** (configurable thresholds, with evidence for each trigger):
   - measured it/s < X% of the hardware prior over >= N hours of rentals;
   - failed the early boot check;
-  - repeated stalls (the adaptive stall detector) or spot interruptions;
+  - repeated verified miner stalls (not dry trees) or spot interruptions;
   - invalid/rejected share ratio above a threshold;
   - network problems: slow image pull or trainer download, repeated pool
     disconnects;

@@ -52,6 +52,12 @@ def amount(value, label, allow_zero=False):
         raise ValueError(f"Invalid {label}") from None
 
 
+def offered_threads(specs):
+    """The leading allocation in Clore's cpus field, as used for orders."""
+    match = re.match(r"(\d+)", str(specs.get("cpus") or ""))
+    return int(match.group(1)) if match else None
+
+
 def prepare_order(server, fees, *, hours, max_cost_usd, pool, public_key,
                   alias, cpu_threads=None, auto_renew=False):
     """Quote an on-demand order with an explicit whole-hour term.
@@ -102,8 +108,7 @@ def prepare_order(server, fees, *, hours, max_cost_usd, pool, public_key,
     if bound > cap:
         raise ValueError(f"Quoted cost bound ${bound} exceeds your ${cap} cap")
     if cpu_threads is None:
-        match = re.match(r"(\d+)", str(specs.get("cpus") or ""))
-        cpu_threads = max(1, int(match.group(1))) if match else 1
+        cpu_threads = max(1, offered_threads(specs) or 1)
     if isinstance(cpu_threads, bool) or not isinstance(cpu_threads, int) or not 1 <= cpu_threads <= 512:
         raise ValueError("CPU threads must be an integer from 1 to 512")
     bootstrap = (

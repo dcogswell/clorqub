@@ -443,7 +443,10 @@ class ServerDetail(ModalScreen):
         d, r = self.detail, self.row
         spot = d.get("spot") or {}
         specs = (d["listing"].get("specs") or {})
-        lines = [
+        entry = r.get("blacklist")
+        lines = ([f"BLACKLIST: {entry['reason']} ({entry['source']})",
+                  f"added {entry['added_at']}; expires "
+                  f"{entry['expires_at'] or 'never'}", ""] if entry else []) + [
             self._kv("server id", d["server_id"]),
             self._kv("owner", d["owner"]),
             self._kv("country", cc_name(d["country"]) or "--"),
@@ -606,7 +609,19 @@ fleet
   unmanaged.
   Clore orders never enrolled as rigs (manual web-UI rentals, etc.)
   appear as 'unmanaged' rows with '-' telemetry cells -- Enter shows
-  their reported order record."""
+  their reported order record.
+
+blacklist
+---------
+  Automatic server blocks expire after 3 days. The experiment runner
+  flags fault/unreachable cancellations, failed provisioning, >40% failed
+  reads over 30 minutes (20+ samples), CPU/allocation mismatch, or <50%
+  normal it/s backed by 3 other compatible rentals. Dry trees never count.
+  Blocks prevent automatic rental; manual rental shows a warning.
+  python3 blacklist.py list [--all]
+  python3 blacklist.py add --server ID --reason TEXT
+  python3 blacklist.py rm --server ID
+  Manual entries never expire. Add --db PATH to use another database."""
 
 
 class HelpModal(ModalScreen):
@@ -1259,6 +1274,11 @@ class ReviewModal(ModalScreen):
         with Vertical(id="review"):
             yield Static("REVIEW ORDER -- nothing placed yet",
                          classes="dtitle")
+            if ctx.get("blacklist"):
+                import rent
+                yield Static(Text(
+                    "WARNING: " + rent.blacklist_warning(ctx["blacklist"]),
+                    style="bold yellow"))
             yield VerticalScroll(Static(Text("\n".join(lines))))
             yield Horizontal(
                 Button("Confirm & Rent", id="r-confirm",
@@ -1571,6 +1591,7 @@ class MarketTui(App):
             fp = (dash.get("snapshot_id"), dash["captured_at"],
                   dash["source"], dash["total"], dash["ranked"],
                   dash.get("spot_signature"),
+                  dash.get("blacklist_signature"),
                   (dash.get("order_inventory") or {}).get("revision"),
                   dash.get("fleet_signature"),
                   dash.get("experiment_signature"),

@@ -187,6 +187,24 @@ class HideReopenQuitTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ExperimentTabTests(unittest.IsolatedAsyncioTestCase):
+    async def test_blacklisted_manual_review_still_allows_confirmation(self):
+        from textual.widgets import Static
+        app = make_app()
+        confirmed = []
+        ctx = {"server_id": 12, "quote": {}, "server": {"specs": {}},
+               "pool": "jetski", "alias": "rig-test", "key_path": "/unused",
+               "blacklist": {"reason": "flaky_ssh", "source": "auto",
+                             "expires_at": "2026-11-18T00:00:00+00:00"}}
+        async with app.run_test() as pilot:
+            modal = tui.ReviewModal({}, ctx, on_confirm=confirmed.append)
+            app.push_screen(modal)
+            await pilot.pause()
+            content = " ".join(str(w.render()) for w in modal.query(Static))
+            self.assertIn("flaky_ssh", content)
+            self.assertIn("manual rental allowed", content)
+            modal._confirm()
+            self.assertEqual(confirmed, [ctx])
+
     async def test_experiment_tab_renders(self):
         from textual.widgets import DataTable, Static, TabbedContent
         from textual.css.query import NoMatches

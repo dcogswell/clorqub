@@ -19,6 +19,7 @@ from datetime import datetime, timezone
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
+import blacklist
 import fleet_store
 import rental_policy
 import rig_ssh
@@ -304,11 +305,18 @@ def _term_matches(order, hours, want_renew=False):
     return end == created + hours * 3600
 
 
-def print_quote_summary(server, quote, pool, key_path):
+def blacklist_warning(entry):
+    return (f"blacklisted: {entry['reason']} ({entry['source']}, "
+            f"expires {entry['expires_at'] or 'never'}); manual rental allowed")
+
+
+def print_quote_summary(server, quote, pool, key_path, blacklist_entry=None):
     specs = server.get("specs") or {}
     renew = quote.get("auto_renew") is True
     print(f"ORDER REVIEW (on-demand, USD-Blockchain, "
           f"{'AUTO-RENEW ON' if renew else 'no renewal'})")
+    if blacklist_entry:
+        print(f"  WARNING: {blacklist_warning(blacklist_entry)}")
     print(f"  server      {server.get('id')}  "
           f"gpu={server.get('gpu_array')}  cuda={server.get('cuda_version')}")
     print(f"  cpu         {specs.get('cpu')}  listed={quote['listed_cpu_allocation']}  "
@@ -375,6 +383,9 @@ def quote_order(*, server_id, hours, max_cost_usd, pool, cpu_threads,
     except Exception as exc:
         reject(str(exc))
     try:
+        blocked = blacklist.active(db).get(server_id)
+        if blocked:
+            warn(f"server {server_id} {blacklist_warning(blocked)}")
         try:
             api_key, _ = load_secrets(env_file, need_creds=False)
         except ValueError as exc:
@@ -417,6 +428,7 @@ def quote_order(*, server_id, hours, max_cost_usd, pool, cpu_threads,
                 "cpu_threads": cpu_threads, "alias": alias,
                 "quote": quote, "server": server,
                 "public_key": public_key, "key_path": key_path,
+                "blacklist": blocked,
                 "db_path": db_path, "env_file": env_file}
     finally:
         db.close()
@@ -643,7 +655,7 @@ def cmd_create(args):
     except APIError:
         return 1
     print_quote_summary(ctx["server"], ctx["quote"], ctx["pool"],
-                        ctx["key_path"])
+                        ctx["key_path"], ctx.get("blacklist"))
     if not live:
         print("\nDRY RUN -- no order placed. Re-run with --live and "
               "confirm to order.")

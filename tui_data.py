@@ -6,6 +6,7 @@ from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
 
+import blacklist
 import experiment
 import fleet_store
 from market import available, cuda_capable, score_listing
@@ -292,6 +293,7 @@ def read_dashboard(path):
                     db, datetime.now(timezone.utc), db_path=path)
             except Exception:
                 exp = None
+            blocked = blacklist.active(db)
         listings = json.loads(latest["raw_json"])["servers"] if latest else []
         rows = []
         cuda_hidden = 0
@@ -300,11 +302,19 @@ def read_dashboard(path):
                 cuda_hidden += 1
                 continue
             row = score_listing(listing)
+            entry = blocked.get(row["server_id"])
+            if entry:
+                row["eligible"] = False
+                row["ineligible_reason"] = f"blacklisted: {entry['reason']}"
+                row["blacklist"] = entry
             row["listing"] = listing
             row["available"] = available(listing)
             row["spot"] = summarize_quote(quotes.get(row["server_id"]))
             rows.append(row)
         return {
+            "blacklist_signature": tuple(
+                (sid, e["reason"], e["source"], e["added_at"], e["expires_at"])
+                for sid, e in sorted(blocked.items())),
             "snapshot_id": latest["id"] if latest else None,
             "captured_at": latest["captured_at"] if latest else None,
             "source": latest["source"] if latest else None,

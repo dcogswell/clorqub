@@ -298,6 +298,28 @@ Fleet tab in the TUI for per-rig health and independent CPU/GPU it/s.
 Already-running watchers need a restart to pick up the telemetry
 tick and new table layout.
 
+## Server blacklist
+
+`blacklist.py` tracks servers to avoid, with reason/evidence and expiry.
+Automatic entries (written by `experiment.py`) expire after 3 days; manual
+entries never expire:
+
+```bash
+python3 blacklist.py list [--all]                 # active (or all) entries
+python3 blacklist.py add --server ID --reason TEXT # manual, no expiry
+python3 blacklist.py rm --server ID               # clear active entries
+```
+
+All commands take `--db PATH`. The experiment runner writes auto entries for
+confirmed fault/unreachable cancels, failed provisioning, >40% failed rig
+reads over 30 min (20+ samples), CPU/thread mismatch vs the listing, and
+sustained it/s under 50% of a compatible 3-rental prior. Share yield, dry
+trees and slow first shares never trigger a block. Blocked servers are
+excluded from automatic fills/probes/re-rents and TUI Candidates; manual
+`rent.py create` and the TUI review show a warning but still allow the
+rental. An already-running experiment process must be restarted to pick up
+the rules (Ctrl+C, then the same `run` command -- rentals are unaffected).
+
 ## Rig side
 
 

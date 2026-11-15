@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO)
 
+import blacklist  # noqa: E402
 import experiment  # noqa: E402
 import orders  # noqa: E402
 import spot  # noqa: E402
@@ -71,6 +72,25 @@ def make_db(path):
 
 
 class TestFleetCloreFields(unittest.TestCase):
+    def test_blacklist_excludes_candidates_and_updates_signature(self):
+        db = experiment.open_db(self.path)
+        from test_experiment import listing
+        db.execute("UPDATE marketplace_snapshots SET raw_json=?",
+                   (json.dumps({"servers": [listing(12)]}),))
+        db.commit()
+        before = tui_data.read_dashboard(self.path)
+        blacklist.add(db, 12, "flaky_ssh", "manual")
+        after = tui_data.read_dashboard(self.path)
+        row = after["rows"][0]
+        self.assertFalse(row["eligible"])
+        self.assertEqual(row["ineligible_reason"], "blacklisted: flaky_ssh")
+        self.assertEqual(row["blacklist"]["source"], "manual")
+        self.assertNotEqual(before["blacklist_signature"], after["blacklist_signature"])
+        blacklist.remove(db, 12)
+        self.assertEqual(tui_data.read_dashboard(self.path)["blacklist_signature"],
+                         before["blacklist_signature"])
+        db.close()
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.path = os.path.join(self.tmp.name, "dash.sqlite3")

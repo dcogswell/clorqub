@@ -14,6 +14,7 @@ from unittest import mock
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO)
 
+import blacklist  # noqa: E402
 import experiment  # noqa: E402
 import fleet_store  # noqa: E402
 import rig_ssh  # noqa: E402
@@ -1455,6 +1456,167 @@ class SummaryTests(unittest.TestCase):
             self.assertIn("runner_alive", result)
         finally:
             db.close()
+
+
+class AutoBlacklistTests(unittest.TestCase):
+    def setUp(self):
+        self.db = make_db()
+        self.addCleanup(self.db.close)
+        self.phase = add_phase(self.db)
+        add_snapshot(self.db, [listing(11), listing(12)])
+        add_fleet(self.db, 1, 11)
+        add_rental(self.db, self.phase["phase_id"], 1, 11, 40)
+
+    def check(self):
+        state = experiment.build_state(self.db, self.phase, NOW, CFG,
+                                       say=lambda *_: None)
+        return experiment.blacklist_checks(self.db, state, NOW, CFG)
+
+    def test_flaky_thresholds_freshness_and_no_share_rule(self):
+        for minute in range(29, -1, -1):
+            add_obs(self.db, 1, minute, None if minute < 13 else status(0))
+        result = self.check()
+        self.assertEqual(result[0][2], "flaky_ssh")
+        self.assertEqual(result[0][3]["failed"], 13)
+        self.db.execute("UPDATE rig_observations SET status_json=? WHERE "
+                        "captured_at=?", (json.dumps(status(0)), iso(0)))
+        self.db.commit()
+        self.assertEqual(self.check(), [])  # Exactly 40% is below trigger.
+        self.db.execute("UPDATE rig_observations SET status_json=?", (json.dumps(status(0)),))
+        self.db.commit()
+        self.assertEqual(self.check(), [])  # No shares is not a server fault.
+        self.db.execute("UPDATE rig_observations SET status_json=NULL")
+        self.db.execute("UPDATE experiment_rentals SET created_at=?", (iso(29),))
+        self.db.commit()
+        self.assertEqual(self.check(), [])
+        self.db.execute("UPDATE experiment_rentals SET created_at=?", (iso(40),))
+        self.db.execute("DELETE FROM rig_observations WHERE captured_at<?", (iso(18),))
+        self.db.commit()
+        self.assertEqual(self.check(), [])  # Fewer than 20 samples.
+        self.db.execute("UPDATE rig_observations SET captured_at=?", (iso(5),))
+        self.db.commit()
+        self.assertEqual(self.check(), [])  # Collector stopped.
+
+    def test_dry_run_and_live_block_only_then_manual_removal(self):
+        for minute in range(29, -1, -1):
+            add_obs(self.db, 1, minute, None)
+        with mock.patch.object(experiment.rent, "cancel_managed_order") as cancel:
+            experiment.run_cycle(self.db, ":memory:", "/unused", self.phase,
+                                 CFG, False, NOW, say=lambda *_: None)
+            self.assertEqual(blacklist.active(self.db, NOW), {})
+            cancel.assert_not_called()
+        action = {"type": "blacklist", "order_id": 1, "server_id": 11,
+                  "reason": "flaky_ssh", "detail": {"failed": 30, "total": 30}}
+        with mock.patch.object(experiment.rent, "cancel_managed_order") as cancel:
+            experiment.execute(self.db, ":memory:", "/unused", self.phase,
+                               CFG, [action], NOW, True, say=lambda *_: None)
+            cancel.assert_not_called()
+        self.assertIn(11, blacklist.active(self.db, NOW))
+        self.assertEqual(self.check(), [])
+        blacklist.remove(self.db, 11, NOW)
+        self.assertEqual(self.check(), [])  # Do not reblock from the same rental.
+
+    def test_spec_mismatch_and_free_window_cancel(self):
+        st = status(0)
+        st["hardware"].update(cpu_model="AMD Ryzen 9 7950X", nproc=36)
+        add_obs(self.db, 1, 0, st)
+        self.assertEqual(self.check()[0][2], "spec_mismatch:cpu")
+        st["hardware"]["cpu_model"] = "Intel Core i9-10980XE CPU @ 3.00GHz"
+        st["hardware"]["nproc"] = 8
+        add_obs(self.db, 1, 0, st)
+        self.assertEqual(self.check()[0][2], "spec_mismatch:threads")
+        self.db.execute("UPDATE experiment_rentals SET created_at=?", (iso(7),))
+        self.db.commit()
+        acts, _ = actions(self.db, self.phase)
+        self.assertEqual(kinds(acts, "cancel")[0]["reason"], "fault:spec")
+        st["hardware"]["nproc"] = 18
+        self.assertIsNone(experiment.spec_mismatch(listing(), st))
+        self.assertIsNone(experiment.spec_mismatch(listing(), status()))
+
+    def test_low_its_requires_independent_compatible_rentals(self):
+        def measured(cpu=10, gpu=80, epoch=239):
+            st = status(0, cpu=cpu, gpu=gpu)
+            st.update(pool="jetski", package={"version": "v1"})
+            st["hardware"]["nproc"] = 18
+            st["shares"]["epoch"] = epoch
+            return st
+        known = {11: listing(11), 12: listing(12)}
+        for minute in range(40, -1, -1):
+            add_obs(self.db, 1, minute, measured(cpu=2))
+        with mock.patch.object(experiment, "server_listings", return_value=known):
+            self.assertEqual(self.check(), [])
+            for oid in (2, 3, 4):
+                add_fleet(self.db, oid, 12)
+                for minute in (40, 30, 20, 10, 0):
+                    add_obs(self.db, oid, minute, measured())
+                if oid < 4:
+                    self.assertEqual(self.check(), [])
+            self.assertEqual(self.check()[0][2], "low_its:cpu")
+            self.assertEqual(self.check()[0][3]["n_rentals"], 3)
+            # A previous algorithm is not a valid prior.
+            self.db.execute("UPDATE rig_observations SET status_json=? "
+                            "WHERE order_id=4", (json.dumps(measured(epoch=238)),))
+            self.db.commit()
+            self.assertEqual(self.check(), [])
+            self.db.execute("UPDATE rig_observations SET status_json=? "
+                            "WHERE order_id=4", (json.dumps(measured()),))
+            self.db.execute("UPDATE rig_observations SET status_json=? "
+                            "WHERE order_id=1", (json.dumps(measured(gpu=10)),))
+            self.db.commit()
+            self.assertEqual(self.check()[0][2], "low_its:gpu")
+
+    def test_cancel_only_blocks_confirmed_faults(self):
+        for reason, rc, expected in (("dry_reroll", 0, False),
+                                     ("fault:gpu_count", 1, False),
+                                     ("fault:gpu_count", 0, True),
+                                     ("unreachable", 0, True)):
+            with self.subTest(reason=reason, rc=rc):
+                self.db.execute("DELETE FROM blacklist")
+                self.db.execute("DELETE FROM experiment_events")
+                self.db.commit()
+                with mock.patch.object(experiment.rent, "cancel_managed_order",
+                                       return_value=(rc, {})):
+                    experiment._exec_cancel(
+                        self.db, ":memory:", "/unused", self.phase["phase_id"],
+                        {"order_id": 1, "server_id": 11, "reason": reason},
+                        NOW, lambda *_: None)
+                self.assertEqual(11 in blacklist.active(self.db, NOW), expected)
+
+    def test_provision_failure_only_and_last_moment_enforcement(self):
+        ctx = {"quote": {"cost_bound_usd": "0.30"}}
+        action = {"server_id": 12, "tier": "other", "reason": "fill"}
+        with mock.patch.object(experiment.rent, "load_secrets", return_value=("test", {})), \
+                mock.patch.object(experiment.orders, "fetch_wallets", return_value={}), \
+                mock.patch.object(experiment.orders, "sanitize_wallets",
+                                  return_value=[{"name": "USD-Blockchain", "balance": 100}]), \
+                mock.patch.object(experiment.rent, "quote_order", return_value=ctx), \
+                mock.patch.object(experiment.rent, "create_order_flow") as create:
+            for info, expected in (
+                    ({"order_id": None, "stage": "quote"}, False),
+                    ({"order_id": 2, "stage": "register"}, False),
+                    ({"order_id": 2, "stage": "provision",
+                      "provision_state": "cancelled"}, True)):
+                create.return_value = (1, info)
+                experiment._exec_rent(self.db, ":memory:", "/unused", self.phase,
+                                      CFG, action, NOW, lambda *_: None)
+                self.assertEqual(12 in blacklist.active(self.db, NOW), expected)
+            create.reset_mock()
+            experiment._exec_rent(self.db, ":memory:", "/unused", self.phase,
+                                  CFG, action, NOW, lambda *_: None)
+            create.assert_not_called()
+
+    def test_blocks_fill_probe_and_rerent(self):
+        blacklist.add(self.db, 12, "test", "auto", now=NOW)
+        add_obs(self.db, 1, 0, status(5))
+        _, state = actions(self.db, self.phase)
+        self.assertIn(12, state["excluded"])
+        self.assertEqual(experiment._candidates(state, CFG, {11}, []), [])
+        self.assertEqual(experiment._probe_candidates(state, CFG, {11}, []), [])
+        add_event(self.db, self.phase["phase_id"], 20, "rerent_scheduled",
+                  server_id=12, detail={"server_id": 12, "tier": "other",
+                                        "due_at": iso(1)})
+        acts, _ = actions(self.db, self.phase)
+        self.assertNotIn(12, [a["server_id"] for a in kinds(acts, "rent")])
 
 
 if __name__ == "__main__":
