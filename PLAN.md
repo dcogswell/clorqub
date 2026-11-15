@@ -1060,6 +1060,27 @@ Design only; nothing here is implemented yet. It replaces the "learned perf
 model" assumption that a rig's share rate is a stable property that can be
 measured in a short window.
 
+### Algorithm (agreed with user, 2026-11-15)
+
+1. **Rank by it/s per USD:** total it/s (CPU + GPU, as the agent reports
+   it) divided by fee-inclusive $/hr. Before renting, it/s comes from our
+   measured history for that GPU/CPU model (hardware reference); after
+   renting, from the rig itself.
+2. **Only switch rentals for better value:** release a rental only when an
+   available candidate has clearly better it/s per USD (hysteresis margin,
+   counting the creation fee), or the rig is faulty. Share rate alone never
+   triggers a switch.
+3. **Dry tree -> re-roll:** when a rental has no shares for a set stretch
+   (at start-up or mid-rental), restart the miner to try for a new tree,
+   repeatedly, for up to **x** time.
+4. **Still dry after x -> stop and re-rent:** cancel the rental, wait **y**,
+   then rent the same server again if it is still available and still the
+   best value (otherwise the next best).
+
+x, y and the "no shares for" stretch are config values; defaults are set
+from the experiments below, not guessed. The rest of this section is the
+evidence and detail behind these rules.
+
 ### What the first 12 rentals show (all jetski, epoch 239, package 4.5)
 
 - **Hashrate is a stable rig property; share rate is not.** The 10 h
@@ -1100,13 +1121,11 @@ measured in a short window.
   minutes and is rig-specific, so it is what a trial measures. It is a
   necessary condition (miner runs, GPU used, hardware matches the listing),
   not a yield prediction.
-- **Price first; the tree matters more than the rig (user view).** Once a
-  rig passes the hardware bar (miner runs, it/s in the expected range for
-  its GPU, listing matches), ranking is mainly by fee-inclusive $/hr. The
-  data so far supports this over hour-long windows (hourly shares did not
-  follow it/s) but is too thin to rule out that a faster rig takes a larger
-  share of a rich tree; the it/s weight in ranking is left to tree-level
-  data to settle.
+- **The tree matters more than the rig (user view), so value is it/s per
+  USD, not shares per hour.** A rig must pass the hardware bar (miner runs,
+  it/s in the expected range for its GPU, listing matches). Hourly shares
+  did not follow it/s in our data, which supports not ranking on short
+  share windows.
 - **Rig comparisons only within one tree ID.** When two of our rigs ever
   report the same ID at overlapping times, that window is a valid
   head-to-head comparison; otherwise rigs are compared only by price and
@@ -1199,6 +1218,12 @@ Builds on rent.py's guarded flow and the existing Phase 4 rails, plus:
 
 ### Open questions
 
+- Defaults for x (re-roll time), y (wait before re-renting) and the
+  "no shares for" stretch. Does re-renting the same server after y get a
+  fresh tree where restarts did not (experiment 3)? Risk: someone else
+  rents the server during y.
+- Are CPU and GPU it/s the same unit of work for jetski (can they be summed
+  for it/s per USD)?
 - Is the logged `ID` the colony tree, and does the pool assign it per
   connection, per rig, or per worker alias?
 - Does restarting the miner (or reconnecting) get a new tree?
