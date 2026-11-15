@@ -7,7 +7,7 @@ from decimal import Decimal, InvalidOperation, ROUND_CEILING
 
 from market import DEFAULT_COUNTRY_BLOCKLIST, available, cuda_version
 
-BOOTSTRAP_COMMIT = "dcd2156196e7d2379d9ed1d663ee93145cebf709"
+BOOTSTRAP_COMMIT = "6832f0467680d22a9565e96e6659a835104df482"
 BOOTSTRAP_SHA256 = "01dfe899bc4341f2e0846b637f05a67c675abba9cf2e401f54b63766fcd59cd6"
 BOOTSTRAP_URL = (
     "https://raw.githubusercontent.com/dcogswell/clorqub/"

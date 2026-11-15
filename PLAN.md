@@ -6,26 +6,27 @@
 mining to the **jetski pool** with **qli (qubic.li)** as a switchable secondary
 pool. A slight loss versus the QUBIC market price is acceptable (QUBIC is near
 its all-time low, so the aim is to stack coins, not to earn USD). Spend is
-held back by a small rental limit and a daily budget, not by a profit gate.
+held back by a small rental limit plus daily and per-epoch budgets, not by a
+profit gate.
 
 ```text
 score(server, pool) = expected_qubic_per_hour(server, pool) / cost_usd_per_hour(server)
                     = QUBIC per dollar
 
-expected_qubic_per_hour = it_per_sec(server)                 # per-rig, hardware
-                        x shares_per_iteration(pool, epoch)  # per-pool, fleet-wide
-                        x qubic_per_share(pool)              # per-pool, from payouts
+expected_qubic_per_hour = sols_per_hour(server, pool)       # per-rig, measured
+                        x qubic_per_solution(pool, epoch)    # from pool payouts
 
 effective_cost_per_qubic = 1 / score                         # USD per QUBIC mined
 ```
 
-- `it_per_sec(server)`: that Clore server's own measured it/s when there is
-  enough of it, otherwise the hardware-model prior (see "Hardware reference").
-  it/s settles within minutes, so rigs are judged on it, not on share counts,
-  which are noisy.
-- `shares_per_iteration(pool, epoch)`: pooled across every rig on that pool,
-  which gives far more data than any single rig.
-- `qubic_per_share(pool)`: from actual payouts. qli pays per share (PPS).
+- `sols_per_hour(server, pool)`: use whole-rig solutions/hour from a pool or
+  worker view when available. Keep CPU trainer (AVX2/AVX512), GPU trainer
+  (CUDA), and package/trainer version distinct. Raw `it/s` from different
+  trainers is not comparable. Until the payout conversion is known, the
+  read-only scanner ranks same-pool candidates by measured/anchored sols/hour
+  per dollar; that is an ordering proxy, not a QUBIC payout estimate.
+- `qubic_per_solution(pool, epoch)`: derive from actual payouts and pool-side
+  solution/score accounting. qli pays per share (PPS).
   jetski has solo and PPLNS endpoints (currently the same server per their
   Discord); start with a rough estimate and refine it from payouts.
 - `cost_usd_per_hour`: Clore price (API gives USD **per day**; divide by 24)
@@ -34,6 +35,70 @@ effective_cost_per_qubic = 1 / score                         # USD per QUBIC min
 Ranking is in QUBIC per dollar, so it doesn't depend on the QUBIC/USD price.
 The market price is only used for the premium ceiling and the high-value test
 below.
+
+### CPU/GPU yield model and initial benchmark anchors
+
+QUBIC has separate CPU trainers for AVX2 and AVX512, plus a CUDA GPU trainer.
+The live jetski "ALL POOLS" figures (CUDA 31,060, AVX512 17,235, AVX2 1,705
+sol/hr in the observed view) are pool-wide totals, not rig benchmarks; they
+must not be used as per-server yield. Likewise, `it/s` from CPU and GPU logs
+has trainer-specific scales and is not directly additive/comparable.
+
+The user's initial whole-rig jetski observations seed conservative priors:
+
+| GPU | CPU reference | Whole-rig yield prior |
+|---|---|---:|
+| RTX 3070 | Ryzen 9 7945HX or 7950X (AVX512-capable) | about 160 sols/hr |
+| RTX 3080 Ti | same class | >350 sols/hr (score at a 350 floor) |
+| RTX 3090 Ti | same class | >350 sols/hr (score at a 350 floor) |
+
+These numbers include the CPU contribution; they are **not GPU-only**. The
+offered CPU thread count for the reference runs was not provided, so preserve
+that as unknown and do not pretend the priors are per-thread. A 3070 at about
+160 is an approximate point estimate; the Ti observations are lower bounds.
+The first scanner only applies these priors to a single-GPU listing with a
+matching model and a listed Ryzen 9 7945HX or 7950X CPU. It does not
+extrapolate even to other AVX512 CPUs (including 7950X3D/9950X), AVX2,
+other GPU models, laptop GPUs, or multi-GPU hosts. Because reference CPU
+allocation is unknown, these are provisional shortlist scores, not
+thread-normalized forecasts or guaranteed yield floors for a new listing.
+Unmatched listings remain visible in SQLite but have no fabricated yield
+score.
+
+Additional user-reported context is stored independently from scoring:
+about **35 CPU it/s**, about **230 GPU it/s** with no exact GPU/run identified,
+and a tentative **100 GPU it/s for RTX 3070** ("I think"). Do not assign the
+230 figure to both Ti models or infer CPU/GPU solution contributions from
+these observations. Pool, epoch, trainer version, measurement duration and
+thread allocation must be recorded alongside future measurements; unknown
+metadata stays unknown for these historical recollections.
+
+CPU ISA detection from the marketplace CPU name is only a pre-rental hint.
+On the rental, read actual CPU flags and require `avx512f` before assigning an
+AVX512 measurement; otherwise downgrade the profile or fail the expected
+hardware check. Keep AVX2 and AVX512 CPU measurements separate, along with
+CUDA measurements, package/trainer version, pool, and allocated thread count.
+Learned whole-rig yields should be based on sustained pool/worker solutions
+per hour. Keep an active-mining rate for hardware calibration, but use
+wall-clock yield (including billable warm-up, idle and downtime) for economic
+ranking, or explicitly apply a measured duty-cycle adjustment. Pool-wide
+totals are not per-rig calibration; a short lucky share window does not
+establish a reliable prior.
+
+Initial scanner implementation: `python3 cli.py scan` is read-only. A saved
+marketplace response can be ranked with `python3 cli.py scan --snapshot
+marketplace.json --db path/to/clorqub.sqlite3`; live mode reads
+`CLORE_API_KEY` from the environment or `~/.config/clorqub/env`. The SQLite
+database stores raw marketplace snapshots, server/spec/price history, and
+these sourced benchmark anchors plus raw it/s context. An offline file's
+import timestamp is not its original observation time or fresh availability.
+The initial ranking uses on-demand pricing
+plus an assumed 5% renter fee from the earlier API observation (not a fresh
+fee lookup), excludes the creation fee and boot opportunity cost,
+and filters RU/UA plus CUDA listings below 12.0. Spot ranking is intentionally
+not shown until the scanner fetches and converts each server's live spot
+minimum; the marketplace USD spot field is a zero placeholder, not a free
+quote. This stage never creates or cancels orders.
 
 ### Spend policy
 
@@ -54,9 +119,115 @@ below.
   fleet goes back to `max_rentals`.
 - **Daily budget cap** (hard `$`/day, checked against actual charges) applies
   on top of all of the above, burst included.
+- **Epoch budget cap:** configurable `epoch_budget_usd` limits total managed
+  rental spend for one QUBIC epoch. It is independent of the daily cap;
+  both must pass before new spending is allowed. No dollar amount has been
+  selected yet.
 - Market price comes from an exchange/aggregator API, cached; if it is
   unavailable, the ceiling and burst tests fail closed (no new rentals beyond
   `max_rentals`, no burst).
+
+### Epoch budget
+
+- Covers all clorqub-managed rentals, normal and burst, on both pools, plus
+  discovered manual orders unless explicitly reviewed and excluded.
+  Count rental charges, renter fees and creation fees, retaining native
+  amounts and the USD conversion used for each charge.
+- Key the budget and accounting by the confirmed QUBIC epoch id and UTC
+  boundaries, not a local calendar week. Persist them in SQLite so daemon
+  restarts, miner restarts and pool switches never reset the spent amount.
+  If the epoch boundary is uncertain, do not reset the budget or admit
+  spending that depends on a reset.
+- Track **cap / actual spent / unbilled reserve / remaining** separately.
+  Remaining = cap - actual spent - reserve; the reserve covers accrued
+  charges not yet reported, pending fees, and estimated cost until the next
+  control check plus cancellation delay. Reconciliation replaces reserves
+  with actual charges rather than counting both.
+- Reject new rentals, bursts and rebids that cannot fit inside the remaining
+  allowance. Release managed rentals before forecast spend crosses the cap,
+  taking a final snapshot where reachable. Cancel paused spot orders too,
+  so they cannot resume and unexpectedly spend the exhausted budget.
+- Rentals spanning a boundary have time-based spend attributed to the epoch
+  in which it accrued; one-time fees belong to the epoch in which charged.
+  Do not charge the full lifetime rental total to each epoch. Unused
+  allowance does not carry over by default. A configured recurring cap may
+  apply to each new confirmed epoch; an explicit epoch override takes
+  precedence. A budget is a ceiling, not an instruction to spend it all.
+- CLI/TUI expose the current epoch, cap, actual spend, reserve, remaining
+  allowance, fleet burn rate and approximate time to budget exhaustion.
+  Set/change it through an audited `set-epoch-budget` command using the same
+  daemon-side validation and spend-increase confirmation as daily budgets.
+  Lowering the cap below already-spent/reserved funds blocks further spend;
+  it cannot undo existing charges.
+- This is a planned daemon spending control, not implemented by the current
+  read-only scanner or TUI.
+
+### Manual epoch earnings by pool
+
+- Allow the user to enter **QUBIC earned for a specific epoch and pool**
+  through the CLI/TUI, even when no usable pool payout API exists. Keep
+  jetski and qli separate, including payout mode/account scope where known.
+  No earnings amount is assumed.
+- Record epoch id, pool, QUBIC amount, covered time window, scope
+  (managed rentals / selected workers / whole pool account), source
+  `manual`, entry time and optional reference/note. Explicit zero earnings
+  is valid; missing earnings are unknown, not zero.
+- Distinguish estimated/accrued earnings from finalized/confirmed earnings,
+  and earnings from an actual payout transfer. An accrued total followed by
+  a final total or payout must not be counted as three earnings events.
+  Corrections supersede the previous entry for that scope/window, with an
+  audit trail, rather than adding a second copy.
+- Feed compatible observations into the pool/epoch yield model:
+  QUBIC per accepted solution/share or score unit, matched to the same
+  accounting window and payout definition. Use this to refine expected
+  QUBIC/hour, pool selection, effective USD/QUBIC and rental value.
+  Never treat jetski and qli share/score units as interchangeable.
+- If a pool account also includes the user's own rigs or unrelated workers,
+  do not attribute the entire entered total to rentals. Require matching
+  worker attribution or sufficiently complete account-wide work data before
+  deriving rental-specific yield. Otherwise retain the entry for reporting
+  and mark calibration unavailable/low-confidence.
+- Estimated or sparse entries inform uncertain priors, not immediate pool
+  switching. Preserve minimum measurement windows, switch cooldowns and
+  trainer/epoch boundaries. API imports must reconcile with manual entries
+  so the same earnings are not counted twice.
+- Show earnings per epoch/pool and which entries calibrated the model.
+  Gross mining earnings do not reduce actual rental spend or automatically
+  replenish the daily/epoch spending caps. This input path is planned, not
+  implemented in the current read-only viewer.
+
+### Manual rentals and startup reconciliation
+
+- The user may create, rebid, pause/resume or cancel rentals directly in
+  Clore's web UI. On startup, fetch `GET my_orders` before any automated
+  rental admission; periodically reconcile on the normal five-minute scan
+  cadence too. The local database is not the sole authority for order
+  existence.
+- Match orders by Clore order id, retaining server id, native currency,
+  quoted price, reported spend and observed state. Import unknown orders
+  as **discovered / observe-only**, never silently creating a duplicate
+  rental or assuming an alias proves clorqub ownership.
+- Show manual orders in the TUI even if their hardware is absent from the
+  current available marketplace. An inventory failure means unknown/stale,
+  not zero orders; retain the last successful inventory and block future
+  automated spending until reconciliation is trustworthy.
+- Discovery is not adoption: do not SSH/bootstrap, change miners or pools,
+  rebid, cancel, or otherwise control an external order until the user
+  explicitly adopts it through an audited confirmation. Adoption reuses the
+  existing order/history rather than resetting spend or creating a new order.
+- Conservatively include discovered orders in rental-slot and daily/epoch
+  budget admission checks unless explicitly excluded. The automation cannot
+  prevent the user from overspending manually: alert and block its own new
+  spending, rather than cancelling unadopted orders.
+- Reconcile changes made in the web UI. An order missing from one successful
+  active-order response is "not returned", not proven cancelled; confirm
+  completion/charges before closing the ledger. Keep paused orders visible
+  because they may resume and bill again.
+- A pre-existing order's cumulative `spend` is not automatically current
+  epoch spend, nor proof all fees are included. Attribute charges using
+  billing timestamps/history; mark unknown allocation conservatively.
+  Store a whitelist of non-secret order metadata, never returned passwords,
+  tokens, order environment variables, SSH material or startup commands.
 
 Poll the marketplace, rank by QUBIC per dollar, rent the best rigs within the
 spend policy, boot them with the clorqub miner image, measure, switch pools on
@@ -65,8 +236,8 @@ rigs that aren't yielding, and rotate out underperformers.
 ## Decisions (from user)
 
 - **Objective: accumulate QUBIC.** Rank by QUBIC per dollar; slight loss vs
-  market price is OK; spend limited by rental count + daily budget (see
-  "Spend policy").
+  market price is OK; spend limited by rental count plus daily and epoch
+  budgets (see "Spend policy").
 - **Rental limit: 2 concurrent**, extendable only for high-value rentals.
 - **Pools: jetski (primary) + qli/qubic.li (secondary), switchable per rig on
   yield.** jetski: `qubjetski-Client`, `wss://pplns.jtskxpool.ai/ws/`. qli:
@@ -123,8 +294,8 @@ Verified against the live Clore API (read-only calls) and docs.
   spot bid price. HiveOS is a Clore CCR image id (`c9a4e2f6b7d488d8f0bab0ff`),
   no longer needed.
 - Marketplace snapshot: 2848 servers, 1645 available. **No CPU-only
-  listings**; every server has at least one GPU, so CPU is always a side
-  benefit of a GPU rental.
+  listings**; every server has at least one GPU. CPU and GPU are sold as a
+  bundle, and CPU/AVX512 yield can materially change the bundle's value.
 
 **Marketplace fields (cross-checked against the web UI)**
 
@@ -293,7 +464,7 @@ Python. Headless daemon + clients, SQLite (WAL mode) for state.
 
 ```text
 clorqub/
-  config.toml          # max_rentals / burst settings, max_premium, budget cap,
+  config.toml          # max_rentals / burst settings, max_premium, daily/epoch caps,
                        #   intervals, country_blocklist, thresholds, rig image,
                        #   bootstrap (pinned agent commit + hashes)
   rig/                 # runs inside rentals (fetched by the bootstrap)
@@ -325,7 +496,7 @@ clorqub/
     daemon.py          # main loop; executes queued commands
     watchdog.py        # dead-man switch (separate process)
     cli.py             # status (share windows) / report / dry-run / pause /
-                       #   set-budget / set-max-rentals / servers /
+                       #   set-budget / set-epoch-budget / set-max-rentals / servers /
                        #   server <id> / hardware / blacklist add|rm|list /
                        #   switch-pool / release
     tui.py             # Textual viewer (Phase 5)
@@ -455,7 +626,8 @@ headless under systemd. Every UI is a separate client process.
 - **Clients read SQLite.** They can start, stop or crash without affecting the
   daemon, and the daemon needs no API or socket server.
 - **Control goes through a `commands` table.** Clients insert rows (pause,
-  resume, set-budget, set-max-rentals, blacklist, release, switch-pool, ...);
+  resume, set-budget, set-epoch-budget, set-max-rentals, blacklist, release,
+  switch-pool, ...);
   the daemon picks them up each cycle, executes them, records the result on
   the row, and logs them in the decision log.
   - Each row has: `id`, `command`, `args` JSON, `source` (cli / tui / web /
@@ -485,6 +657,32 @@ Clients:
   and accepts commands from allowlisted Discord user ids in designated
   channels. Same `commands` / `events` path as every other client, so no
   daemon changes are needed to add it. The bot token is an env var.
+
+### Future phase: local non-rental PCs
+
+- Monitor the user's own mining PCs alongside Clore rentals. Start
+  **read-only**: collect hardware, miner/pool/worker identity, trainer
+  versions, uptime, CPU/GPU rates, shares, epoch and health through an
+  explicitly configured local agent or SSH connection. Do not replace or
+  restart an existing miner just to collect stats.
+- Give each machine a stable device id and `local` source type; rentals
+  retain their Clore order/server ids. Reuse measurements, pool runs,
+  epoch reports and durable counter capture without inventing a Clore
+  order or counting a local PC against rental-slot limits.
+- TUI/reporting show Rentals and Local PCs separately, with optional
+  combined pool/epoch totals. Deduplicate worker/share observations and
+  preserve worker attribution when manually entered pool earnings cover
+  both local PCs and rentals.
+- Local PCs incur no Clore rental charges and do not consume the rental
+  daily/epoch budgets. Optional measured power and electricity prices may
+  supply a separate local operating-cost view; unknown local cost is
+  **unknown**, not free, and must not create a bogus best USD/QUBIC score.
+- Missing telemetry raises a local-PC health alert, not a rental release
+  or cancellation action. Any future local pool switching/restart controls
+  require explicit opt-in per machine and must respect other miner
+  supervisors. Keep connection credentials outside SQLite and logs.
+- Deliver after the rental collector/reporting path is stable; this
+  future phase is not implemented by the current marketplace viewer.
 
 ### Clore billing
 
@@ -527,6 +725,19 @@ Clients:
 - Every order is placed with a **maximum duration** (where the API allows; the
   listing's `mrl` is the host's cap), so a rental can't bill forever if
   everything else fails.
+- **Auto-renew is strictly opt-in** (`rent.py create --auto-renew`, or the
+  TUI setup checkbox — default off): it asks Clore to re-bill each `hours`
+  term until cancelled, so the quoted cost bound covers ONE term only and
+  the review screen says so. The receipt must echo `auto_renew: true` or
+  the order is auto-cancelled as a term mismatch. The TUI's **Max** hours
+  button fills the listing's `mrl`; `fleet_rentals.auto_renew` (0/1/NULL)
+  records what was ordered.
+- **Renew toggle on live orders:** the Fleet detail's **Auto-renew**
+  button calls `set_order_auto_renew` (one POST, never retried) on an
+  active on-demand order — always with `auto_renew_max_price` when
+  enabling, so renewal stops if the host raises the daily price.
+  Spot, ended and observe-only orders are refused locally;
+  `renewal_in_progress` in a term's last 60 s is not retried.
 
 ### Network / region filter
 
@@ -579,6 +790,30 @@ and never relies on a remote counter staying alive.
   compared.
 - Raw snapshots are kept (with a configurable retention) so derived tables
   can be recomputed if a parser bug is fixed.
+- **Miner-log archiving (current):** each 30 s telemetry tick appends the
+  new bytes of `/clorqub/logs/<pool>.log` into `rig_log_chunks` with a
+  per-rig/pool byte cursor (`rig_log_cursors`); shrink/rotation re-reads
+  the tail. The `l` log view falls back to this archive when the live
+  SSH fetch fails, so logs survive rig death and web-UI cancellation.
+- **Stock `miner`/`miner log` on the rig (current):** the agent runs the
+  miner under a pty, writes the raw ANSI stream to
+  `/clorqub/logs/<pool>.raw.log`, and points HiveOS's stock commands at
+  it -- a detached `miner` screen session tails it for `miner`, and
+  `/run/hive/miner.1` symlinks to it for `miner log`.
+- **Vanished orders:** a managed rig absent from a fresh (<15 min) good
+  `my_orders` snapshot whose SSH is failing is marked `missing` and no
+  longer polled. This is detection only; it does not cancel anything.
+- **TUI fleet/orders views:** the Fleet tab lists only active rigs
+  (cancelled/missing/failed states and orders vanished from a later
+  good inventory are hidden) and shows burn $/hr plus reported spend;
+  the Orders tab keeps every order ever seen in snapshot history,
+  marked active or ended.
+- **Finding (2026-11):** a rented rig was unreachable for ~78 min while
+  still billing before the user cancelled it by hand -- and its miner
+  log was lost because nothing persisted it. Log archiving now covers
+  the log half; **unreachable alerting / auto-cancel policy** (e.g.
+  alert or auto-release after N minutes of failed SSH on a still-billing
+  order) is a future safety item, not implemented.
 
 ### Hardware reference
 
@@ -587,7 +822,7 @@ or not we rented it.
 
 - `servers`: clore `server_id`, `owner` (hoster id), country, first/last
   seen, latest listing.
-- `server_specs`: one row per **distinct spec set** seen for a server
+- `server_specs`: one row per **observed spec interval** for a server
   (valid_from / valid_to), so a host swapping hardware or changing the threads
   offered is visible: CPU model, `cpus` cores/threads offered, RAM, disk +
   speed, motherboard, PCIe rev/width, GPU models (`gpu_array`), GPU count,
@@ -597,10 +832,12 @@ or not we rented it.
 - `rig_reports`: what the rig actually reported at boot (CPU model, `nproc`,
   CPU flags such as AVX2/AVX-512, `nvidia-smi` GPUs, driver/CUDA). Compared
   with the listing for the spec-mismatch check.
-- `cpu_models` / `gpu_models`: normalized model names (e.g. "Ryzen 9
-  9950X3D", "RTX 3090 Ti") with the perf prior: it/s per thread (CPU) or per
-  card (GPU), per pool and trainer version, its source (benchmark, measured),
-  sample count, and last update. Seeded in Phase 1, learned from rentals.
+- `performance_benchmarks`: sourced whole-rig or device-level yield anchors
+  keyed by GPU model, CPU profile/ISA, offered thread count when known, pool,
+  and trainer/package version. Store point estimates versus lower-bound
+  observations, source, sample count, and update time separately. The user's
+  initial jetski whole-rig anchors are seeded by the read-only scanner; rentals
+  progressively replace broad priors with verified measurements.
 - `cli.py hardware` lists models with their measured it/s and how many
   servers/rentals back each number; `cli.py server <id>` shows spec history.
 
@@ -633,8 +870,19 @@ SQLite tables (besides the hardware reference above):
   deduped by `SolutionHash`. When only counters are available, counter deltas
   between polls are stored as timestamped events.
 - `payouts`: per pool, QUBIC amount, time, epoch, source. Feeds
-  `qubic_per_share`.
+  `qubic_per_share`; reconcile transfers with the epoch earnings ledger
+  rather than counting a transfer as new earnings again.
+- `epoch_earnings`: manual/API earnings by epoch, pool, window and worker/
+  account scope, with estimated/confirmed status, source and correction
+  history. Calibrates pool yield only when work/earnings attribution matches.
 - `prices`: QUBIC/USD and CLORE/USD samples, source, time.
+- `epoch_budgets`: epoch id/boundaries, configured USD cap and audited
+  changes, with epoch-attributed actual charges and outstanding reservations
+  retained for reconciliation and reports.
+- `order_inventory`: timestamped success/failure observations of `my_orders`,
+  with sanitized financial/hardware metadata. Unknown orders are observe-only
+  until adoption; failures preserve the last good view rather than inventing
+  an empty fleet.
 - `blacklist`: `server_id` or `owner` (hoster), reason, source (auto/manual),
   added at, optional expiry.
 - `commands`, `events`, `decisions`: see "Process model".
@@ -642,10 +890,10 @@ SQLite tables (besides the hardware reference above):
 Use:
 
 - **Scoring**: blacklisted servers/hosters and blocked countries are dropped
-  before ranking. For other servers, blend that server's measured it/s with
-  the hardware prior, weighted by how much rented time we have on it. A
-  known-good server can then beat an untested one with the same specs, and
-  the reverse.
+  before ranking. Compare solutions/hour only within compatible pool,
+  CPU-ISA/GPU trainer, and version profiles. Blend a server's sustained,
+  verified whole-rig yield with a matching prior, weighted by measurement
+  confidence. Do not sum raw CPU/GPU it/s or apply an AVX512 prior to AVX2.
 - **Exploration**: with only 2 slots, exploration doesn't get a dedicated slot.
   Instead, an untested server whose prior-based score is close to the best
   (within a configurable margin) may take a slot, at most one at a time, so a
@@ -753,7 +1001,7 @@ every N minutes:
   7. fill slots under the spend policy:
      - up to max_rentals with the best candidates;
      - beyond that, up to max_rentals_burst only for high-value candidates;
-     - never over the daily budget
+     - never over either the daily or epoch budget
      -> create_order with cloreai/hiveos:0.4 + bootstrap command, POOL=jetski
   8. for rentals whose yield is well below expected on their current pool but
      whose price is still competitive: final snapshot, `agent switch` to the
@@ -779,8 +1027,10 @@ Clore rate limits (1 req/s, `create_order` 1 per 5 s) are enforced in
   spend money.
 - **Rental limit**: `max_rentals` (default 2), hard ceiling
   `max_rentals_burst` for high-value rentals only.
-- **Budget cap**: hard `$`/day limit in config, checked against actual charges;
-  daemon refuses to exceed it, burst included.
+- **Budget caps**: daily and per-QUBIC-epoch USD limits, checked against
+  actual charges plus unbilled/pending reserves; both apply, burst included.
+  Forecast cancellation latency so releasing only after a cap is crossed is
+  not the normal control path.
 - **Premium ceiling**: no rental above `market_price x (1 + max_premium)` per
   QUBIC; fails closed if the market price is unavailable.
 - **Dead-man switch**: `watchdog.py` (separate systemd unit) watches the
@@ -820,12 +1070,13 @@ Clore rate limits (1 req/s, `create_order` 1 per 5 s) are enforced in
 | Phase | Deliverable | Depends on |
 |-------|-------------|------------|
 | 0 | Done so far: Clore API auth/rate limits/endpoints, marketplace field meanings (cross-checked with web UI), price units, spot data, region/network data, HiveOS dropped, miner packages (URLs, `.hash` verification, config formats, jetski local API). **Remaining:** (1) Docker order specifics — `ssh_key` / `command` / max-duration fields, time from order to SSH, whether hosts allow mining in Docker orders; (2) creation-fee rule and actual-charge reporting, via one cheap test rental (with user approval); (3) a real jetski `/summary` response and GPU runtime needs (both binaries already confirmed to run in plain `ubuntu:24.04`); (4) jetski and qubic.li per-worker stats and payout APIs; (5) QUBIC/USD price source; (6) Qubic idle-phase schedule | — |
-| 1 | Read-only scanner + scorer: marketplace -> `servers` / `server_specs` / `server_prices`; rank by QUBIC per dollar with premium ceiling and country filter, show effective cost per QUBIC vs market, print table. Seed `cpu_models` / `gpu_models` (it/s per thread / per card) from published benchmarks, the local rig, and/or a few short test rentals; seed QUBIC/share from current pool payouts | 0 |
+| 1 | **In progress:** read-only on-demand marketplace scanner (`cli.py`/`market.py`) persists marketplace snapshots, server/spec/price history, and user-supplied whole-rig benchmark anchors in SQLite; provisionally ranks only matching RTX 3070 / 3080 Ti / 3090 Ti + Ryzen 9 7945HX or 7950X profiles by sols/hour per dollar. Opt-in `--watch`/`--interval` rescan loop (`scanner_watch.py`, 300 s default, never auto-started) plus `collector.py` controls for a transient systemd-run `--user` service (no install/autostart) feed the read-only `tui.py` viewer. Live scans also poll `my_orders` (observe-only inventory incl. manual web-UI rentals); optional `--spot-limit` adds bounded spot-floor observations (indicative only, no bids). Guarded operator rentals exist via `rent.py` (dry-run default, confirmed --live, on-demand bounded term, one POST, reconcile/adopt, observe-only enroll), and the TUI runs the same guarded flow in-process on `b` (setup -> live quote review -> explicit Confirm & Rent, no terminal handoff) plus one on-demand read-only miner-log tail fetch on `l`; watch/collector cycles also SSH-read enrolled rigs every 30 s into `rig_observations` shown on the TUI Fleet tab (no extra Clore API calls). Remaining: live spot ranking, pool payout conversion, broader CPU/GPU/thread-allocation calibration, and price-premium display | 0 |
 | 2 | `qubic_parse.py` (copied parsers for both miners + tests against real `stats.<epoch>.lock`/log samples) + rig bootstrap + agent (package fetch/verify, both miners, `.lock` mirror; tested locally in `cloreai/hiveos:0.4`) + SQLite schema incl. `commands`/`events` + collector + single-rental path: rent one server, early boot check, confirm shares — on each pool, with a switch between them that loses no data | 0 |
 | 3 | Share summary windows (15m/1h/2h/4h/24h/epoch; fleet / worker / server, split by pool run) + per-server history + learned perf model + payouts + blacklist (manual + auto rules, `servers`/`server <id>`/`hardware` reports) | 2 |
-| 4 | Full loop: spend policy (2-rental limit, burst, premium ceiling, budget) + exploration + pool switching + rotation with hysteresis + watchdog | 1, 3 |
-| 5 | Textual TUI client (reads SQLite, sends `commands`) | 4 |
+| 4 | Full loop: spend policy (2-rental limit, burst, premium ceiling, daily + epoch budgets with reserves/rollover accounting) + exploration + pool switching + rotation with hysteresis + watchdog | 1, 3 |
+| 5 | Textual TUI client (reads SQLite, sends `commands`). **Partial, delivered early:** `tui.py` + `tui_data.py` = read-only marketplace viewer over the scanner db (Candidates / Marketplace / Benchmarks, server detail). Fleet table, share windows and `commands` controls still come later | 4 |
 | 6 | Later: web view (FastAPI, localhost/auth); Discord bot (posts `events`, accepts allowlisted `commands`) | 4 |
+| 7 | Future: read-only local non-rental PC monitoring; shared stats/epoch earnings with explicit machine identity and separate local/rental costs. Optional local controls only after per-machine opt-in | 2, 3, 5 |
 
 Phase 1 is usable standalone — it answers "which Clore rig mines the most
 QUBIC per dollar right now, and how does that compare to buying" without

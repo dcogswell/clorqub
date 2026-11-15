@@ -24,9 +24,11 @@ try:
     from textual.binding import Binding
     from textual.containers import Horizontal, Vertical, VerticalScroll
     from textual.screen import ModalScreen
+    from textual.scrollbar import ScrollBar
+    from textual.widget import Widget
     from textual.widgets import (Button, Checkbox, DataTable, Footer,
                                  Input, Select, Static, TabbedContent,
-                                 TabPane)
+                                 TabPane, TextArea)
 except ImportError:
     print(
         "error: the 'textual' package is required for the TUI.\n"
@@ -61,8 +63,18 @@ Screen { background: #16181c; }
 #search { height: 3; padding: 0 1; }
 TabbedContent { height: 1fr; }
 TabPane { padding: 0; }
-DataTable { height: 1fr; }
+DataTable { height: 1fr; scrollbar-size-horizontal: 2;
+            scrollbar-color: #2dd4bf; scrollbar-color-active: #f59e0b; }
+.twrap { height: 1fr; }
+Button.nudge { width: 4; min-width: 4; height: 1fr;
+               border: none; background: $panel; color: $edge; }
+Button.nudge:hover { background: #272c33; }
+Button.nudge:focus { text-style: bold; }
 #bench { height: auto; padding: 0 1; }
+.compact #search { display: none; }
+.compact #hdr { height: 2; }
+.compact #h3 { display: none; }
+.compact Button.nudge { width: 3; min-width: 3; }
 ServerDetail, HelpModal, OrderDetail, FleetDetail, RentalSetup,
 ReviewModal, ProgressModal, LogModal, RenewModal {
     align: center middle; }
@@ -140,10 +152,20 @@ MKT_COLS = ("ID", "GPU", "CPU", "Price$/d", "SpotFlr", "Avail", "CC",
             "sols/h", "ODsol/$", "thr", "CPU model", "ISA", "Rel%",
             "Reason")
 ORDER_COLS = ("Order", "Server", "Type", "Online", "Curr", "Price/d",
-              "Spend", "Control", "State")
+              "Spend", "Sh/h", "Sh/¢", "Control", "State")
 FLEET_COLS = ("Server", "Pool", "Health", "CPU it/s", "GPU it/s",
               "Epoch", "Found", "Age", "$/hr", "Sh/h", "Spend$", "Up",
               "End", "Order", "GPU", "Worker", "Submitted", "Trainer")
+
+# app actions that only make sense on some tabs -> the footer hides
+# (and disables) them elsewhere via check_action
+PANE_ACTIONS = {
+    "toggle_available": ("candidates", "marketplace"),
+    "toggle_sort": ("candidates", "marketplace"),
+    "rent_selected": ("candidates", "marketplace"),
+    "toggle_fleet_all": ("fleet",),
+    "log_selected": ("fleet", "orders"),
+}
 
 
 def end_label(deadline_at):
@@ -160,7 +182,7 @@ def end_label(deadline_at):
                         else "%m-%d %H:%M")
 
 
-def uptime_label(created_at):
+def uptime_label(created_at, until=None):
     """Compact rental uptime '2h14m' / '3d5h'; '-' when unknown."""
     if not created_at:
         return "-"
@@ -169,8 +191,15 @@ def uptime_label(created_at):
             created_at.replace("Z", "+00:00"))
     except (ValueError, TypeError):
         return "-"
-    secs = max(0, int((datetime.now(timezone.utc)
-                       - start.astimezone(timezone.utc)).total_seconds()))
+    end = datetime.now(timezone.utc)
+    if until:
+        try:
+            end = min(end, datetime.fromisoformat(
+                until.replace("Z", "+00:00")).astimezone(timezone.utc))
+        except (ValueError, TypeError, AttributeError):
+            pass
+    secs = max(0, int((end - start.astimezone(timezone.utc))
+                      .total_seconds()))
     days, rem = divmod(secs, 86400)
     hours, rem = divmod(rem, 3600)
     mins = rem // 60
@@ -292,6 +321,42 @@ def rate_fmt(value):
     return f"{value:.1f}"
 
 
+_DURATION_PART = re.compile(r"(\d+(?:\.\d+)?)([dhms])")
+_END_LABEL = re.compile(r"(?:(\d{2})-(\d{2}) )?(\d{2}):(\d{2})")
+
+
+def _cell_sort_key(cell, reverse=False):
+    """Text cell -> (rank, value): numbers/durations first, then
+    strings; '-', '?' and 'n/a' always last -- reverse is folded into
+    the key so descending never floats the placeholders up top."""
+    text = cell.plain if isinstance(cell, Text) else str(cell)
+    s = text.strip().lower()
+    if not s or s in ("-", "?", "n/a", "unknown age"):
+        return (2, 0)
+    val = None
+    m = _END_LABEL.fullmatch(s)
+    if m:
+        now = datetime.now()
+        mon, day = ((int(m.group(1)), int(m.group(2)))
+                    if m.group(1) else (now.month, now.day))
+        val = datetime(now.year, mon, day, int(m.group(3)),
+                       int(m.group(4)), tzinfo=timezone.utc).timestamp()
+    elif _DURATION_PART.match(s):
+        val = sum(float(v) * {"d": 86400, "h": 3600, "m": 60,
+                              "s": 1}[u]
+                  for v, u in _DURATION_PART.findall(
+                      s.removesuffix(" old")))
+    else:
+        try:
+            val = float(re.sub(r"[^\d.\-]", "", s.split()[0]))
+        except ValueError:
+            pass
+    if val is not None:
+        return (0, -val if reverse else val)
+    return (1, tuple(-ord(c) for c in s) + (math.inf,)
+            if reverse else s)
+
+
 class ServerDetail(ModalScreen):
     """Scrollable per-server modal: overview + spec/price history."""
 
@@ -322,6 +387,15 @@ class ServerDetail(ModalScreen):
                     yield VerticalScroll(Static(self._prices()))
                 with TabPane("Rentals"):
                     yield VerticalScroll(Static(self._rentals()))
+            yield Horizontal(
+                Button("Raw JSON", id="sd-json"),
+                Button("Close", id="sd-close", variant="primary"))
+
+    def on_button_pressed(self, event):
+        if event.button.id == "sd-json":
+            self.action_toggle_json()
+        else:
+            self.dismiss()
 
     def _kv(self, label, value):
         return f"{label:<14} {value}"
@@ -347,7 +421,7 @@ class ServerDetail(ModalScreen):
                 f"{r.get('order_id'):<9} "
                 f"{str(r.get('pool') or '?')[:7]:<7} "
                 f"{str(r.get('provision_state') or '?')[:16]:<16} "
-                f"{uptime_label(r.get('created_at')):<7} "
+                f"{uptime_label(r.get('created_at'), r.get('up_until')):<7} "
                 f"{rate:<7} {spend:<7} {shr:<7} "
                 f"{'ON' if r.get('auto_renew') else ''}")
         return "\n".join(lines)
@@ -399,7 +473,7 @@ class ServerDetail(ModalScreen):
             f"  offers    {(spot.get('offers_count') if spot else None)}",
             f"  note      {(spot.get('note') if spot else '-')}",
             "",
-            "press j for raw listing JSON",
+            "press j or tap Raw JSON for raw listing JSON",
         ]
         if self.show_json:
             lines += ["", json.dumps(d["listing"], indent=2, sort_keys=True)]
@@ -443,7 +517,8 @@ class ServerDetail(ModalScreen):
 
 HELP_TEXT = """keys
 ----
-  /            focus search filter
+  /            focus search filter (reveals the bar on small screens;
+               Enter/Escape hides it again -- the filter still applies)
   b            rent setup -> in-TUI quote review -> Confirm & Rent
              (no terminal needed; nothing spends until you confirm)
   l            (on Fleet or Orders) tail the rig's miner log -- one
@@ -451,12 +526,13 @@ HELP_TEXT = """keys
              the locally archived copy instead
   a            toggle available-only
   s            toggle sort: sols/$ desc <-> $/day asc
-  c            reset filters (search, availability, sort)
+  f            toggle fleet view: active rigs <-> all (incl. ended)
+  c            reset filters (search, availability, sort, fleet view)
   r            reload the local SQLite db (rereads the db file; NOT an
              API refresh -- this app never calls the Clore API)
   Enter        open server detail on the highlighted row
   j            (in detail) toggle raw listing JSON
-  Escape/q     close detail or this help
+  Escape/q     close detail or this help (Close button works too)
   q            quit
 
 data
@@ -484,7 +560,10 @@ orders
   The Orders tab is observe-only: it lists reported Clore orders
   (including manual web-UI rentals) from the last successful poll.
   Online/spend fields are reported, not verified. Per-epoch accounting
-  and any rental control are not implemented here.
+  and any rental control are not implemented here. Sh/h is the recent
+  submitted-shares/hour rate from enrolled-rig telemetry; orders with
+  no recorded agent show '-'. Sh/¢ is shares per fee-inclusive cent
+  of spend rate (native price assumed USD-denominated).
 
 spot floors
 -----------
@@ -524,6 +603,11 @@ class HelpModal(ModalScreen):
                          classes="dtitle")
             yield VerticalScroll(Static(Text(
                 HELP_TEXT.format(db_path=self.db_path))))
+            yield Horizontal(
+                Button("Close", id="help-close", variant="primary"))
+
+    def on_button_pressed(self, event):
+        self.dismiss()
 
     def action_close(self):
         self.dismiss()
@@ -544,6 +628,10 @@ class OrderDetail(ModalScreen):
 
     def compose(self) -> ComposeResult:
         o = self.order
+        shr = (f"{o['shares_hr']:.1f}"
+               if o.get("shares_hr") is not None else "-")
+        spc = (f"{o['shares_per_cent']:.2f}"
+               if o.get("shares_per_cent") is not None else "-")
         kind = ("spot" if o.get("spot") is True else
                 "on-demand" if o.get("spot") is False else "unknown")
         lines = [
@@ -563,6 +651,10 @@ class OrderDetail(ModalScreen):
             f"price/day        {o.get('price_day_native')} (native)",
             f"spend reported   {o.get('spend_reported_native')} (native, "
             "cumulative -- not epoch spend, not fee-verified)",
+            f"shares/hr        {shr} (agent telemetry; '-' if not "
+            "enrolled)",
+            f"shares/¢         {spc} (shares per fee-inclusive cent "
+            "of spend rate)",
             f"creation fee     {o.get('quoted_creation_fee_native')} "
             "(quote, not proof charged)",
             f"created (unix)   {o.get('created_unix')}",
@@ -778,7 +870,11 @@ class CancelModal(ModalScreen):
         if event.button.id == "cc-back":
             self.dismiss()
             return
-        self.query_one("#cc-go", Button).disabled = True
+        go = self.query_one("#cc-go", Button)
+        go.disabled = True
+        go.label = "sending..."
+        self._append("sending cancel request -- waiting for API "
+                     "(one POST, no retry)...")
         self._run()
 
     def _append(self, msg):
@@ -877,6 +973,8 @@ class RenewModal(ModalScreen):
 
     def on_mount(self):
         self._app = self.app
+        if not self.on_now:
+            self.query_one("#rn-cap", Input).focus()
 
     def on_button_pressed(self, event):
         if event.button.id == "rn-back":
@@ -894,7 +992,11 @@ class RenewModal(ModalScreen):
                     "the renewal may re-bill at"))
                 return
             self._cap = cap
-        self.query_one("#rn-go", Button).disabled = True
+        go = self.query_one("#rn-go", Button)
+        go.disabled = True
+        go.label = "sending..."
+        self._append("sending auto-renew request -- waiting for API "
+                     "(one POST, no retry)...")
         self._run()
 
     def _append(self, msg):
@@ -985,7 +1087,10 @@ class RentalSetup(ModalScreen):
                     "On-demand only. Price/fees are re-fetched live "
                     "for the review; the same guarded rules as "
                     "rent.py apply (bounded term, one POST, "
-                    "auto-cancel on a bad receipt).")),
+                    "auto-cancel on a bad receipt).\n\n"
+                    "Keys: Tab/Shift-Tab moves between fields, "
+                    "Space toggles, Enter presses a focused button "
+                    "(taps may not reach fields over SSH).")),
                 Static("", id="r-error"),
                 Static(hours_hint),
                 Horizontal(
@@ -1010,6 +1115,9 @@ class RentalSetup(ModalScreen):
                     Button("Review & Rent", id="r-go",
                            variant="primary"),
                     Button("Cancel", id="r-cancel")))
+
+    def on_mount(self):
+        self.query_one("#r-hours", Input).focus()
 
     def _fail(self, msg):
         self.query_one("#r-error", Static).update(Text(msg))
@@ -1173,8 +1281,7 @@ class ProgressModal(ModalScreen):
             yield Static(self._title, classes="dtitle")
             yield VerticalScroll(Static("", id="plog"))
             yield Static("running...", id="pstatus")
-            yield Horizontal(Button("Close", id="p-close",
-                                    disabled=True))
+            yield Horizontal(Button("Close", id="p-close"))
 
     def add_line(self, msg):
         self._lines.append(msg)
@@ -1191,7 +1298,6 @@ class ProgressModal(ModalScreen):
         self.done = True
         try:
             self.query_one("#pstatus", Static).update(Text(status))
-            self.query_one("#p-close", Button).disabled = False
         except Exception:
             pass
 
@@ -1295,11 +1401,15 @@ class LogModal(ModalScreen):
 class MarketTui(App):
     TITLE = "clorqub marketplace"
     CSS = CSS
+    # drags scroll (touch-style); copying still works via the terminal's
+    # own selection
+    ALLOW_SELECT = False
     BINDINGS = [
         Binding("q", "quit", "Quit"),
         Binding("r", "reload", "Reload db"),
         Binding("a", "toggle_available", "Avail only"),
         Binding("s", "toggle_sort", "Sort $/day"),
+        Binding("f", "toggle_fleet_all", "Fleet all"),
         Binding("/", "focus_search", "Search"),
         Binding("c", "reset_filters", "Reset"),
         Binding("b", "rent_selected",
@@ -1317,12 +1427,18 @@ class MarketTui(App):
         self.error = None
         self.avail_only = False
         self.sort_by_price = False
+        self.fleet_show_all = False
         self.fingerprint = None
         self.reloaded_at = None
         self.sel_id = {"cand": None, "mkt": None}
+        self.sort_cols = {}  # table id -> (ColumnKey, reverse)
         self._rent_active = False
         self._rent_log = []
         self._rent_modal = None
+        self._search_pinned = False
+        self._drag_scroll = None
+        # gentler horizontal pointer/trackpad scrolling (default is 4.0)
+        self.scroll_sensitivity_x = 2.0
 
     def compose(self) -> ComposeResult:
         with Vertical(id="hdr"):
@@ -1336,19 +1452,37 @@ class MarketTui(App):
             yield Input(placeholder="/ filter: id owner cc cpu gpu isa reason")
         with TabbedContent():
             with TabPane("Candidates", id="candidates"):
-                yield DataTable(id="cand", cursor_type="row")
+                with Horizontal(classes="twrap"):
+                    yield Button("◀", id="cand-left", classes="nudge")
+                    yield DataTable(id="cand", cursor_type="row")
+                    yield Button("▶", id="cand-right", classes="nudge")
             with TabPane("Marketplace", id="marketplace"):
-                yield DataTable(id="mkt", cursor_type="row")
+                with Horizontal(classes="twrap"):
+                    yield Button("◀", id="mkt-left", classes="nudge")
+                    yield DataTable(id="mkt", cursor_type="row")
+                    yield Button("▶", id="mkt-right", classes="nudge")
             with TabPane("Benchmarks", id="benchmarks"):
                 yield VerticalScroll(Static(id="bench"))
             with TabPane("Orders", id="orders"):
                 with Vertical():
                     yield Static("", id="orders-status")
-                    yield DataTable(id="orders-table", cursor_type="row")
+                    with Horizontal(classes="twrap"):
+                        yield Button("◀", id="orders-table-left",
+                                     classes="nudge")
+                        yield DataTable(id="orders-table",
+                                        cursor_type="row")
+                        yield Button("▶", id="orders-table-right",
+                                     classes="nudge")
             with TabPane("Fleet", id="fleet"):
                 with Vertical():
                     yield Static("", id="fleet-status")
-                    yield DataTable(id="fleet-table", cursor_type="row")
+                    with Horizontal(classes="twrap"):
+                        yield Button("◀", id="fleet-table-left",
+                                     classes="nudge")
+                        yield DataTable(id="fleet-table",
+                                        cursor_type="row")
+                        yield Button("▶", id="fleet-table-right",
+                                     classes="nudge")
         yield Footer()
 
     def on_mount(self):
@@ -1360,6 +1494,25 @@ class MarketTui(App):
         self.action_reload()
         self.call_after_refresh(
             lambda: self.query_one("#cand", DataTable).focus())
+        self.call_after_refresh(self._update_compact)
+
+    def on_resize(self, event):
+        self._update_compact(event.size)
+
+    def _update_compact(self, size=None):
+        """Small viewports (phones, keyboard open): drop the search row
+        and stats line so the table and tab status stay visible.
+        `/` still reveals the search row via _search_pinned."""
+        size = size or self.screen.size
+        compact = size.height < 15 or size.width < 50
+        if not compact:
+            self._search_pinned = False
+        self.set_class(compact, "compact")
+        try:
+            self.query_one("#search").display = (
+                self._search_pinned if compact else True)
+        except Exception:
+            pass
 
     # -- data --------------------------------------------------------------
 
@@ -1390,6 +1543,7 @@ class MarketTui(App):
                   (dash.get("order_inventory") or {}).get("revision"),
                   dash.get("fleet_signature"),
                   self.avail_only, self.sort_by_price,
+                  self.fleet_show_all,
                   self._search_text())
             if fp != self.fingerprint:
                 self.fingerprint = fp
@@ -1537,10 +1691,17 @@ class MarketTui(App):
                       "no" if online is False else "?"),
                 plain(o.get("currency") or "?"),
                 plain(o.get("price_day_native")),
-                plain(o.get("spend_reported_native")),
+                plain(f"{o['spend_reported_native']:.2f}"
+                      if o.get("spend_reported_native") is not None
+                      else "-"),
+                plain(f"{o['shares_hr']:.1f}"
+                      if o.get("shares_hr") is not None else "-"),
+                plain(f"{o['shares_per_cent']:.2f}"
+                      if o.get("shares_per_cent") is not None else "-"),
                 plain(o.get("control")),
                 plain(o.get("state")),
                 key=str(o.get("order_id")))
+        self._apply_sort(table)
 
     def _cells(self, r):
         return {
@@ -1578,12 +1739,22 @@ class MarketTui(App):
                 sel_row = i
         if sel_row is not None:
             table.move_cursor(row=sel_row)
+        self._apply_sort(table)
+
+    def _apply_sort(self, table):
+        """Re-run the clicked-column sort after a table rebuild."""
+        spec = self.sort_cols.get(table.id)
+        if spec:
+            table.sort(spec[0],
+                       key=lambda cell: _cell_sort_key(cell, spec[1]))
 
     def render_fleet(self):
         fleet = (self.dash or {}).get("fleet") or []
+        fleet_all = (self.dash or {}).get("fleet_all") or fleet
         status = self.query_one("#fleet-status", Static)
         table = self.query_one("#fleet-table", DataTable)
-        items = fleet
+        active_ids = {r.get("order_id") for r in fleet}
+        items = fleet_all if self.fleet_show_all else fleet
         text = self._search_text()
         if text:
             items = [r for r in items if text in " ".join(str(v or "")
@@ -1597,22 +1768,27 @@ class MarketTui(App):
                                " ".join((r.get("status") or {}).get(
                                    "hardware", {}).get("gpus") or []),
                                )).lower()]
-        if not fleet:
+        if not fleet_all:
             status.update(Text(
                 "No rigs enrolled; `rent.py create` or `rent.py enroll` "
                 "adds them here (read-only)."))
         else:
-            latest = max((r.get("attempted_at") or "" for r in fleet),
+            latest = max((r.get("attempted_at") or "" for r in fleet_all),
                          default="")
             rates = [r["rate_hr_usd"] for r in fleet
                      if r.get("rate_hr_usd") is not None]
-            spends = [r["spend_usd"] for r in fleet
+            spends = [r["spend_usd"] for r in items
                       if r.get("spend_usd") is not None]
             parts = ([f"burn ${sum(rates):.3f}/hr"] if rates else []) + \
                     ([f"spend ${sum(spends):.2f}"] if spends else [])
             totals = "  ".join(parts) or "burn/spend n/a"
+            hidden = len(fleet_all) - len(fleet)
+            view = ("all" if self.fleet_show_all else
+                    f"active ({hidden} ended hidden)" if hidden
+                    else "active")
             status.update(Text(
-                f"{len(fleet)} rig(s) -- last poll {latest or 'never'} "
+                f"{len(items)} rig(s) [{view} -- f toggles] -- "
+                f"last poll {latest or 'never'} "
                 f"({age_of(latest) if latest else 'unknown age'}); "
                 f"unreachable rigs keep last-good rates below; "
                 f"End* = auto-renewing term  |  {totals}"))
@@ -1622,7 +1798,7 @@ class MarketTui(App):
             its = st.get("its") or {}
             shares = st.get("shares") or {}
             trainer = st.get("trainer") or {}
-            table.add_row(
+            cells = [
                 plain(r.get("server_id") or "?"),
                 plain(st.get("pool") or r.get("pool") or "?"),
                 plain(r.get("health") or "unknown"),
@@ -1640,7 +1816,8 @@ class MarketTui(App):
                       if r.get("shares_hr") is not None else "-"),
                 plain(f"{r['spend_usd']:.2f}"
                       if r.get("spend_usd") is not None else "-"),
-                plain(uptime_label(r.get("created_at"))),
+                plain(uptime_label(r.get("created_at"),
+                                   r.get("up_until"))),
                 plain(end_label(r.get("end_at"))
                       + ("*" if r.get("auto_renew") else "")),
                 plain(r.get("order_id")),
@@ -1650,8 +1827,11 @@ class MarketTui(App):
                       if shares.get("submitted") is not None else "-"),
                 plain(" ".join(x for x in (
                     trainer.get("variant"), trainer.get("version"))
-                    if x) or "-"),
-                key=str(r.get("order_id")))
+                    if x) or "-")]
+            if r.get("order_id") not in active_ids:
+                cells = [_dim(c) for c in cells]
+            table.add_row(*cells, key=str(r.get("order_id")))
+        self._apply_sort(table)
 
     def render_benchmarks(self):
         bench = self.query_one("#bench", Static)
@@ -1691,18 +1871,40 @@ class MarketTui(App):
         self.fingerprint = None
         self.render_tables()
 
+    def on_input_submitted(self, event):
+        # Enter in the filter = done typing; same as Escape
+        self.action_leave_search()
+
+    async def action_quit(self):
+        # modal screens have their own close keys; a stray `q` while
+        # a form field is unfocused must not kill the app
+        if len(self.screen_stack) != 1:
+            return
+        await super().action_quit()
+
     def action_focus_search(self):
+        if len(self.screen_stack) != 1:
+            return
+        if self.has_class("compact"):
+            # phone-sized viewport: reveal the hidden filter bar
+            self._search_pinned = True
+            self.query_one("#search").display = True
         self.query_one(Input).focus()
 
     def action_reset_filters(self):
+        if len(self.screen_stack) != 1:
+            return
         self.query_one(Input).value = ""
         self.avail_only = False
         self.sort_by_price = False
+        self.fleet_show_all = False
         self.fingerprint = None
         self.render_tables()
         self.notify("filters reset")
 
     def action_help(self):
+        if len(self.screen_stack) != 1:
+            return
         self.push_screen(HelpModal(self.db_path))
 
     def action_rent_selected(self):
@@ -1951,6 +2153,10 @@ class MarketTui(App):
 
     def action_leave_search(self):
         if isinstance(self.focused, Input):
+            if self.has_class("compact"):
+                # re-hide the filter bar; the typed filter still applies
+                self._search_pinned = False
+                self.query_one("#search").display = False
             pane = self._active_pane()
             table_id = {"candidates": "#cand", "marketplace": "#mkt",
                         "orders": "#orders-table",
@@ -1966,18 +2172,56 @@ class MarketTui(App):
         except Exception:
             return "candidates"
 
+    def check_action(self, action, parameters):
+        """Hide tab-scoped footer keys on tabs where they do nothing."""
+        panes = PANE_ACTIONS.get(action)
+        if panes is None:
+            return True
+        # False = disabled + removed from the footer
+        return self._active_pane() in panes
+
+    def on_tabbed_content_tab_activated(self, _event):
+        self.refresh_bindings()
+
     def action_toggle_available(self):
+        if len(self.screen_stack) != 1:
+            return
         self.avail_only = not self.avail_only
         self.fingerprint = None
         self.render_tables()
         self.notify(f"available-only: {self.avail_only}")
 
+    def action_toggle_fleet_all(self):
+        if len(self.screen_stack) != 1:
+            return
+        self.fleet_show_all = not self.fleet_show_all
+        self.fingerprint = None
+        self.render_fleet()
+        self.notify("fleet: all rigs (incl. ended)" if self.fleet_show_all
+                    else "fleet: active rigs only")
+
     def action_toggle_sort(self):
+        if len(self.screen_stack) != 1:
+            return
         self.sort_by_price = not self.sort_by_price
         self.fingerprint = None
         self.render_tables()
         self.notify("sort: fee-inclusive $/day asc" if self.sort_by_price
                     else "sort: sols/$ desc")
+
+    def on_data_table_header_selected(self, event):
+        """Click a column header to sort ascending; again to reverse."""
+        table, col = event.data_table, event.column_key
+        prev = self.sort_cols.get(table.id)
+        reverse = prev == (col, False)
+        self.sort_cols[table.id] = (col, reverse)
+        self._apply_sort(table)
+        for key, column in table.columns.items():
+            base = column.label.plain.rstrip(" ▲▼")
+            arrow = "▼" if key == col and reverse else \
+                    "▲" if key == col else ""
+            column.label = Text(base + arrow)
+        table.refresh()
 
     def on_data_table_row_selected(self, event):
         table = event.data_table
@@ -1992,7 +2236,7 @@ class MarketTui(App):
                 self.push_screen(OrderDetail(order))
             return
         if table.id == "fleet-table":
-            rig = next((r for r in (self.dash or {}).get("fleet") or []
+            rig = next((r for r in (self.dash or {}).get("fleet_all") or []
                         if str(r.get("order_id")) == row), None)
             if rig is not None:
                 self.push_screen(FleetDetail(rig, self.db_path))
@@ -2018,6 +2262,76 @@ class MarketTui(App):
                 self.sel_id[which] = int(event.row_key.value)
             except (TypeError, ValueError):
                 pass
+
+    def on_button_pressed(self, event):
+        """◀/▶ side buttons: nudge the table one column left/right."""
+        btn_id = event.button.id or ""
+        left = btn_id.endswith("-left")
+        if not (left or btn_id.endswith("-right")):
+            return
+        table_id = btn_id.rsplit("-", 1)[0]
+        try:
+            table = self.query_one(f"#{table_id}", DataTable)
+        except Exception:
+            return
+        self._nudge_x(table, -1 if left else 1)
+        table.focus()
+
+    def _nudge_x(self, table, direction):
+        """Scroll horizontally to the next column boundary."""
+        x = table._row_label_column_width
+        edges = []
+        for column in table.ordered_columns:
+            edges.append(x)
+            x += column.get_render_width(table)
+        target = table.scroll_target_x
+        if direction > 0:
+            new = next((e for e in edges if e > target + 0.5),
+                       table.max_scroll_x)
+        else:
+            new = next((e for e in reversed(edges) if e < target - 0.5), 0)
+        table.scroll_to(x=new)
+
+    def on_mouse_down(self, event):
+        """Arm a possible drag scroll (content follows the pointer)."""
+        self._drag_scroll = None
+        try:
+            widget, _ = self.screen.get_widget_at(event.screen_x,
+                                                  event.screen_y)
+        except Exception:
+            return
+        if isinstance(widget, (Input, TextArea, ScrollBar)):
+            return  # these use drags for selection / scrollbar moves
+        # nearest overflowing ancestor per axis; x and y may differ
+        x_widget = y_widget = None
+        node = widget
+        while isinstance(node, Widget):
+            if (x_widget is None and node.allow_horizontal_scroll
+                    and node.max_scroll_x > 0):
+                x_widget = node
+            if (y_widget is None and node.allow_vertical_scroll
+                    and node.max_scroll_y > 0):
+                y_widget = node
+            node = node.parent
+        if x_widget or y_widget:
+            self._drag_scroll = (
+                x_widget, y_widget, event.screen_x, event.screen_y,
+                x_widget.scroll_target_x if x_widget else 0,
+                y_widget.scroll_target_y if y_widget else 0)
+
+    def on_mouse_move(self, event):
+        if not self._drag_scroll or event.button != 1:
+            return
+        x_widget, y_widget, x0, y0, sx0, sy0 = self._drag_scroll
+        if x_widget is not None:
+            x_widget.scroll_to(x=sx0 - (event.screen_x - x0),
+                               animate=False)
+        if y_widget is not None:
+            y_widget.scroll_to(y=sy0 - (event.screen_y - y0),
+                               animate=False)
+
+    def on_mouse_up(self, _event):
+        self._drag_scroll = None
 
 
 def main(argv=None):
