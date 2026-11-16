@@ -979,10 +979,32 @@ def decide(now, state, cfg, say=None):
                  if r["role"] == "slot" and r["its_total"]
                  and r["age"] >= _minutes(cfg["startup_min"])]
         if slots:
-            worst = min(
-                slots,
-                key=lambda r: r["its_total"] / float(r["hourly_usd"]))
-            worst_eff = worst["its_total"] / float(worst["hourly_usd"])
+            # Rank incumbents by realized shares/$-h -- the metric that
+            # pays. A rig hashing well on paper but starving on shares
+            # is weak even when its it/s/$ looks fine. Median fleet
+            # yield (shares/h per it/s) converts a challenger's
+            # predicted it/s into a predicted share rate so both sides
+            # compare in the same units; when nothing has shared yet
+            # fall back to raw it/s/$.
+            def _shares_h(r):
+                hours = max((now - r["t0"]).total_seconds(),
+                            60) / 3600
+                return sum(c for _, c in r["share_arrivals"]) / hours
+
+            yields = [_shares_h(r) / r["its_total"] for r in slots
+                      if _shares_h(r) > 0 and r["its_total"]]
+            its_yield = _median(yields)
+            if its_yield:
+                eff = lambda r, hourly: _shares_h(r) / hourly
+                est_rate = lambda est, hourly: est * its_yield / hourly
+                unit = "sh"
+            else:
+                eff = lambda r, hourly: r["its_total"] / hourly
+                est_rate = lambda est, hourly: est / hourly
+                unit = "its"
+            worst = min(slots,
+                        key=lambda r: eff(r, float(r["hourly_usd"])))
+            worst_eff = eff(worst, float(worst["hourly_usd"]))
             active_ids = {r["server_id"] for r in state["rentals"]}
             best = None
             for c in _candidates(state, cfg, active_ids, []):
@@ -995,7 +1017,12 @@ def decide(now, state, cfg, say=None):
                     if c["prior"] is not None else None)
                 if est_its is None or est_its <= worst["its_total"]:
                     continue
-                est_eff = est_its / float(c["hourly"])
+                # the swap costs a fresh creation fee: amortize it over
+                # the rental term into the challenger's effective
+                # hourly. The incumbent's fee is already sunk.
+                eff_hr = float(c["hourly"]) + float(
+                    _CREATION_FEE_USD) / term
+                est_eff = est_rate(est_its, eff_hr)
                 if best is None or est_eff > best[1]:
                     best = (c, est_eff)
             if best is not None and best[1] > worst_eff * (
@@ -1015,8 +1042,8 @@ def decide(now, state, cfg, say=None):
                         f"remaining ${state['remaining']:.2f}")
             elif say and best is not None:
                 say(f"{_iso(now)} note upgrade scan: best s"
-                    f"{best[0]['server_id']} est {best[1]:.0f} its/$ "
-                    f"vs worst {worst_eff:.0f} "
+                    f"{best[0]['server_id']} est {best[1]:.0f} {unit}/$"
+                    f" vs worst {worst_eff:.0f} "
                     f"(need >{worst_eff * (1 + cfg['upgrade_margin']):.0f})")
 
     for pending in state["pending_bursts"]:
@@ -1327,6 +1354,7 @@ def decide(now, state, cfg, say=None):
 
 
 _QUOTE_PAD_USD = Decimal("0.20")
+_CREATION_FEE_USD = Decimal("0.10")  # flat marketplace order fee
 
 
 def _est_bound(c, hours):

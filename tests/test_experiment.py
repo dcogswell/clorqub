@@ -1376,6 +1376,85 @@ class BurstTests(unittest.TestCase):
         finally:
             db.close()
 
+    def test_upgrade_trigger_uses_share_yield(self):
+        # incumbent A hashes hard on paper (1000 its @ $0.2835/h =
+        # 3527 its/$) but starves on shares: realized 60 sh/h/$0.2835
+        # = 211.6 sh/$-h. Healthy slot B sets the fleet yield. A
+        # pricier challenger (1500 its @ $0.40/h) loses on its/$
+        # (3750 < 3527*1.25) but crushes A on predicted shares/$
+        # (1500*3.03/0.4167 = 10907 > 264.5): the audition fires.
+        db = make_db()
+        try:
+            cfg = dict(CFG, max_rentals=2)
+            phase = add_phase(db, cfg=cfg)
+            add_fleet(db, 1, 11)
+            add_rental(db, phase["phase_id"], 1, 11, 60,
+                       hourly="0.2835")
+            add_obs(db, 1, 1, status(submitted=1, cpu=200, gpu=800))
+            add_fleet(db, 2, 12)
+            add_rental(db, phase["phase_id"], 2, 12, 60,
+                       hourly="0.02")
+            add_obs(db, 2, 1, status(submitted=10, cpu=20, gpu=80))
+            chal = self._server_with_history(
+                db, 20, "AMD Ryzen 9 9950X 16-Core Processor",
+                "RTX 4090", its_cpu=300, its_gpu=1200)  # est 1500 its
+            # on_demand_usd is a daily price: $9.60/day = $0.40/h
+            chal["price"] = {"usd": {"on_demand_usd": 9.6, "spot": 0}}
+            add_snapshot(db, [chal])
+            acts, _ = actions(db, phase, cfg=cfg)
+            bursts = kinds(acts, "burst")
+            self.assertEqual(len(bursts), 1)
+            self.assertEqual(bursts[0]["trigger"], "upgrade")
+            self.assertEqual(bursts[0]["trigger_order_id"], 1)
+            self.assertEqual(bursts[0]["server_id"], 20)
+        finally:
+            db.close()
+
+    def test_upgrade_trigger_fee_blocks_marginal_swap(self):
+        # same weak-share incumbent (yield 0.06, eff 211.6 sh/$-h,
+        # need >264.5). Challenger 1100 its @ $0.24/h: without the
+        # $0.10 creation fee it clears (66/0.24 = 275 > 264.5); with
+        # the fee amortized over the 6h term it falls short
+        # (66/0.2567 = 257). At $0.20/h it still clears (304 > 264.5).
+        db = make_db()
+        try:
+            cfg = dict(CFG, max_rentals=1)
+            phase = add_phase(db, cfg=cfg)
+            add_fleet(db, 1, 11)
+            add_rental(db, phase["phase_id"], 1, 11, 60,
+                       hourly="0.2835")
+            add_obs(db, 1, 1, status(submitted=1, cpu=200, gpu=800))
+            chal = self._server_with_history(
+                db, 20, "AMD Ryzen 9 9950X 16-Core Processor",
+                "RTX 4090", its_cpu=200, its_gpu=900)  # est 1100 its
+            chal["price"] = {"usd": {"on_demand_usd": 5.76,
+                                     "spot": 0}}  # $0.24/h
+            add_snapshot(db, [chal])
+            acts, _ = actions(db, phase, cfg=cfg)
+            self.assertEqual(kinds(acts, "burst"), [])
+
+            db2 = make_db()
+            try:
+                phase2 = add_phase(db2, cfg=cfg)
+                add_fleet(db2, 1, 11)
+                add_rental(db2, phase2["phase_id"], 1, 11, 60,
+                           hourly="0.2835")
+                add_obs(db2, 1, 1,
+                        status(submitted=1, cpu=200, gpu=800))
+                chal2 = self._server_with_history(
+                    db2, 20, "AMD Ryzen 9 9950X 16-Core Processor",
+                    "RTX 4090", its_cpu=200, its_gpu=900)
+                chal2["price"] = {"usd": {"on_demand_usd": 4.8,
+                                          "spot": 0}}  # $0.20/h
+                add_snapshot(db2, [chal2])
+                acts2, _ = actions(db2, phase2, cfg=cfg)
+                self.assertEqual(kinds(acts2, "burst")[0]["trigger"],
+                                 "upgrade")
+            finally:
+                db2.close()
+        finally:
+            db.close()
+
     def test_upgrade_judge_dominance_swap(self):
         # probe beats the producing incumbent on raw it/s AND
         # shares/$: it is promoted and the incumbent is 'upgraded' out
