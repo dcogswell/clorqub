@@ -149,6 +149,19 @@ def utcnow():
     return datetime.now(timezone.utc).replace(microsecond=0)
 
 
+EPOCH_END_WEEKDAY = 2  # Qubic epochs end Wednesday 00:00 UTC
+
+
+def epoch_end(now):
+    """Next Wednesday 00:00 UTC after `now`."""
+    days = (EPOCH_END_WEEKDAY - now.weekday()) % 7
+    end = (now + timedelta(days=days)).replace(
+        hour=0, minute=0, second=0, microsecond=0)
+    if end <= now:
+        end += timedelta(days=7)
+    return end
+
+
 def open_db(path):
     db = market.connect_db(os.path.expanduser(path))
     fleet_store.initialize(db)
@@ -642,6 +655,9 @@ def build_state(db, phase, now, cfg, apply_endings=True, say=print):
         "reserve": _dec(phase["reserve_usd"]),
         "committed": committed,
         "remaining": budget - committed,
+        "epoch_ends_at": epoch_end(now),
+        "active_burn_hr": sum(
+            r["hourly_usd"] for r in rentals),
         "rentals": rentals,
         "pending_rerents": pending_rerents(db, phase_id),
         "pending_bursts": pending_bursts(db, phase_id),
@@ -837,6 +853,19 @@ def decide(now, state, cfg, say=None):
     if state["remaining"] <= 0:
         blocks.append("budget")
 
+    # epoch-end pacing: budget is meant to land spent at Wednesday
+    # 00:00 UTC -- idle rigs are the failure mode, so under-burning
+    # favours strong rigs and over-burning favours cheap short ones
+    hours_to_epoch = max(0.0, (state["epoch_ends_at"] - now)
+                         .total_seconds() / 3600)
+    term = max(1, min(cfg["hours"], int(hours_to_epoch)))
+    optimal_burn = (float(state["remaining"]) / hours_to_epoch
+                    if hours_to_epoch > 0 else None)
+    pace_deficit = (optimal_burn - float(state["active_burn_hr"])
+                    if optimal_burn is not None else None)
+    value_first = (pace_deficit is not None
+                   and pace_deficit > 0.1 * optimal_burn)
+
     burst_ok = (state["unjudged_burst"] is None
                 and now < state["phase_ends_at"] and not blocks)
     burst_emitted = False
@@ -971,7 +1000,7 @@ def decide(now, state, cfg, say=None):
                     best = (c, est_eff)
             if best is not None and best[1] > worst_eff * (
                     1 + cfg["upgrade_margin"]):
-                if _quote_fits(best[0], cfg["hours"],
+                if _quote_fits(best[0], term,
                                state["remaining"]):
                     actions.append({
                         "type": "burst", "trigger": "upgrade",
@@ -982,7 +1011,7 @@ def decide(now, state, cfg, say=None):
                 elif say:
                     say(f"{_iso(now)} note upgrade scan: s"
                         f"{best[0]['server_id']} dominant but est "
-                        f"${_est_bound(best[0], cfg['hours']):.2f} > "
+                        f"${_est_bound(best[0], term):.2f} > "
                         f"remaining ${state['remaining']:.2f}")
             elif say and best is not None:
                 say(f"{_iso(now)} note upgrade scan: best s"
@@ -1202,10 +1231,10 @@ def decide(now, state, cfg, say=None):
                 # probes are prospective slots, not lottery filler:
                 # same ranking and term as a slot fill
                 probes_now = _candidates(state, cfg, active_ids,
-                                         chosen)
+                                         chosen, value_first)
                 target = burst.get("target_server")
                 affordable = [c for c in probes_now if _quote_fits(
-                    c, cfg["hours"], state["remaining"])]
+                    c, term, state["remaining"])]
                 pick = next((c for c in affordable
                              if c["server_id"] == target), None) \
                     if target is not None else None
@@ -1217,10 +1246,10 @@ def decide(now, state, cfg, say=None):
                         "type": "rent", "server_id": pick["server_id"],
                         "reason": "probe", "tier": pick["tier"],
                         "role": "probe", "burst_id": burst["burst_id"],
-                        "hours": cfg["hours"]})
+                        "hours": term})
                 elif say and probes_now:
                     cheapest = min(
-                        (_est_bound(c, cfg["hours"]) for c in probes_now
+                        (_est_bound(c, term) for c in probes_now
                          if c["hourly"] is not None), default=None)
                     say(f"{_iso(now)} note burst {burst['burst_id']}: "
                         f"{len(probes_now)} candidates, none affordable "
@@ -1247,7 +1276,8 @@ def decide(now, state, cfg, say=None):
             if acceptable:
                 rent_actions.append({"type": "rent", "server_id": sid,
                                      "reason": "rerent",
-                                     "tier": pending["tier"]})
+                                     "tier": pending["tier"],
+                                     "hours": term})
                 chosen.append({"server_id": sid,
                                "tier": pending["tier"]})
                 rerented_ids.add(sid)
@@ -1265,9 +1295,10 @@ def decide(now, state, cfg, say=None):
                 1 for p in state["pending_rerents"]
                 if p["server_id"] not in rerented_ids) \
                 + n_chosen_slots < cfg["max_rentals"]:
-            candidates = _candidates(state, cfg, active_ids, chosen)
+            candidates = _candidates(state, cfg, active_ids, chosen,
+                                     value_first)
             pick = next((c for c in candidates if _quote_fits(
-                c, cfg["hours"], state["remaining"])), None)
+                c, term, state["remaining"])), None)
             if pick is None:
                 if say and candidates:
                     say(f"{_iso(now)} note fill: {len(candidates)} "
@@ -1278,7 +1309,8 @@ def decide(now, state, cfg, say=None):
             n_chosen_slots += 1
             rent_actions.append({"type": "rent",
                                  "server_id": pick["server_id"],
-                                 "reason": "fill", "tier": pick["tier"]})
+                                 "reason": "fill", "tier": pick["tier"],
+                                 "hours": term})
     # a probe near its free-window deadline freezes rentals: a blocking
     # provision wait could push its cancel past the window.
     if any(r["role"] == "probe"
@@ -1310,9 +1342,11 @@ def _quote_fits(c, hours, remaining):
     return est is not None and est <= remaining
 
 
-def _candidates(state, cfg, active_ids, chosen):
+def _candidates(state, cfg, active_ids, chosen, value_first=False):
     """Acceptable listings minus active/pending/excluded, zen-tier
-    preference, sorted by (coverage asc, -its/usd prior, hourly, id)."""
+    preference, sorted by (coverage asc, -its/usd prior, hourly, id).
+    value_first=True (behind epoch-end pace) sorts by prior first --
+    converting budget into hash outranks exploration there."""
     pending_ids = {p["server_id"] for p in state["pending_rerents"]}
     chosen_ids = {c["server_id"] for c in chosen}
     zen_have = sum(1 for r in state["rentals"] if r["tier"] == "zen") + \
@@ -1344,8 +1378,9 @@ def _candidates(state, cfg, active_ids, chosen):
     if zen_want > 0 and any(c["tier"] == "zen" for c in pool):
         pool = [c for c in pool if c["tier"] == "zen"]
     pool.sort(key=lambda c: (
-        c["coverage"],
-        -c["prior"] if c["prior"] is not None else float("inf"),
+        (-(c["prior"] or 0), c["coverage"]) if value_first
+        else (c["coverage"],
+              -c["prior"] if c["prior"] is not None else float("inf")),
         c["hourly"], c["server_id"]))
     return pool
 
@@ -1526,6 +1561,8 @@ def summary(db, now, db_path=None):
                  "started_at": _iso(ub["started_at"]),
                  "n_target": ub["n_target"], "probes": probes,
                  "judge_in_s": max(0.0, judge_in)}
+    hours_to_epoch = max(0.0, (state["epoch_ends_at"] - now)
+                         .total_seconds() / 3600)
     return {
         "phase": {
             "phase_id": phase["phase_id"],
@@ -1534,7 +1571,12 @@ def summary(db, now, db_path=None):
             "budget": f"{_dec(phase['budget_usd']):.2f}",
             "reserve": f"{_dec(phase['reserve_usd']):.2f}",
             "committed": f"{state['committed']:.2f}",
-            "remaining": f"{state['remaining']:.2f}"},
+            "remaining": f"{state['remaining']:.2f}",
+            "active_burn_hr": f"{float(state['active_burn_hr']):.3f}",
+            "optimal_burn_hr": (
+                f"{float(state['remaining']) / hours_to_epoch:.3f}"
+                if hours_to_epoch > 0 else None),
+            "epoch_ends_at": _iso(state["epoch_ends_at"])},
         "rentals": rentals,
         "pending_rerents": [{
             "server_id": p["server_id"],
@@ -1837,8 +1879,15 @@ def run_cycle(db, db_path, env_file, phase, cfg, live, now=None,
         bits.append(f"burst {ub['burst_id']}({ub['trigger']}) "
                     f"{len(state['burst_probes'])}/{ub['n_target']} "
                     "probes")
+    hours_to_epoch = max(0.0, (state["epoch_ends_at"] - now)
+                         .total_seconds() / 3600)
+    optimal = (state["remaining"] / _dec(hours_to_epoch)
+               if hours_to_epoch > 0 else None)
+    opt_txt = f"opt=${float(optimal):.3f}/h" \
+        if optimal is not None else "opt=-"
     say(f"{_iso(now)} tick committed=${state['committed']:.2f} "
         f"remaining=${state['remaining']:.2f} "
+        f"burn=${float(state['active_burn_hr']):.3f}/h {opt_txt} "
         f"{' | '.join(bits) if bits else 'idle'}")
     execute(db, db_path, env_file, phase, cfg, acts, now, live,
             say=say)

@@ -1639,12 +1639,24 @@ class MarketTui(App):
             return
         d = self.dash
         kind = (d["source"] or "?").split(":", 1)[0]
+        bal = d.get("balance_usd")
+        phase = (d.get("experiment") or {}).get("phase") or {}
+        money = ""
+        if phase:
+            opt = phase.get("optimal_burn_hr")
+            money = (
+                f"BAL {'$' + format(bal, '.2f') if bal is not None else '-'}  "
+                f"BUD ${phase.get('committed', '?')}"
+                f"/${phase.get('budget', '?')}  "
+                f"OPT {('$' + format(float(opt), '.3f') + '/h')
+                       if opt is not None else '-'}  |  ")
         if d["captured_at"]:
             h2.update(Text(
-                f"CACHED SNAPSHOT  imported {d['captured_at']} "
+                money +
+                f"snapshot {d['captured_at']} "
                 f"({age_of(d['captured_at'])})"))
         else:
-            h2.update(Text("CACHED SNAPSHOT  nothing imported yet"))
+            h2.update(Text(money + "snapshot: nothing imported yet"))
         warn = "  anchors != guarantees"
         if self.error:
             warn = "  STALE -- reload failed"

@@ -551,6 +551,41 @@ class DecideTests(unittest.TestCase):
     def test_coverage_ordering_prefers_unexplored_hardware(self):
         db = make_db()
         try:
+            phase = add_phase(db, cfg=dict(CFG, max_rentals=2))
+            # an on-pace fleet: burn >= remaining/hours_to_epoch keeps
+            # the coverage-first ordering (behind pace -> value-first)
+            add_fleet(db, 8, 8)
+            add_rental(db, phase["phase_id"], 8, 8, 60, hourly="3.0")
+            add_obs(db, 8, 1, status(submitted=5))
+            old = listing(server_id=42, cpu="Intel Core i9-10980XE",
+                          gpu="RTX 3070")
+            db.execute(
+                "INSERT INTO servers(server_id, owner, country,"
+                " first_seen, last_seen, latest_json)"
+                " VALUES (?,?,?,?,?,?)",
+                (42, 1, "CA", iso(500), iso(0), json.dumps(old)))
+            add_fleet(db, 999, 42)
+            add_obs(db, 999, 300, status(submitted=1))
+            add_obs(db, 999, 240, status(submitted=2))
+            db.commit()
+            add_snapshot(db, [
+                listing(server_id=9, cpu="Intel Core i9-10980XE",
+                        gpu="RTX 3070"),
+                listing(server_id=10, cpu="Intel Xeon E5-2695 v4",
+                        gpu="RTX 3070"),
+            ])
+            acts, _ = actions(db, phase, cfg=dict(CFG, max_rentals=2))
+            rents = kinds(acts, "rent")
+            self.assertEqual(len(rents), 1)
+            self.assertEqual(rents[0]["server_id"], 10)
+        finally:
+            db.close()
+
+    def test_behind_epoch_pace_prefers_known_producers(self):
+        # no burn and a fat remaining budget -> behind pace: fills
+        # favour rigs with a measured prior over unexplored ones
+        db = make_db()
+        try:
             phase = add_phase(db, cfg=dict(CFG, max_rentals=1))
             old = listing(server_id=42, cpu="Intel Core i9-10980XE",
                           gpu="RTX 3070")
@@ -572,7 +607,7 @@ class DecideTests(unittest.TestCase):
             acts, _ = actions(db, phase, cfg=dict(CFG, max_rentals=1))
             rents = kinds(acts, "rent")
             self.assertEqual(len(rents), 1)
-            self.assertEqual(rents[0]["server_id"], 10)
+            self.assertEqual(rents[0]["server_id"], 9)
         finally:
             db.close()
 
