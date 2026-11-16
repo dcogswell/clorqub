@@ -98,7 +98,7 @@ PROBE_RENT_GUARD_MIN = 4
 DEFAULT_CONFIG = {
     "max_rentals": 2,
     "hours": 6,
-    "max_price_hr": "0.30",
+    "max_price_hr": "0.50",
     "x_min": [30, 60, 90],
     "y_min": [15, 30, 60],
     "startup_min": 8,
