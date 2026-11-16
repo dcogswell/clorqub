@@ -4,9 +4,14 @@ auto-rental").
 A `phase` is a bounded experiment window with a USD budget. `run`
 watches the phase's experiment rentals (which the collector observes
 into rig_observations) and applies re-roll rules: start-up restarts,
-fault cancels inside the free window, dry-tree cancel + re-rent, cancel +
-re-rent after x/y, and slot filling across hardware tiers. Dry-run is
-the default; --live spends money and requires --confirm-budget.
+fault cancels inside the free window, and dry-tree handling via bursts.
+A produced slot that goes quiet for its x arm triggers a probe burst
+while it keeps hashing; at judge time the incumbent is re-checked and
+either keeps its slot, or is replaced by a promoted probe (its order
+keeps the proven tree). When nothing produced, the incumbent is
+cancelled and a retry burst refills the vacancy after the y arm.
+Dry-run is the default; --live spends money and requires
+--confirm-budget.
 
 Only orders recorded in experiment_rentals are ever acted on.
 """
@@ -101,21 +106,24 @@ DEFAULT_CONFIG = {
     "fault_check_min": 6,
     "free_window_min": 10,
     "dry_after_min": 15,
-    "produced_dry_min": 35,
-    "dry_rerent_delay_min": 2,
-    "dry_rerent_max_per_day": 3,
     "restart_cooldown_min": 10,
     "unreachable_min": 15,
     "rerent_grace_min": 60,
     "stale_obs_sec": 120,
     "stale_market_min": 15,
     "burst_max": 4,
-    "burst_hours": 1,
-    "burst_cooldown_min": 60,
     "burst_fill_min": 5,
     "probe_judge_min": 5,
     "probe_cancel_by_min": 8,
-    "burst_keep_control": True,
+    # promotion: a probe replaces a dry slot only when within
+    # promote_its_floor of the best its and ahead on its/$ by margin
+    "promote_its_floor": 0.5,
+    "promote_margin": 0.15,
+    # opportunistic upgrade: a listing predicted to beat the weakest
+    # producing slot on both it/s and it/s/$ earns a probe audition;
+    # the swap needs the same dominance on measured shares/$ + it/s
+    "upgrade_margin": 0.25,
+    "upgrade_daily_max": 4,
 }
 
 
@@ -178,11 +186,14 @@ def validate_config(cfg):
             cfg["burst_max"] > rental_policy.MAX_BURST_PROBES:
         raise ValueError(
             f"burst_max must be 1..{rental_policy.MAX_BURST_PROBES}")
-    if isinstance(cfg["burst_hours"], bool) \
-            or not isinstance(cfg["burst_hours"], int) \
-            or not 1 <= cfg["burst_hours"] <= rental_policy.MAX_HOURS:
-        raise ValueError(
-            f"burst_hours must be 1..{rental_policy.MAX_HOURS}")
+    if not 0 < cfg["promote_its_floor"] <= 1:
+        raise ValueError("promote_its_floor must be in (0, 1]")
+    if not 0 <= cfg["promote_margin"]:
+        raise ValueError("promote_margin must be >= 0")
+    if not 0 <= cfg["upgrade_margin"]:
+        raise ValueError("upgrade_margin must be >= 0")
+    if cfg["upgrade_daily_max"] < 0:
+        raise ValueError("upgrade_daily_max must be >= 0")
     if cfg["probe_cancel_by_min"] >= cfg["free_window_min"]:
         raise ValueError(
             "probe_cancel_by_min must be < free_window_min")
@@ -295,12 +306,6 @@ def _rental_state(db, phase, row, now, cfg, listings):
     arrivals = share_arrivals(good)
     last_share_at = arrivals[-1][0] if arrivals else None
     restarts = _restart_events(db, phase["phase_id"], order_id)
-    dry_rerents_24h = db.execute(
-        "SELECT COUNT(*) FROM experiment_events WHERE phase_id=?"
-        " AND kind='cancel' AND server_id=? AND ts>=?"
-        " AND detail_json LIKE '%\"reason\": \"dry\"%'",
-        (phase["phase_id"], row["server_id"],
-         _iso(now - timedelta(days=1)))).fetchone()[0]
     quiet_since = last_share_at or t0
     reroll_start = None
     if quiet_since is not None:
@@ -349,7 +354,6 @@ def _rental_state(db, phase, row, now, cfg, listings):
         "restarts": restarts,
         "reroll_start": reroll_start,
         "quiet_since": quiet_since,
-        "dry_rerents_24h": dry_rerents_24h,
         "good_obs": good,
         "spec_mismatch": spec_mismatch(listing, last_status),
     }
@@ -372,6 +376,30 @@ def pending_rerents(db, phase_id):
         elif sid in pending and row["kind"] in (
                 "rent", "rent_failed", "rerent_expired"):
             del pending[sid]
+    return list(pending.values())
+
+
+def pending_bursts(db, phase_id):
+    """burst_scheduled events with no later burst_started for the same
+    for_order (or a retry_expired/retry_cleared), as pending retry
+    bursts for vacated slots."""
+    pending = {}
+    for row in db.execute(
+            "SELECT kind, order_id, detail_json FROM experiment_events "
+            "WHERE phase_id=? ORDER BY id", (phase_id,)):
+        detail = json.loads(row["detail_json"])
+        if row["kind"] == "burst_scheduled":
+            key = detail["for_order"]
+            pending[key] = {"for_order": key,
+                            "server_id": detail.get("server_id"),
+                            "tier": detail.get("tier"),
+                            "y_min": detail["y_min"],
+                            "due_at": _dt(detail["due_at"])}
+        elif row["kind"] == "burst_started" \
+                and row["order_id"] is not None:
+            pending.pop(row["order_id"], None)
+        elif row["kind"] in ("retry_expired", "retry_cleared"):
+            pending.pop(detail.get("for_order"), None)
     return list(pending.values())
 
 
@@ -433,6 +461,7 @@ def history_stats(db, known_listings, exclude_order_id=None,
     coverage = {}
     cpu_samples = {}
     gpu_samples = {}
+    server_samples = {}
     rental_counts = {"cpu": {}, "gpu": {}}
     for fleet in db.execute("SELECT * FROM fleet_rentals"):
         if fleet["order_id"] == exclude_order_id:
@@ -473,12 +502,21 @@ def history_stats(db, known_listings, exclude_order_id=None,
                 target.setdefault(key, []).extend(values)
                 counts = rental_counts[device]
                 counts[key] = counts.get(key, 0) + 1
+        per_rental = sum(_median(samples[d]) or 0 for d in ("cpu", "gpu"))
+        if per_rental > 0:
+            server_samples.setdefault(fleet["server_id"], []).append(
+                per_rental)
     return {
         "coverage": coverage,
         "cpu_prior": {k: _median(v) for k, v in cpu_samples.items()},
         "gpu_prior": {k: _median(v) for k, v in gpu_samples.items()},
         "cpu_rentals": rental_counts["cpu"],
         "gpu_rentals": rental_counts["gpu"],
+        # per-server hardware history: median total it/s across this
+        # server's past rentals. it/s is hardware-bound (tree luck only
+        # moves share yield), so this survives a fresh tree draw.
+        "server_prior": {sid: {"its": _median(v), "rentals": len(v)}
+                         for sid, v in server_samples.items()},
     }
 
 
@@ -544,9 +582,17 @@ def build_state(db, phase, now, cfg, apply_endings=True, say=print):
     bursts = [dict(b) for b in db.execute(
         "SELECT * FROM experiment_bursts WHERE phase_id=? "
         "ORDER BY burst_id", (phase_id,))]
+    burst_meta = {}
+    for row in db.execute(
+            "SELECT detail_json FROM experiment_events WHERE phase_id=?"
+            " AND kind='burst_started'", (phase_id,)):
+        detail = json.loads(row["detail_json"])
+        if detail.get("burst_id") is not None:
+            burst_meta[detail["burst_id"]] = detail
     for b in bursts:
         b["started_at"] = _dt(b["started_at"])
         b["judged_at"] = _dt(b["judged_at"])
+        b["y_min"] = (burst_meta.get(b["burst_id"]) or {}).get("y_min")
     unjudged = next((b for b in bursts if b["judged_at"] is None), None)
     last_burst_at = (max(b["started_at"] for b in bursts)
                      if bursts else None)
@@ -596,6 +642,7 @@ def build_state(db, phase, now, cfg, apply_endings=True, say=print):
         "remaining": budget - committed,
         "rentals": rentals,
         "pending_rerents": pending_rerents(db, phase_id),
+        "pending_bursts": pending_bursts(db, phase_id),
         "excluded": excluded_servers(db, phase_id) | set(
             blacklist.active(db, now)),
         "listings": listings,
@@ -612,6 +659,14 @@ def build_state(db, phase, now, cfg, apply_endings=True, say=print):
                            if snapshot_at else None),
         "pending_attempts": bool(fleet_store.pending_attempts(db)),
         "stats": history_stats(db, server_listings(db)),
+        "tried_servers": {row["server_id"] for row in db.execute(
+            "SELECT DISTINCT server_id FROM experiment_rentals"
+            " WHERE phase_id=?", (phase_id,))},
+        "upgrade_bursts_24h": db.execute(
+            "SELECT COUNT(*) FROM experiment_events WHERE phase_id=?"
+            " AND kind='burst_started' AND ts>=?"
+            " AND detail_json LIKE '%\"trigger\": \"upgrade\"%'",
+            (phase_id, _iso(now - timedelta(days=1)))).fetchone()[0],
     }
 
 
@@ -735,6 +790,14 @@ def _exec_blacklist(db, phase_id, action, now, say):
                              "ttl_days": blacklist.AUTO_TTL_DAYS}, say=say)
 
 
+def _retry_burst(r, now):
+    """Retry-burst schedule for a vacated slot: after the cancelled
+    rental's y arm, an empty-slot burst buys fresh draws."""
+    return {"for_order": r["order_id"], "server_id": r["server_id"],
+            "tier": r["tier"], "y_min": r["y_min"],
+            "due_at": _iso(now + _minutes(r["y_min"]))}
+
+
 def _fault_reason(rental):
     """Fault checks for the free window; returns a short tag or None."""
     if rental.get("spec_mismatch"):
@@ -750,10 +813,11 @@ def _fault_reason(rental):
     return None
 
 
-def decide(now, state, cfg):
+def decide(now, state, cfg, say=None):
     """Pure: state -> ordered action dicts. One action per rental per
     cycle; restart/cancel actions survive global blocks, rent actions
-    are replaced by `blocked` entries."""
+    are replaced by `blocked` entries. `say`, when given, gets
+    log-only notes for skipped work that emits no event."""
     actions = []
     telemetry_stale = bool(state["rentals"]) and (
         state["telemetry_age_s"] is None
@@ -773,10 +837,6 @@ def decide(now, state, cfg):
 
     burst_ok = (state["unjudged_burst"] is None
                 and now < state["phase_ends_at"] and not blocks)
-    auto_burst_ok = burst_ok and (
-        state["last_burst_started_at"] is None or now - state[
-            "last_burst_started_at"] >= _minutes(
-                cfg["burst_cooldown_min"]))
     burst_emitted = False
 
     for r in [] if telemetry_stale else state["rentals"]:
@@ -827,11 +887,13 @@ def decide(now, state, cfg):
         if reroll is not None and now - reroll >= _minutes(r["x_min"]) \
                 and (r["last_share_at"] is None
                      or r["last_share_at"] < reroll):
+            # a re-roll that produced nothing for its x arm: stop the
+            # burn; a retry burst fills the slot after the y arm.
             actions.append({
                 "type": "cancel", "order_id": r["order_id"],
                 "server_id": r["server_id"], "tier": r["tier"],
-                "reason": "dry_after_x",
-                "rerent_at": _iso(now + _minutes(r["y_min"]))})
+                "reason": "dry_after_x", "rerent_at": None,
+                "retry_burst": _retry_burst(r, now)})
             continue
         if r["its_total"] == 0 and now - (
                 r["last_restart_at"] or t0) >= _minutes(
@@ -844,37 +906,101 @@ def decide(now, state, cfg):
                             "reason": "zero_its"})
             continue
         produced = r["last_share_at"] is not None
-        threshold = cfg["produced_dry_min"] if produced \
-            else cfg["dry_after_min"]
-        if now - quiet >= _minutes(threshold):
-            if r["dry_rerents_24h"] < cfg["dry_rerent_max_per_day"]:
-                # tree assignments are pool-side sticky per wallet+alias;
-                # only a new order (new worker identity) buys a new draw.
-                # A rig that produced before is proven -- re-rent the same
-                # server. One that never produced may just be unable to
-                # hit: leave rerent unset so the fill picks fresh hardware
-                # (the same server is still allowed if it wins).
-                actions.append({
-                    "type": "cancel", "order_id": r["order_id"],
-                    "server_id": r["server_id"], "tier": r["tier"],
-                    "reason": "dry",
-                    "rerent_at": _iso(now + _minutes(
-                        cfg["dry_rerent_delay_min"])) if produced
-                        else None})
-            elif auto_burst_ok and not burst_emitted:
-                # out of daily re-rents; a burst still shows whether the
-                # pool is dry everywhere or just our tree
+        if produced and now - quiet >= _minutes(r["x_min"]):
+            # dry incumbent rides out the burst: at judge it is
+            # re-checked and only cancelled when a probe beats it or
+            # nothing produced. x_min is the dry-tolerance arm.
+            if burst_ok and not burst_emitted:
                 actions.append({
                     "type": "burst", "trigger": "dry",
                     "trigger_order_id": r["order_id"],
-                    "n": cfg["burst_max"]})
+                    "y_min": r["y_min"], "n": cfg["burst_max"]})
                 burst_emitted = True
+            continue
+        if not produced and now - quiet >= _minutes(
+                cfg["dry_after_min"]):
+            # never produced: nothing worth rechecking -- cancel
+            # outright and let a retry burst fill the vacancy.
+            actions.append({
+                "type": "cancel", "order_id": r["order_id"],
+                "server_id": r["server_id"], "tier": r["tier"],
+                "reason": "dry", "rerent_at": None,
+                "retry_burst": _retry_burst(r, now)})
+            continue
 
     if not burst_emitted and burst_ok and state["burst_request_n"]:
         actions.append({"type": "burst", "trigger": "manual",
                         "trigger_order_id": None,
                         "n": state["burst_request_n"]})
         burst_emitted = True
+
+    n_slots = sum(1 for r in state["rentals"] if r["role"] == "slot")
+    # opportunistic upgrade: a listing whose predicted it/s and it/s/$
+    # both dominate the weakest producing slot earns a one-probe
+    # audition. Per-server history answers the hardware question; the
+    # probe still has to verify its fresh tree draw actually produces.
+    # Only worth spending an audition when the fleet is full -- a
+    # vacant slot captures the same upside through the normal fill.
+    if not burst_emitted and burst_ok \
+            and n_slots >= cfg["max_rentals"] \
+            and state["upgrade_bursts_24h"] < cfg["upgrade_daily_max"]:
+        slots = [r for r in state["rentals"]
+                 if r["role"] == "slot" and r["its_total"]
+                 and r["age"] >= _minutes(cfg["startup_min"])]
+        if slots:
+            worst = min(
+                slots,
+                key=lambda r: r["its_total"] / float(r["hourly_usd"]))
+            worst_eff = worst["its_total"] / float(worst["hourly_usd"])
+            active_ids = {r["server_id"] for r in state["rentals"]}
+            best = None
+            for c in _candidates(state, cfg, active_ids, []):
+                sid = c["server_id"]
+                if sid in state["tried_servers"] or not c["hourly"]:
+                    continue
+                known = state["stats"]["server_prior"].get(sid)
+                est_its = known["its"] if known is not None else (
+                    c["prior"] * float(c["hourly"])
+                    if c["prior"] is not None else None)
+                if est_its is None or est_its <= worst["its_total"]:
+                    continue
+                est_eff = est_its / float(c["hourly"])
+                if best is None or est_eff > best[1]:
+                    best = (c, est_eff)
+            if best is not None and best[1] > worst_eff * (
+                    1 + cfg["upgrade_margin"]):
+                actions.append({
+                    "type": "burst", "trigger": "upgrade",
+                    "trigger_order_id": worst["order_id"],
+                    "y_min": worst["y_min"], "n": 1})
+                burst_emitted = True
+            elif say and best is not None:
+                say(f"{_iso(now)} note upgrade scan: best s"
+                    f"{best[0]['server_id']} est {best[1]:.0f} its/$ "
+                    f"vs worst {worst_eff:.0f} "
+                    f"(need >{worst_eff * (1 + cfg['upgrade_margin']):.0f})")
+
+    for pending in state["pending_bursts"]:
+        due = pending["due_at"]
+        if now > due + _minutes(cfg["rerent_grace_min"]):
+            actions.append({"type": "retry_expired",
+                            "for_order": pending["for_order"]})
+            continue
+        if now < due:
+            continue
+        if n_slots + len(state["pending_rerents"]) \
+                >= cfg["max_rentals"]:
+            # the freed slot was taken by something else; drop it
+            actions.append({"type": "retry_cleared",
+                            "for_order": pending["for_order"]})
+            continue
+        if burst_ok and not burst_emitted:
+            # the vacancy stays reserved; a retry buys fresh draws
+            actions.append({
+                "type": "burst", "trigger": "dry_retry",
+                "trigger_order_id": pending["for_order"],
+                "y_min": pending["y_min"], "n": cfg["burst_max"]})
+            burst_emitted = True
 
     burst = state["unjudged_burst"]
     if burst is not None:
@@ -897,26 +1023,157 @@ def decide(now, state, cfg):
                 and any(ts >= p["t0"] for ts, _ in
                         p.get("share_arrivals", []))}
             # probes at/past the deadline are left to the probe_deadline
-            # cancel; they can't be kept or judged-cancelled.
-            active_probes = [
-                p for p in probes
-                if not p["ended"] and p["role"] == "probe"
-                and p["age"] < _minutes(cfg["probe_cancel_by_min"])]
-            keep = [p["order_id"] for p in active_probes
-                    if p["order_id"] in finder_ids]
-            rest = sorted(
-                (p for p in active_probes
-                 if p["order_id"] not in finder_ids),
-                key=lambda p: p["hourly_usd"])
-            control = None
-            if cfg["burst_keep_control"] and rest:
-                control = rest[0]["order_id"]
-                rest = rest[1:]
-            actions.append({
-                "type": "judge", "burst_id": burst["burst_id"],
-                "finders": sorted(finder_ids), "keep": keep,
-                "control": control,
-                "cancel": [p["order_id"] for p in rest]})
+            # cancel; they can't be promoted or judged-cancelled.
+            live = [p for p in probes
+                    if not p["ended"] and p["role"] == "probe"
+                    and p["age"] < _minutes(cfg["probe_cancel_by_min"])]
+            finders = [p for p in live if p["order_id"] in finder_ids]
+            original = next(
+                (r for r in state["rentals"]
+                 if r["order_id"] == burst["trigger_order_id"]
+                 and r["role"] == "slot"), None)
+            # a share during the burst window means the incumbent's
+            # tree rotated or warmed up: it competes as a candidate.
+            recovered = original is not None and any(
+                ts >= burst["started_at"]
+                for ts, _ in original["share_arrivals"])
+
+            def _eff(p):
+                hourly = float(p["hourly_usd"])
+                return (p["its_total"] or 0) / hourly if hourly else 0.0
+
+            def _pick(cands):
+                """Floor-then-efficiency: within promote_its_floor of
+                the best its, take the best its/$. Higher raw its
+                feeds solution weight; efficiency guards the budget."""
+                top = max(p["its_total"] or 0 for p in cands)
+                pool = [p for p in cands if (p["its_total"] or 0)
+                        >= cfg["promote_its_floor"] * top]
+                return max(pool, key=_eff)
+
+            def _drop(p):
+                return {"order_id": p["order_id"],
+                        "server_id": p["server_id"],
+                        "tier": p.get("tier"),
+                        "reason": ("probe_lost"
+                                   if p["order_id"] in finder_ids
+                                   else "probe_no_share")}
+
+            judge = {"type": "judge", "burst_id": burst["burst_id"],
+                     "finders": sorted(finder_ids), "promote": None,
+                     "cancel_original": None, "retry": None,
+                     "cancel": [], "verdict": None}
+            if original is not None and not recovered:
+                if finders:
+                    winner = _pick(finders)
+                    judge["promote"] = winner["order_id"]
+                    judge["cancel_original"] = {
+                        "order_id": original["order_id"],
+                        "server_id": original["server_id"],
+                        "tier": original["tier"], "reason": "replaced"}
+                    judge["cancel"] = [
+                        _drop(p) for p in live
+                        if p["order_id"] != winner["order_id"]]
+                    judge["verdict"] = "promoted"
+                else:
+                    # nothing produced anywhere; stop the burn and
+                    # retry the vacancy after the slot's y arm
+                    judge["cancel_original"] = {
+                        "order_id": original["order_id"],
+                        "server_id": original["server_id"],
+                        "tier": original["tier"], "reason": "dry"}
+                    judge["cancel"] = [_drop(p) for p in live]
+                    judge["retry"] = _retry_burst(original, now)
+                    judge["verdict"] = "dry_retry"
+            elif original is not None:
+                if burst["trigger"] == "upgrade":
+                    # the incumbent is healthy: a challenger must
+                    # dominate -- higher raw it/s (weight) AND higher
+                    # shares/$ over the audition window, by margin.
+                    def _rate(p, since):
+                        n = sum(c for ts, c in p.get(
+                            "share_arrivals", []) if ts >= since)
+                        hours = max(
+                            (now - since).total_seconds(), 60) / 3600
+                        hourly = float(p["hourly_usd"])
+                        return n / hours / hourly if hourly else 0.0
+                    orig_rate = _rate(original, burst["started_at"])
+                    able = [p for p in finders
+                            if (p["its_total"] or 0)
+                            > (original["its_total"] or 0)]
+                    winner = max(able, key=lambda p: _rate(p, p["t0"]),
+                                 default=None)
+                    judge["stats"] = {
+                        "orig_shares_per_usd_h": round(orig_rate, 1),
+                        "orig_its": original["its_total"],
+                        "probe_shares_per_usd_h": (
+                            round(_rate(winner, winner["t0"]), 1)
+                            if winner else None),
+                        "probe_its": (winner["its_total"]
+                                      if winner else None)}
+                    if winner is not None and _rate(
+                            winner, winner["t0"]) > orig_rate * (
+                                1 + cfg["upgrade_margin"]):
+                        judge["promote"] = winner["order_id"]
+                        judge["cancel_original"] = {
+                            "order_id": original["order_id"],
+                            "server_id": original["server_id"],
+                            "tier": original["tier"],
+                            "reason": "upgraded"}
+                        judge["cancel"] = [
+                            _drop(p) for p in live
+                            if p["order_id"] != winner["order_id"]]
+                        judge["verdict"] = "upgraded"
+                    else:
+                        judge["cancel"] = [_drop(p) for p in live]
+                        judge["verdict"] = "kept_original"
+                else:
+                    winner = _pick(finders + [original])
+                    judge["stats"] = {
+                        "orig_its_per_usd": round(_eff(original), 1),
+                        "winner_its_per_usd": round(_eff(winner), 1),
+                        "winner": winner["order_id"],
+                        "winner_is_orig":
+                            winner["order_id"] == original["order_id"]}
+                    if winner["order_id"] == original["order_id"] or \
+                            _eff(winner) <= _eff(original) * (
+                                    1 + cfg["promote_margin"]):
+                        judge["cancel"] = [_drop(p) for p in live]
+                        judge["verdict"] = "kept_original"
+                    else:
+                        judge["promote"] = winner["order_id"]
+                        judge["cancel_original"] = {
+                            "order_id": original["order_id"],
+                            "server_id": original["server_id"],
+                            "tier": original["tier"], "reason": "replaced"}
+                        judge["cancel"] = [
+                            _drop(p) for p in live
+                            if p["order_id"] != winner["order_id"]]
+                        judge["verdict"] = "promoted"
+            elif finders and n_slots < cfg["max_rentals"]:
+                winner = _pick(finders)
+                judge["promote"] = winner["order_id"]
+                judge["cancel"] = [
+                    _drop(p) for p in live
+                    if p["order_id"] != winner["order_id"]]
+                judge["verdict"] = "promoted"
+            elif burst["trigger"] == "dry_retry" \
+                    and n_slots < cfg["max_rentals"]:
+                # nobody produced: re-arm the vacancy for another y
+                # arm of pool-rotation patience
+                retry_y = burst["y_min"] or cfg["y_min"][0]
+                judge["cancel"] = [_drop(p) for p in live]
+                judge["retry"] = {
+                    "for_order": burst["trigger_order_id"],
+                    "server_id": None, "tier": None,
+                    "y_min": retry_y,
+                    "due_at": _iso(now + _minutes(retry_y))}
+                judge["verdict"] = "retry_again"
+            else:
+                judge["cancel"] = [_drop(p) for p in live]
+                judge["verdict"] = ("no_vacancy" if finders
+                                    else "no_finders")
+            actions.append(judge)
 
     rent_actions = []
     if not blocks and now < state["phase_ends_at"]:
@@ -932,16 +1189,18 @@ def decide(now, state, cfg):
                    if not p["ended"]) < burst["n_target"] \
                     and len(state["rentals"]) + len(chosen) < \
                     cfg["max_rentals"] + cfg["burst_max"]:
-                probes_now = _probe_candidates(state, cfg, active_ids,
-                                               chosen)
+                # probes are prospective slots, not lottery filler:
+                # same ranking and term as a slot fill
+                probes_now = _candidates(state, cfg, active_ids,
+                                         chosen)
                 if probes_now:
                     pick = probes_now[0]
                     chosen.append(pick)
                     rent_actions.append({
                         "type": "rent", "server_id": pick["server_id"],
-                        "reason": "probe", "tier": "other",
+                        "reason": "probe", "tier": pick["tier"],
                         "role": "probe", "burst_id": burst["burst_id"],
-                        "hours": cfg["burst_hours"]})
+                        "hours": cfg["hours"]})
         # pending rerents due: re-rent the same server while it is
         # still listed, acceptable and in budget
         for pending in state["pending_rerents"]:
@@ -953,14 +1212,14 @@ def decide(now, state, cfg):
             if now < due:
                 continue
             sid = pending["server_id"]
-            if sid in state["excluded"]:
-                continue
             row = state["scored"].get(sid)
-            if row is not None and row["ineligible_reason"] in (
+            acceptable = sid not in state["excluded"] \
+                and row is not None \
+                and row["ineligible_reason"] in (
                     None, "no matching benchmark") \
-                    and row["hourly_cost_usd"] is not None \
-                    and row["hourly_cost_usd"] <= _dec(
-                        cfg["max_price_hr"]):
+                and row["hourly_cost_usd"] is not None \
+                and row["hourly_cost_usd"] <= _dec(cfg["max_price_hr"])
+            if acceptable:
                 rent_actions.append({"type": "rent", "server_id": sid,
                                      "reason": "rerent",
                                      "tier": pending["tier"]})
@@ -968,10 +1227,16 @@ def decide(now, state, cfg):
                                "tier": pending["tier"]})
                 rerented_ids.add(sid)
                 n_chosen_slots += 1
+            elif say:
+                why = ("excluded" if sid in state["excluded"]
+                       else "unlisted" if row is None
+                       else row["ineligible_reason"]
+                       or f"${row['hourly_cost_usd']}/h over cap")
+                say(f"{_iso(now)} note rerent s{sid} skipped: {why}")
         # fill empty slots with the least-explored acceptable listings;
-        # probes/kept/control don't consume max_rentals slots
-        n_slots = sum(1 for r in state["rentals"] if r["role"] == "slot")
-        while n_slots + sum(
+        # probes don't consume max_rentals slots, but pending retry
+        # bursts reserve the vacancies they will fill
+        while n_slots + len(state["pending_bursts"]) + sum(
                 1 for p in state["pending_rerents"]
                 if p["server_id"] not in rerented_ids) \
                 + n_chosen_slots < cfg["max_rentals"]:
@@ -997,27 +1262,6 @@ def decide(now, state, cfg):
     else:
         actions.extend(rent_actions)
     return actions
-
-
-def _probe_candidates(state, cfg, active_ids, chosen):
-    """Cheapest acceptable listings for burst probes: same filters as
-    _candidates but no zen/coverage preference -- lottery tickets."""
-    pending_ids = {p["server_id"] for p in state["pending_rerents"]}
-    chosen_ids = {c["server_id"] for c in chosen}
-    pool = []
-    for sid, row in state["scored"].items():
-        if sid in active_ids or sid in pending_ids or sid in chosen_ids \
-                or sid in state["excluded"]:
-            continue
-        if row["ineligible_reason"] not in (None, "no matching benchmark"):
-            continue
-        hourly = row["hourly_cost_usd"]
-        if hourly is None or hourly > _dec(cfg["max_price_hr"]):
-            continue
-        pool.append({"server_id": sid, "tier": "other",
-                     "hourly": hourly})
-    pool.sort(key=lambda c: (c["hourly"], c["server_id"]))
-    return pool
 
 
 def _candidates(state, cfg, active_ids, chosen):
@@ -1142,22 +1386,17 @@ def next_step(r, now, cfg):
         when = base + _minutes(cfg["restart_cooldown_min"])
         return f"wedged restart in {_countdown(when, now)}"
     produced = r["last_share_at"] is not None
-    dry_due = quiet + _minutes(cfg["produced_dry_min"] if produced
-                               else cfg["dry_after_min"])
-    verb = "re-rent" if produced else "replace"
     if r["reroll_start"] is not None:
         give_due = r["reroll_start"] + _minutes(r["x_min"])
-        if give_due <= dry_due:
-            return f"gives up in {_countdown(give_due, now)}"
-        return f"{verb} in {_countdown(dry_due, now)}"
-    if produced and \
-            now - r["last_share_at"] < _minutes(cfg["dry_after_min"]):
-        ago = int((now - r["last_share_at"]).total_seconds() // 60)
-        return f"mining (last share {ago}m ago)"
-    if now >= dry_due and r.get("dry_rerents_24h", 0) \
-            >= cfg["dry_rerent_max_per_day"]:
-        return "dry; daily re-rent cap reached, riding the pool rotation"
-    return f"{verb} in {_countdown(dry_due, now)}"
+        return f"gives up in {_countdown(give_due, now)}"
+    if produced:
+        if now - r["last_share_at"] < _minutes(cfg["dry_after_min"]):
+            ago = int((now - r["last_share_at"]).total_seconds() // 60)
+            return f"mining (last share {ago}m ago)"
+        dry_due = quiet + _minutes(r["x_min"])
+        return f"burst in {_countdown(dry_due, now)}"
+    dry_due = quiet + _minutes(cfg["dry_after_min"])
+    return f"replace in {_countdown(dry_due, now)}"
 
 
 def summary(db, now, db_path=None):
@@ -1255,6 +1494,10 @@ def summary(db, now, db_path=None):
             "server_id": p["server_id"],
             "due_at": _iso(p["due_at"])}
             for p in state["pending_rerents"]],
+        "pending_bursts": [{
+            "for_order": p["for_order"],
+            "due_at": _iso(p["due_at"])}
+            for p in state["pending_bursts"]],
         "burst": burst,
         "events": events,
         "runner_alive": alive}
@@ -1272,10 +1515,12 @@ def execute(db, db_path, env_file, phase, cfg, actions, now, live,
             if kind == "blocked":
                 emit(db, now, phase_id, None, None, "blocked",
                      {"reason": action["reason"]}, say=say)
-            elif kind == "rerent_expired":
-                emit(db, now, phase_id, None, action["server_id"],
-                     "rerent_expired", {"server_id": action["server_id"]},
-                     say=say)
+            elif kind in ("rerent_expired", "retry_expired",
+                          "retry_cleared"):
+                emit(db, now, phase_id, action.get("for_order"),
+                     action.get("server_id"), kind,
+                     {"server_id": action.get("server_id"),
+                      "for_order": action.get("for_order")}, say=say)
             else:
                 emit(db, now, phase_id, action.get("order_id"),
                      action.get("server_id"), "dryrun", action, say=say)
@@ -1285,10 +1530,12 @@ def execute(db, db_path, env_file, phase, cfg, actions, now, live,
                  {"reason": action["reason"]}, say=say)
         elif kind == "blacklist":
             _exec_blacklist(db, phase_id, action, now, say)
-        elif kind == "rerent_expired":
-            emit(db, now, phase_id, None, action["server_id"],
-                 "rerent_expired", {"server_id": action["server_id"]},
-                 say=say)
+        elif kind in ("rerent_expired", "retry_expired",
+                      "retry_cleared"):
+            emit(db, now, phase_id, action.get("for_order"),
+                 action.get("server_id"), kind,
+                 {"server_id": action.get("server_id"),
+                  "for_order": action.get("for_order")}, say=say)
         elif kind == "burst":
             _exec_burst(db, phase_id, action, now, say)
         elif kind == "judge":
@@ -1321,39 +1568,45 @@ def _exec_burst(db, phase_id, action, now, say):
     emit(db, now, phase_id, action.get("trigger_order_id"), None,
          "burst_started",
          {"burst_id": cur.lastrowid, "trigger": action["trigger"],
-          "n": action["n"]}, say=say)
+          "n": action["n"], "y_min": action.get("y_min")}, say=say)
 
 
 def _exec_judge(db, db_path, env_file, phase_id, action, now, say):
-    burst_id = action["burst_id"]
-    for order_id in action["keep"]:
+    if action.get("promote") is not None:
+        # the winner keeps its order -- and its proven tree
         db.execute(
-            "UPDATE experiment_rentals SET role='kept' "
-            "WHERE order_id=? AND role='probe'", (order_id,))
-    if action.get("control") is not None:
-        db.execute(
-            "UPDATE experiment_rentals SET role='control' "
-            "WHERE order_id=? AND role='probe'", (action["control"],))
+            "UPDATE experiment_rentals SET role='slot' "
+            "WHERE order_id=? AND role='probe'",
+            (action["promote"],))
     db.execute(
         "UPDATE experiment_bursts SET judged_at=? WHERE burst_id=?",
-        (_iso(now), burst_id))
+        (_iso(now), action["burst_id"]))
     db.commit()
-    for order_id in action["cancel"]:
-        prow = db.execute(
-            "SELECT server_id, tier FROM experiment_rentals "
-            "WHERE order_id=?", (order_id,)).fetchone()
-        if prow is None:
-            continue
+    for c in action["cancel"]:
         _exec_cancel(db, db_path, env_file, phase_id,
-                     {"order_id": order_id,
-                      "server_id": prow["server_id"],
-                      "tier": prow["tier"],
-                      "reason": "probe_no_share", "rerent_at": None},
-                     now, say)
+                     {"order_id": c["order_id"],
+                      "server_id": c["server_id"],
+                      "tier": c.get("tier"), "reason": c["reason"],
+                      "rerent_at": None}, now, say)
+    orig = action.get("cancel_original")
+    if orig is not None:
+        _exec_cancel(db, db_path, env_file, phase_id,
+                     {"order_id": orig["order_id"],
+                      "server_id": orig["server_id"],
+                      "tier": orig.get("tier"), "reason": orig["reason"],
+                      "rerent_at": None}, now, say)
+    if action.get("retry"):
+        retry = action["retry"]
+        emit(db, now, phase_id, retry["for_order"],
+             retry.get("server_id"), "burst_scheduled", retry, say=say)
     emit(db, now, phase_id, None, None, "burst_judged",
-         {"burst_id": burst_id, "finders": action["finders"],
-          "kept": action["keep"], "control": action.get("control"),
-          "cancelled": action["cancel"]}, say=say)
+         {"burst_id": action["burst_id"], "verdict": action["verdict"],
+          "finders": action["finders"], "promote": action.get("promote"),
+          "cancelled": [c["order_id"] for c in action["cancel"]],
+          "cancel_original": (orig or {}).get("reason"),
+          "retry_due_at": (action.get("retry") or {}).get("due_at"),
+          "stats": action.get("stats")},
+         say=say)
 
 
 def _exec_restart(db, phase_id, action, now, say):
@@ -1407,6 +1660,9 @@ def _exec_cancel(db, db_path, env_file, phase_id, action, now, say):
                  {"server_id": action["server_id"],
                   "tier": action.get("tier"),
                   "due_at": action["rerent_at"]}, say=say)
+        if action.get("retry_burst"):
+            emit(db, now, phase_id, order_id, action["server_id"],
+                 "burst_scheduled", action["retry_burst"], say=say)
     else:
         emit(db, now, phase_id, order_id, action["server_id"],
              "cancel_failed", {"info": _safe_info(info)}, say=say)
@@ -1513,8 +1769,28 @@ def run_cycle(db, db_path, env_file, phase, cfg, live, now=None,
               for oid, sid, reason, detail in
               blacklist_checks(db, state, now, cfg)]
     state["excluded"].update(a["server_id"] for a in checks)
-    execute(db, db_path, env_file, phase, cfg,
-            checks + decide(now, state, cfg), now, live, say=say)
+    acts = checks + decide(now, state, cfg, say=say)
+    # per-cycle heartbeat: silent runs are indistinguishable from a
+    # dead runner otherwise
+    bits = [f"{r['order_id']}:{r['role']} "
+            f"{next_step(r, now, cfg)} its={r['its_total']}"
+            for r in state["rentals"]]
+    for p in state["pending_rerents"]:
+        bits.append(f"rerent s{p['server_id']} due "
+                    f"{_countdown(p['due_at'], now)}")
+    for p in state["pending_bursts"]:
+        bits.append(f"retry for {p['for_order']} due "
+                    f"{_countdown(p['due_at'], now)}")
+    ub = state["unjudged_burst"]
+    if ub is not None:
+        bits.append(f"burst {ub['burst_id']}({ub['trigger']}) "
+                    f"{len(state['burst_probes'])}/{ub['n_target']} "
+                    "probes")
+    say(f"{_iso(now)} tick committed=${state['committed']:.2f} "
+        f"remaining=${state['remaining']:.2f} "
+        f"{' | '.join(bits) if bits else 'idle'}")
+    execute(db, db_path, env_file, phase, cfg, acts, now, live,
+            say=say)
 
 
 # ---------------------------------------------------------------- CLI
@@ -1534,14 +1810,16 @@ def _config_from_args(args):
                 "free_window_min", "dry_after_min",
                 "restart_cooldown_min", "unreachable_min",
                 "rerent_grace_min", "stale_obs_sec",
-                "stale_market_min", "burst_max", "burst_hours",
-                "burst_cooldown_min", "burst_fill_min",
-                "probe_judge_min", "probe_cancel_by_min"):
+                "stale_market_min", "burst_max", "burst_fill_min",
+                "probe_judge_min", "probe_cancel_by_min",
+                "upgrade_daily_max"):
         value = getattr(args, key, None)
         if value is not None:
             cfg[key] = value
-    if getattr(args, "no_burst_keep_control", False):
-        cfg["burst_keep_control"] = False
+    for key in ("promote_its_floor", "promote_margin", "upgrade_margin"):
+        value = getattr(args, key, None)
+        if value is not None:
+            cfg[key] = value
     if isinstance(cfg["x_min"], str):
         cfg["x_min"] = [int(v) for v in cfg["x_min"].split(",")]
     if isinstance(cfg["y_min"], str):
@@ -1864,12 +2142,13 @@ def main(argv=None):
     sp.add_argument("--stale-obs-sec", type=int)
     sp.add_argument("--stale-market-min", type=int)
     sp.add_argument("--burst-max", type=int)
-    sp.add_argument("--burst-hours", type=int)
-    sp.add_argument("--burst-cooldown-min", type=int)
     sp.add_argument("--burst-fill-min", type=int)
     sp.add_argument("--probe-judge-min", type=int)
     sp.add_argument("--probe-cancel-by-min", type=int)
-    sp.add_argument("--no-burst-keep-control", action="store_true")
+    sp.add_argument("--promote-its-floor", type=float)
+    sp.add_argument("--promote-margin", type=float)
+    sp.add_argument("--upgrade-margin", type=float)
+    sp.add_argument("--upgrade-daily-max", type=int)
     _add_db_arg(sp)
     sp.set_defaults(func=cmd_start_phase)
 

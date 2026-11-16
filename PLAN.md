@@ -1140,20 +1140,26 @@ runner blocks all actions rather than cancelling rigs. `experiment.py
 report` prints per-rental shares/cost, restarts with tree changes and
 shares within minutes, tree segments, and per-x/y summaries.
 
-**Burst probing (implemented, user idea):** when a slot rig hits a dry
-tree (or on `experiment.py burst`), rent up to 4 extra cheapest-first
-probes on 1 h terms, never auto-renew. No restarts on probes; at ~5 min
-of mining keep every probe that found a share plus the cheapest
-non-finder as a control, and cancel the rest by 8 min, inside Clore's
-free 10-minute window. New rentals pause while any probe is within 4 min
-of that deadline, because order provisioning can block a cycle for up to
-3 min. Auto bursts are at least 60 min apart. The report lists each
-burst's probes, their first tree IDs (how many distinct trees concurrent
-rigs got) and kept-vs-control shares per USD. Auto-renew stays off as a
-strategy: an owner can raise the renewal price, and
-`auto_renew_max_price` stopping renewal on a price rise is the API's
-documented behaviour, not something we've tested. Telemetry now runs every
-15 s (`--tick-interval`) and the runner every 15 s.
+**Burst probing with promotion (implemented, user idea):** a produced
+slot that goes quiet past its `x_min` arm triggers a burst of up to 4
+probes — slot-grade candidates at the normal `hours` term, never
+auto-renew — while the incumbent keeps hashing. No restarts on probes;
+every non-producer is cancelled by 8 min, inside Clore's free 10-minute
+window, and rentals pause while any probe is within 4 min of it. At
+judge the incumbent is re-checked: if it recovered (a share arrived
+during the burst) it competes on the same footing as finders — a probe
+is promoted only when it is within `promote_its_floor` of the best raw
+it/s and beats the incumbent's it/s-per-USD by `promote_margin`;
+otherwise the incumbent stays. If the incumbent stayed dry, the best
+finder is promoted to `slot` (it keeps its order, so the proven tree
+survives) and the incumbent is cancelled `replaced`. If nobody produced
+the incumbent is cancelled `dry` and a retry burst refills the vacancy
+after the slot's `y_min` arm, re-arming itself while the pool stays
+dry. Auto-renew stays off as a strategy: an owner can raise the
+renewal price, and `auto_renew_max_price` stopping renewal on a price
+rise is the API's documented behaviour, not something we've tested.
+Telemetry now runs every 15 s (`--tick-interval`) and the runner every
+15 s.
 
 The design below replaces the "learned perf
 model" assumption that a rig's share rate is a stable property that can be
