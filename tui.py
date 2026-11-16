@@ -71,8 +71,7 @@ Button.nudge { width: 4; min-width: 4; height: 1fr;
 Button.nudge:hover { background: #272c33; }
 Button.nudge:focus { text-style: bold; }
 #bench { height: auto; padding: 0 1; }
-#exp-scroll { height: 60%; }
-#exp-log { height: auto; padding: 0 1; }
+#exp-log { height: 60%; }
 .compact #search { display: none; }
 .compact #hdr { height: 2; }
 .compact #h3 { display: none; }
@@ -1534,8 +1533,7 @@ class MarketTui(App):
                                         cursor_type="row")
                         yield Button("▶", id="exp-table-right",
                                      classes="nudge")
-                    with VerticalScroll(id="exp-scroll"):
-                        yield Static("", id="exp-log")
+                    yield TextArea(id="exp-log", read_only=True)
         yield Footer()
 
     def on_mount(self):
@@ -1723,11 +1721,11 @@ class MarketTui(App):
         exp = (self.dash or {}).get("experiment")
         status = self.query_one("#exp-status", Static)
         table = self.query_one("#exp-table", DataTable)
-        logw = self.query_one("#exp-log", Static)
+        logw = self.query_one("#exp-log", TextArea)
         snap = self._snapshot(table)
-        keep_log_scroll = self._keep_scroll("#exp-scroll")
+        keep_log_scroll = self._keep_log_scroll()
         table.clear()
-        logw.update(Text(""))
+        logw.load_text("")
         if not exp or not exp.get("phase"):
             status.update(Text("no experiment phase"))
             return
@@ -1795,8 +1793,7 @@ class MarketTui(App):
                 f"{' ' + str(e['order_id']) if e.get('order_id') else ''}"
                 f"{' s' + str(e['server_id']) if e.get('server_id') else ''}"
                 f"{' ' + extras if extras else ''}")
-        logw.update(Text("\n".join(lines)))
-        keep_log_scroll()
+        keep_log_scroll("\n".join(lines))
 
     def _cells(self, r):
         return {
@@ -1858,6 +1855,33 @@ class MarketTui(App):
         sy = sv.scroll_target_y
         return lambda: self.call_after_refresh(
             lambda: sv.scroll_to(y=sy, animate=False))
+
+    def _keep_log_scroll(self):
+        """Capture the exp-log view position before a text rewrite:
+        restore it after, or keep pinned to the tail when already at
+        the bottom (and on first fill). An active selection is
+        re-applied so a refresh doesn't wipe a copy in progress."""
+        try:
+            w = self.query_one("#exp-log", TextArea)
+        except Exception:
+            return lambda _text: None
+        sy = w.scroll_target_y
+        at_bottom = w.max_scroll_y <= 0 or sy >= w.max_scroll_y - 0.5
+        sel = w.selection
+        def _apply(text):
+            w.load_text(text)
+            try:
+                if sel and sel != w.selection:
+                    w.selection = sel
+            except Exception:
+                pass
+            if at_bottom:
+                self.call_after_refresh(
+                    lambda: w.scroll_end(animate=False))
+            else:
+                self.call_after_refresh(
+                    lambda: w.scroll_to(y=sy, animate=False))
+        return _apply
 
     def _fill(self, table, rows, cols, which):
         selected = self.sel_id[which]

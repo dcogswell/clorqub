@@ -232,8 +232,8 @@ class ExperimentTabTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIn("10", cells[0])   # order
                 self.assertIn("zen", cells)
 
-                log = str(app.query_one("#exp-log", Static)
-                          .render())
+                from textual.widgets import TextArea
+                log = app.query_one("#exp-log", TextArea).text
                 self.assertIn("rent", log)
                 self.assertIn("reason=fill", log)
 
