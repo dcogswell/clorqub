@@ -67,14 +67,14 @@ def spot_floor_label(row):
 def display(rows, limit, source_desc, inventory=None, orders_ok=None):
     eligible = sorted(
         (row for row in rows if row["eligible"]),
-        key=lambda row: row["estimated_sols_per_usd"],
-        reverse=True,
+        key=lambda row: (row["estimated_sols_per_usd"] is None,
+                         -(row["estimated_sols_per_usd"] or 0)),
     )
     print(f"Source: {source_desc}")
     print(
-        "Pool: jetski only. Ranked: single-GPU RTX 3070 / 3080 Ti / 3090 Ti "
-        "listings whose CPU matches the benchmarked models "
-        "(Ryzen 9 7945HX / 7950X); every other listing is unscored."
+        "Pool: jetski only. Ranked: available single-GPU listings with a "
+        "supported USD price; sols/h appears only where a benchmark "
+        "exists (RTX 3070 / 3080 Ti / 3090 Ti on Ryzen 9 7945HX/7950X)."
     )
     print()
     print(
@@ -87,7 +87,7 @@ def display(rows, limit, source_desc, inventory=None, orders_ok=None):
             f"{row['server_id']:>7} {str(row['gpu'] or '?'):<12.12} "
             f"{row['effective_price_day_usd']:>7.2f} "
             f"{spot_floor_label(row):>8} {yield_marker(row):>7} "
-            f"{row['estimated_sols_per_usd']:>8.1f} "
+            f"{row['estimated_sols_per_usd'] if row['estimated_sols_per_usd'] is not None else '-':>8} "
             f"{row['country'] or '--':>3} "
             f"{str(row['threads_listed'] or '?'):>6.6} "
             f"{str(row['cpu']):<30.30} "

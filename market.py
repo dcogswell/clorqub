@@ -241,8 +241,6 @@ def score_listing(server, mode="on-demand", benchmarks=None):
         reason = "not a single-GPU listing"
     elif price_day is None or price_day <= 0:
         reason = "no supported USD price"
-    elif benchmark is None:
-        reason = "no matching benchmark"
     else:
         reason = None
 
@@ -267,6 +265,7 @@ def score_listing(server, mode="on-demand", benchmarks=None):
         "estimated_sols_per_usd": (
             sols_hr / hourly_cost if sols_hr is not None and hourly_cost else None
         ),
+        "benchmarked": benchmark is not None,
         "benchmark_source": benchmark["source"] if benchmark else None,
         "benchmark_notes": benchmark["notes"] if benchmark else None,
         "benchmark_kind": benchmark["observation_kind"] if benchmark else None,

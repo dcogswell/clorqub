@@ -1802,7 +1802,9 @@ class MarketTui(App):
             "CPU model": plain(r.get("cpu")),
             "ISA": plain(isa_label(r.get("cpu_isa"))),
             "Rel%": plain(fmt_rel(r)),
-            "Reason": plain(r.get("ineligible_reason") or "matched"),
+            "Reason": plain(r.get("ineligible_reason") or (
+                "unbenchmarked" if not r.get("benchmarked")
+                else "matched")),
         }
 
     def _snapshot(self, table):

@@ -111,7 +111,8 @@ def refresh_quotes(db, servers, api_key, limit, stop_event=None):
     previous = latest_quotes(db)
     candidates = [score_listing(server) for server in servers]
     candidates = sorted(
-        (row for row in candidates if row["eligible"]),
+        (row for row in candidates
+         if row["eligible"] and row["estimated_sols_per_usd"] is not None),
         key=lambda row: row["estimated_sols_per_usd"], reverse=True,
     )
     # Unseen/oldest observations go first; preserve value order for ties.

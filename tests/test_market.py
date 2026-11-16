@@ -45,8 +45,8 @@ class TestMarketplaceScoring(unittest.TestCase):
 
     def test_avx2_has_no_fabricated_yield_prior(self):
         row = market.score_listing(listing(cpu="AMD Ryzen 9 3900"))
-        self.assertFalse(row["eligible"])
-        self.assertEqual(row["ineligible_reason"], "no matching benchmark")
+        self.assertTrue(row["eligible"])
+        self.assertFalse(row["benchmarked"])
         self.assertIsNone(row["estimated_sols_hr"])
 
     def test_only_reference_cpu_models_get_a_yield_prior(self):
@@ -55,7 +55,8 @@ class TestMarketplaceScoring(unittest.TestCase):
                     "Intel(R) Xeon(R) Platinum 8272CL"):
             with self.subTest(cpu=cpu):
                 row = market.score_listing(listing(cpu=cpu))
-                self.assertFalse(row["eligible"])
+                self.assertTrue(row["eligible"])
+                self.assertFalse(row["benchmarked"])
                 self.assertIsNone(row["estimated_sols_hr"])
                 self.assertEqual(row["cpu_isa"], "AVX512_inferred")
         self.assertNotEqual(market.cpu_profile("AMD EPYC 7763")[1], "AVX512_inferred")
