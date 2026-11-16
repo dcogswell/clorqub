@@ -9,7 +9,8 @@ from pathlib import Path
 import blacklist
 import experiment
 import fleet_store
-from market import available, cuda_capable, score_listing
+from market import (GPU_IT_SCALE, available, cpu_profile, cuda_capable,
+                    score_listing)
 from orders import latest_wallets, read_inventory
 from spot import latest_quotes, summarize_quote
 from telemetry_policy import health, timestamp
@@ -211,6 +212,38 @@ def _history_stats_cached(db):
     return stats
 
 
+def _gpu_est(stats, gpu):
+    """Measured prior if the model was rented, else extrapolated from
+    the measured models via GPU_IT_SCALE relative multipliers."""
+    prior = stats["gpu_prior"].get(gpu)
+    if prior is not None:
+        return prior, False
+    scale = GPU_IT_SCALE.get(gpu)
+    if scale is None:
+        return None, False
+    base = [p / GPU_IT_SCALE[g]
+            for g, p in stats["gpu_prior"].items()
+            if g in GPU_IT_SCALE]
+    if not base:
+        return None, False
+    base = sorted(base)[len(base) // 2]
+    return base * scale, True
+
+
+def _cpu_est(stats, cpu):
+    """Measured prior if the CPU was rented, else the median prior of
+    its ISA class (AVX-512 vs AVX2/unclassified differ by ~8x)."""
+    prior = stats["cpu_prior"].get(cpu)
+    if prior is not None:
+        return prior, False
+    _, isa = cpu_profile(cpu)
+    vals = [p for c, p in stats["cpu_prior"].items()
+            if cpu_profile(c)[1] == isa]
+    if not vals:
+        return None, False
+    return sorted(vals)[len(vals) // 2], True
+
+
 def read_dashboard(path):
     """Latest imported market only: disappeared listings must not remain candidates."""
     try:
@@ -345,13 +378,19 @@ def read_dashboard(path):
             for row in rows:
                 entry = stats["server_prior"].get(row["server_id"])
                 prior = entry["its"] if entry else None
+                extrapolated = False
                 if prior is None:
-                    vals = [v for v in (
-                        stats["cpu_prior"].get(row["cpu"]),
-                        stats["gpu_prior"].get(row["gpu"])) if v]
-                    prior = sum(vals) if vals else None
+                    # est is cpu+gpu: a single-side prior is not an
+                    # estimate, it just looks like a tiny rig. Missing
+                    # sides are extrapolated from model-class data.
+                    cpu_p, cpu_x = _cpu_est(stats, row["cpu"])
+                    gpu_p, gpu_x = _gpu_est(stats, row["gpu"])
+                    if cpu_p is not None and gpu_p is not None:
+                        prior = cpu_p + gpu_p
+                        extrapolated = cpu_x or gpu_x
                 if prior:
                     row["est_its"] = prior
+                    row["est_extrapolated"] = extrapolated
                     if row["hourly_cost_usd"]:
                         row["est_its_per_usd"] = \
                             prior / float(row["hourly_cost_usd"])

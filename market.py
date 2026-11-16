@@ -13,6 +13,40 @@ DEFAULT_COUNTRY_BLOCKLIST = {"RU", "UA", "BY"}
 DEFAULT_MIN_CUDA = (12, 0)
 RENTER_FEES = {"on-demand": 0.05, "spot": 0.0125}
 
+# Relative Qubic GPU it/s multiplier vs RTX 4090 = 1.0. Absolute it/s
+# swings with each epoch's difficulty, but the ratios between models
+# transfer. Anchors: pool.qubic.li hashrate table (RTX 5090 ~55 vs
+# RTX 4090 ~25 Mit/s -> 2.2x) and the advanced-hash.ai Qubic calculator
+# (4090/4080S/4070Ti/3090/3070/3060Ti/3060). Unlisted models are
+# interpolated from relative compute benchmarks -- rough priors only.
+GPU_IT_SCALE = {
+    "RTX 5090": 2.20,
+    "RTX 5080": 0.80,
+    "RTX 5070 Ti": 0.65,
+    "RTX 5070": 0.50,
+    "RTX 5060 Ti": 0.30,
+    "RTX 5060": 0.22,
+    "RTX 4090": 1.00,
+    "RTX 4080": 0.65,
+    "RTX 4070 Ti": 0.48,
+    "RTX 4070": 0.40,
+    "RTX 4060 Ti": 0.30,
+    "RTX 4060": 0.22,
+    "RTX 3090 Ti": 0.48,
+    "RTX 3090": 0.45,
+    "RTX 3080 Ti": 0.42,
+    "RTX 3080": 0.38,
+    "RTX 3070 Ti": 0.31,
+    "RTX 3070": 0.28,
+    "RTX 3060 Ti": 0.25,
+    "RTX 3060": 0.19,
+    "RTX 3050": 0.15,
+    "RTX 2080 Ti": 0.30,
+    "RTX 2080": 0.25,
+    "RTX 2070": 0.20,
+    "RTX 2060": 0.15,
+}
+
 # These are end-to-end jetski observations supplied by the user for a
 # high-end Zen 4 Ryzen CPU. They are not GPU-only rates.
 USER_BENCHMARKS = (

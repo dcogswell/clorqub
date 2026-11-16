@@ -71,7 +71,7 @@ Button.nudge { width: 4; min-width: 4; height: 1fr;
 Button.nudge:hover { background: #272c33; }
 Button.nudge:focus { text-style: bold; }
 #bench { height: auto; padding: 0 1; }
-#exp-scroll { height: 10; }
+#exp-scroll { height: 60%; }
 #exp-log { height: auto; padding: 0 1; }
 .compact #search { display: none; }
 .compact #hdr { height: 2; }
@@ -1801,7 +1801,9 @@ class MarketTui(App):
             "sols/h": plain(yield_marker(r)),
             "ODsol/$": plain(fmt_ratio(r)),
             "est it/s": plain(
-                f"{r['est_its']:.0f}" if r.get("est_its") else "-"),
+                (f"~{r['est_its']:.0f}" if r.get("est_extrapolated")
+                 else f"{r['est_its']:.0f}") if r.get("est_its")
+                else "-"),
             "it/$": plain(
                 f"{r['est_its_per_usd']:.0f}"
                 if r.get("est_its_per_usd") else "-"),
