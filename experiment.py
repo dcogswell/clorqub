@@ -592,7 +592,9 @@ def build_state(db, phase, now, cfg, apply_endings=True, say=print):
     for b in bursts:
         b["started_at"] = _dt(b["started_at"])
         b["judged_at"] = _dt(b["judged_at"])
-        b["y_min"] = (burst_meta.get(b["burst_id"]) or {}).get("y_min")
+        meta = burst_meta.get(b["burst_id"]) or {}
+        b["y_min"] = meta.get("y_min")
+        b["target_server"] = meta.get("server_id")
     unjudged = next((b for b in bursts if b["judged_at"] is None), None)
     last_burst_at = (max(b["started_at"] for b in bursts)
                      if bursts else None)
@@ -969,11 +971,19 @@ def decide(now, state, cfg, say=None):
                     best = (c, est_eff)
             if best is not None and best[1] > worst_eff * (
                     1 + cfg["upgrade_margin"]):
-                actions.append({
-                    "type": "burst", "trigger": "upgrade",
-                    "trigger_order_id": worst["order_id"],
-                    "y_min": worst["y_min"], "n": 1})
-                burst_emitted = True
+                if _quote_fits(best[0], cfg["hours"],
+                               state["remaining"]):
+                    actions.append({
+                        "type": "burst", "trigger": "upgrade",
+                        "trigger_order_id": worst["order_id"],
+                        "server_id": best[0]["server_id"],
+                        "y_min": worst["y_min"], "n": 1})
+                    burst_emitted = True
+                elif say:
+                    say(f"{_iso(now)} note upgrade scan: s"
+                        f"{best[0]['server_id']} dominant but est "
+                        f"${_est_bound(best[0], cfg['hours']):.2f} > "
+                        f"remaining ${state['remaining']:.2f}")
             elif say and best is not None:
                 say(f"{_iso(now)} note upgrade scan: best s"
                     f"{best[0]['server_id']} est {best[1]:.0f} its/$ "
@@ -1193,14 +1203,29 @@ def decide(now, state, cfg, say=None):
                 # same ranking and term as a slot fill
                 probes_now = _candidates(state, cfg, active_ids,
                                          chosen)
-                if probes_now:
-                    pick = probes_now[0]
+                target = burst.get("target_server")
+                affordable = [c for c in probes_now if _quote_fits(
+                    c, cfg["hours"], state["remaining"])]
+                pick = next((c for c in affordable
+                             if c["server_id"] == target), None) \
+                    if target is not None else None
+                if pick is None:
+                    pick = next(iter(affordable), None)
+                if pick is not None:
                     chosen.append(pick)
                     rent_actions.append({
                         "type": "rent", "server_id": pick["server_id"],
                         "reason": "probe", "tier": pick["tier"],
                         "role": "probe", "burst_id": burst["burst_id"],
                         "hours": cfg["hours"]})
+                elif say and probes_now:
+                    cheapest = min(
+                        (_est_bound(c, cfg["hours"]) for c in probes_now
+                         if c["hourly"] is not None), default=None)
+                    say(f"{_iso(now)} note burst {burst['burst_id']}: "
+                        f"{len(probes_now)} candidates, none affordable "
+                        f"(cheapest est ${cheapest}, "
+                        f"remaining ${state['remaining']:.2f})")
         # pending rerents due: re-rent the same server while it is
         # still listed, acceptable and in budget
         for pending in state["pending_rerents"]:
@@ -1241,9 +1266,14 @@ def decide(now, state, cfg, say=None):
                 if p["server_id"] not in rerented_ids) \
                 + n_chosen_slots < cfg["max_rentals"]:
             candidates = _candidates(state, cfg, active_ids, chosen)
-            if not candidates:
+            pick = next((c for c in candidates if _quote_fits(
+                c, cfg["hours"], state["remaining"])), None)
+            if pick is None:
+                if say and candidates:
+                    say(f"{_iso(now)} note fill: {len(candidates)} "
+                        f"candidates, none affordable "
+                        f"(remaining ${state['remaining']:.2f})")
                 break
-            pick = candidates[0]
             chosen.append(pick)
             n_chosen_slots += 1
             rent_actions.append({"type": "rent",
@@ -1262,6 +1292,22 @@ def decide(now, state, cfg, say=None):
     else:
         actions.extend(rent_actions)
     return actions
+
+
+_QUOTE_PAD_USD = Decimal("0.20")
+
+
+def _est_bound(c, hours):
+    """Rough quote bound before the API call: hourly*hours plus a pad
+    covering the creation fee and cost margin."""
+    if c["hourly"] is None:
+        return None
+    return _dec(c["hourly"]) * hours + _QUOTE_PAD_USD
+
+
+def _quote_fits(c, hours, remaining):
+    est = _est_bound(c, hours)
+    return est is not None and est <= remaining
 
 
 def _candidates(state, cfg, active_ids, chosen):
@@ -1568,7 +1614,8 @@ def _exec_burst(db, phase_id, action, now, say):
     emit(db, now, phase_id, action.get("trigger_order_id"), None,
          "burst_started",
          {"burst_id": cur.lastrowid, "trigger": action["trigger"],
-          "n": action["n"], "y_min": action.get("y_min")}, say=say)
+          "n": action["n"], "y_min": action.get("y_min"),
+          "server_id": action.get("server_id")}, say=say)
 
 
 def _exec_judge(db, db_path, env_file, phase_id, action, now, say):
@@ -1716,8 +1763,12 @@ def _exec_rent(db, db_path, env_file, phase, cfg, action, now, say):
             env_file=env_file, key_path=rent.DEFAULT_KEY,
             auto_renew=False, say=say, warn=say)
     except Exception as exc:
+        detail = {"stage": "quote", "error": type(exc).__name__}
+        if isinstance(exc, ValueError):
+            # validation/policy messages are safe by design
+            detail["detail"] = str(exc)[:200]
         emit(db, now, phase_id, None, sid, "rent_failed",
-             {"stage": "quote", "error": type(exc).__name__}, say=say)
+             detail, say=say)
         return
     bound = _dec(ctx["quote"]["cost_bound_usd"])
     if bound + committed > _dec(phase["budget_usd"]):

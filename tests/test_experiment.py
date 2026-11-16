@@ -136,10 +136,10 @@ def add_event(db, phase_id, minutes_ago, kind, order_id=None,
     db.commit()
 
 
-def actions(db, phase, cfg=None):
+def actions(db, phase, cfg=None, say=None):
     state = experiment.build_state(db, phase, NOW, cfg or CFG,
                                    say=lambda *_a: None)
-    return experiment.decide(NOW, state, cfg or CFG), state
+    return experiment.decide(NOW, state, cfg or CFG, say=say), state
 
 
 def kinds(acts, kind):
@@ -880,6 +880,71 @@ class BurstTests(unittest.TestCase):
         finally:
             db.close()
 
+    def test_probe_prefers_burst_target_server(self):
+        # an upgrade burst auditions the listing that triggered it,
+        # not whatever tops the generic coverage-first ranking
+        db = make_db()
+        try:
+            phase = add_phase(db)
+            add_snapshot(db, [
+                listing(server_id=20, price=2.4),
+                listing(server_id=21, price=4.0),
+            ])
+            burst_id = add_burst(db, phase["phase_id"], 1,
+                                 trigger="upgrade", n_target=1)
+            experiment.emit(
+                db, NOW, phase["phase_id"], None, None,
+                "burst_started",
+                {"burst_id": burst_id, "trigger": "upgrade", "n": 1,
+                 "server_id": 21}, say=lambda *_a: None)
+            acts, _ = actions(db, phase)
+            probes = [r for r in kinds(acts, "rent")
+                      if r.get("role") == "probe"]
+            self.assertEqual(len(probes), 1)
+            self.assertEqual(probes[0]["server_id"], 21)
+        finally:
+            db.close()
+
+    def test_unaffordable_candidates_note_instead_of_rents(self):
+        # remaining budget cannot cover any quote: decide must not
+        # emit futile rent actions that churn rent_failed rows
+        db = make_db()
+        try:
+            cfg = dict(CFG)
+            phase = add_phase(db, budget="0.50", cfg=cfg)
+            add_snapshot(db, [listing(server_id=20, price=2.4)])
+            # est bound ~$0.83 > remaining $0.50
+            add_burst(db, phase["phase_id"], 1, n_target=1)
+            notes = []
+            acts, _ = actions(db, phase, cfg=cfg, say=notes.append)
+            self.assertEqual(kinds(acts, "rent"), [])
+            self.assertTrue(
+                any("none affordable" in n for n in notes))
+        finally:
+            db.close()
+
+    def test_upgrade_burst_skipped_when_probe_unaffordable(self):
+        # a dominant listing still isn't worth an audition the budget
+        # cannot cover
+        db = make_db()
+        try:
+            cfg = dict(CFG, max_rentals=1)
+            phase = add_phase(db, budget="0.80", cfg=cfg)
+            self._producing_slot(db, phase)  # commits ~$0.73
+            strong = self._server_with_history(
+                db, 20, "AMD Ryzen 9 9950X 16-Core Processor",
+                "RTX 4090")
+            strong["price"] = {"usd": {"on_demand_usd": 0.5,
+                                       "spot": 0}}
+            add_snapshot(db, [strong])
+            notes = []
+            acts, _ = actions(db, phase, cfg=cfg, say=notes.append)
+            self.assertEqual(kinds(acts, "burst"), [])
+            self.assertTrue(
+                any("dominant but est" in n for n in notes))
+        finally:
+            db.close()
+
     def test_probes_exceed_slots_not_total_cap(self):
         db = make_db()
         try:
@@ -1238,6 +1303,7 @@ class BurstTests(unittest.TestCase):
             self.assertEqual(len(bursts), 1)
             self.assertEqual(bursts[0]["trigger"], "upgrade")
             self.assertEqual(bursts[0]["trigger_order_id"], 1)
+            self.assertEqual(bursts[0]["server_id"], 20)
             self.assertEqual(bursts[0]["n"], 1)
             # a listing that merely matches on it/s does not qualify
             db2 = make_db()

@@ -149,7 +149,8 @@ def yield_marker(row):
     return f"~{sols:.0f}"
 
 
-CAND_COLS = ("ID", "GPU", "OD$/d", "SpotFlr", "sols/h", "ODsol/$", "CC",
+CAND_COLS = ("ID", "GPU", "OD$/d", "SpotFlr", "sols/h", "ODsol/$",
+             "est it/s", "it/$", "CC",
              "thr", "CPU model", "ISA", "Rel%")
 MKT_COLS = ("ID", "GPU", "CPU", "Price$/d", "SpotFlr", "Avail", "CC",
             "sols/h", "ODsol/$", "thr", "CPU model", "ISA", "Rel%",
@@ -1690,7 +1691,8 @@ class MarketTui(App):
         else:
             rows = sorted(rows, key=lambda r: (
                 r.get("estimated_sols_per_usd") is None,
-                -(r.get("estimated_sols_per_usd") or 0)))
+                -(r.get("estimated_sols_per_usd") or 0),
+                -(r.get("est_its_per_usd") or 0)))
         return rows
 
     def render_tables(self):
@@ -1798,6 +1800,11 @@ class MarketTui(App):
             "CC": plain(r.get("country") or "--"),
             "sols/h": plain(yield_marker(r)),
             "ODsol/$": plain(fmt_ratio(r)),
+            "est it/s": plain(
+                f"{r['est_its']:.0f}" if r.get("est_its") else "-"),
+            "it/$": plain(
+                f"{r['est_its_per_usd']:.0f}"
+                if r.get("est_its_per_usd") else "-"),
             "thr": plain(r.get("threads_listed") or "?"),
             "CPU model": plain(r.get("cpu")),
             "ISA": plain(isa_label(r.get("cpu_isa"))),

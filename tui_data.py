@@ -185,6 +185,32 @@ def open_readonly(path):
     return db
 
 
+_STATS_CACHE = {}
+
+
+def _history_stats_cached(db):
+    """Measured hardware priors, recomputed only when new observations land."""
+    key = db.execute(
+        "SELECT COALESCE(MAX(id),0) FROM rig_observations"
+    ).fetchone()[0], db.execute(
+        "SELECT COUNT(*) FROM fleet_rentals"
+    ).fetchone()[0]
+    if _STATS_CACHE.get("key") == key:
+        return _STATS_CACHE["stats"]
+    ids = [r[0] for r in db.execute(
+        "SELECT DISTINCT server_id FROM fleet_rentals")]
+    known = {}
+    if ids:
+        marks = ",".join("?" * len(ids))
+        for sid, js in db.execute(
+                "SELECT server_id, latest_json FROM servers "
+                f"WHERE server_id IN ({marks})", ids):
+            known[sid] = json.loads(js)
+    stats = experiment.history_stats(db, known)
+    _STATS_CACHE.update(key=key, stats=stats)
+    return stats
+
+
 def read_dashboard(path):
     """Latest imported market only: disappeared listings must not remain candidates."""
     try:
@@ -294,6 +320,10 @@ def read_dashboard(path):
             except Exception:
                 exp = None
             blocked = blacklist.active(db)
+            try:
+                stats = _history_stats_cached(db)
+            except Exception:
+                stats = None
         listings = json.loads(latest["raw_json"])["servers"] if latest else []
         rows = []
         cuda_hidden = 0
@@ -311,6 +341,20 @@ def read_dashboard(path):
             row["available"] = available(listing)
             row["spot"] = summarize_quote(quotes.get(row["server_id"]))
             rows.append(row)
+        if stats:
+            for row in rows:
+                entry = stats["server_prior"].get(row["server_id"])
+                prior = entry["its"] if entry else None
+                if prior is None:
+                    vals = [v for v in (
+                        stats["cpu_prior"].get(row["cpu"]),
+                        stats["gpu_prior"].get(row["gpu"])) if v]
+                    prior = sum(vals) if vals else None
+                if prior:
+                    row["est_its"] = prior
+                    if row["hourly_cost_usd"]:
+                        row["est_its_per_usd"] = \
+                            prior / float(row["hourly_cost_usd"])
         return {
             "blacklist_signature": tuple(
                 (sid, e["reason"], e["source"], e["added_at"], e["expires_at"])
