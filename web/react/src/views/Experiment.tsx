@@ -106,6 +106,15 @@ const CAND_COLS: ColDef<Candidate>[] = [
       if (d.next_trial_at) {
         return <span className="text-gray-400" title={dt(d.next_trial_at)}>{until(d.next_trial_at)}</span>
       }
+      if (d.upgrade_status === 'tried'
+          && d.tried_role === 'slot' && d.tried_reason === 'term_end') {
+        return (
+          <span className="text-teal-400/80"
+            title="held a full seat and completed its term — proven hardware, still rentable on any vacancy (no audition needed)">
+            on vacancy
+          </span>
+        )
+      }
       if (d.upgrade_status === 'tried') {
         return (
           <span className="text-gray-500"
@@ -241,9 +250,12 @@ function CandidatesPanel() {
   const rows = useMemo(
     () => (cands.data?.candidate_values ?? [])
       // 'next phase' rows are tried-terminal this phase -- except a
-      // live rental (judging now) or a ★ pin (forces an audition)
+      // live rental (judging now), a ★ pin (forces an audition), or
+      // a slot that completed a full term (proven; still rentable
+      // via fills on any vacancy)
       .filter((c) => !hideDead || c.upgrade_status !== 'tried'
-        || c.tried_active || pinSet.has(c.server_id))
+        || c.tried_active || pinSet.has(c.server_id)
+        || (c.tried_role === 'slot' && c.tried_reason === 'term_end'))
       .filter((c) => !rentedOnly || c.meas_rentals > 0),
     [cands.data, rentedOnly, hideDead, pinSet])
   const unlistedPins = pinSet.size
