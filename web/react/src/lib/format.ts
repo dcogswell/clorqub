@@ -26,8 +26,13 @@ export function dt(ts: string | null | undefined): string {
   const d = new Date(s.includes('T') ? s : s.replace(' ', 'T'))
   if (Number.isNaN(d.getTime())) return ts.slice(0, 19)
   const p = (n: number) => String(n).padStart(2, '0')
+  // zone abbreviation for the timestamp's own date (EST vs EDT)
+  const zone = new Intl.DateTimeFormat('en-US', { timeZoneName: 'short' })
+    .formatToParts(d).find((part) => part.type === 'timeZoneName')
+    ?.value ?? ''
   return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ` +
-    `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`
+    `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}` +
+    (zone ? ` ${zone}` : '')
 }
 
 export function ago(ts: string | null | undefined): string {
