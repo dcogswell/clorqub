@@ -22,7 +22,7 @@ sys.path.insert(0, REPO)
 import experiment  # noqa: E402
 
 DB = os.path.expanduser("~/.local/share/clorqub/clorqub.sqlite3")
-OUT = os.path.expanduser("~/.local/share/clorqub/reports")
+OUT = os.path.join(REPO, "reports")  # gitignored; visible in the IDE
 
 # event kinds worth reporting; tick/rental_value/trainer are noise
 REPORT_KINDS = {
