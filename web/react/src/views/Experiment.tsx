@@ -5,18 +5,18 @@ import { api } from '../api'
 import type { Candidate, ExpEvent, ExpRental, GpuStat,
   PoolShareEstimate, Verdict } from '../api'
 import { Badge, Grid, Panel, Stat, pinColumn } from '../components/ui'
-import { ago, dt, num, usd } from '../lib/format'
+import { ago, dt, num, until, usd } from '../lib/format'
 
 const POLL = 30_000
 
 const CAND_COLS: ColDef<Candidate>[] = [
-  { field: 'server_id', headerName: 'Server', width: 95 },
+  { field: 'server_id', headerName: 'Server', width: 95, pinned: 'left' },
   {
-    field: 'gpu', headerName: 'GPU', width: 150,
+    field: 'gpu', headerName: 'GPU', width: 150, pinned: 'left',
     valueFormatter: (p) => p.value ?? '—',
   },
   {
-    field: 'cpu', headerName: 'CPU', width: 190,
+    field: 'cpu', headerName: 'CPU', width: 190, pinned: 'left',
     valueFormatter: (p) => p.value ?? '—',
   },
   {
@@ -93,6 +93,28 @@ const CAND_COLS: ColDef<Candidate>[] = [
             : `${d.tried_reason} · ${ago(d.tried_at)}`}
         </span>
       )
+    },
+  },
+  {
+    field: 'next_trial_at', headerName: 'next trial', width: 105,
+    cellRenderer: (p: { value: string | null; data?: Candidate }) => {
+      const d = p.data
+      if (!d) return ''
+      if (d.tried_active) {
+        return <span className="text-gray-400" title="trial in progress — judged when it ends">at judgement</span>
+      }
+      if (d.next_trial_at) {
+        return <span className="text-gray-400" title={dt(d.next_trial_at)}>{until(d.next_trial_at)}</span>
+      }
+      if (d.upgrade_status === 'tried') {
+        return (
+          <span className="text-gray-500" title="a ★ pin re-opens it sooner">next phase</span>
+        )
+      }
+      if (d.upgrade_status === 'ok' || d.upgrade_status === 'retryable') {
+        return <span className="text-teal-400/80">now</span>
+      }
+      return ''
     },
   },
 ]

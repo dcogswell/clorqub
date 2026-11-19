@@ -195,7 +195,7 @@ export function pinColumn<T>(pinSet: Set<number>,
   return {
     colId: 'pinned',
     headerName: 'pin', width: 50, sortable: false,
-    suppressMovable: true, resizable: false,
+    suppressMovable: true, resizable: false, pinned: 'left',
     filter: 'agTextColumnFilter',
     valueGetter: (p) => {
       const sid = (p.data as { server_id?: number } | undefined)?.server_id

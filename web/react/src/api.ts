@@ -89,6 +89,7 @@ export interface Candidate {
   tried_at: string | null
   tried_active: boolean
   tried_role: string | null
+  next_trial_at: string | null
   mode?: string | null
   od_hourly?: number | null
   spot_hourly?: number | null

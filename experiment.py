@@ -5522,6 +5522,11 @@ def summary(db, now, db_path=None):
             sp = (state["stats"].get("server_prior") or {}).get(
                 c["server_id"]) or {}
             td = tried_detail.get(c["server_id"])
+            next_at = state.get(
+                "upgrade_cooldown_until", {}).get(c["server_id"])
+            if next_at is None or next_at <= now:
+                next_at = state.get(
+                    "upgrade_pending_until", {}).get(c["server_id"])
             th_its, th_x, th_c = (
                 est_its(state["stats"], c["server_id"], c["cpu"],
                         c["gpu"], gpu_count=c.get("gpu_count") or 1,
@@ -5578,7 +5583,9 @@ def summary(db, now, db_path=None):
                 "tried_reason": td["reason"] if td else None,
                 "tried_at": td["at"] if td else None,
                 "tried_active": bool(td and td["active"]),
-                "tried_role": td["role"] if td else None})
+                "tried_role": td["role"] if td else None,
+                "next_trial_at": _iso(next_at)
+                if next_at is not None and next_at > now else None})
     return {
         "phase": {
             "phase_id": phase["phase_id"],

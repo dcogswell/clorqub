@@ -44,6 +44,16 @@ export function ago(ts: string | null | undefined): string {
   return `${(s / 86400).toFixed(1)}d ago`
 }
 
+export function until(ts: string | null | undefined): string {
+  if (!ts) return '—'
+  const s = (new Date(ts).getTime() - Date.now()) / 1000
+  if (s <= 0) return 'now'
+  if (s < 60) return `in ${Math.ceil(s)}s`
+  if (s < 3600) return `in ${Math.ceil(s / 60)}m`
+  if (s < 86400) return `in ${(s / 3600).toFixed(1)}h`
+  return `in ${(s / 86400).toFixed(1)}d`
+}
+
 export function duration(a: string | null | undefined, b?: string | null): string {
   if (!a) return '—'
   // clamp to now: for active rigs `until` is the future term end
