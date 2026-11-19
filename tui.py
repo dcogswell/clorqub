@@ -29,6 +29,7 @@ try:
     from textual.widgets import (Button, Checkbox, DataTable, Footer,
                                  Input, Select, Static, TabbedContent,
                                  TabPane, TextArea)
+    from textual.widgets._text_area import Selection
 except ImportError:
     print(
         "error: the 'textual' package is required for the TUI.\n"
@@ -40,6 +41,7 @@ except ImportError:
     )
     raise SystemExit(2)
 
+import clipboard  # noqa: E402
 import rental_policy  # noqa: E402
 from cli import DEFAULT_DB, DEFAULT_ENV  # noqa: E402
 from market import available  # noqa: E402
@@ -70,8 +72,8 @@ Button.nudge { width: 4; min-width: 4; height: 1fr;
                border: none; background: $panel; color: $edge; }
 Button.nudge:hover { background: #272c33; }
 Button.nudge:focus { text-style: bold; }
-#bench { height: auto; padding: 0 1; }
 #exp-log { height: 60%; }
+#exp-upgrade { color: #9aa4b0; height: auto; padding: 0 1; }
 .compact #search { display: none; }
 .compact #hdr { height: 2; }
 .compact #h3 { display: none; }
@@ -80,6 +82,7 @@ ServerDetail, HelpModal, OrderDetail, FleetDetail, RentalSetup,
 ReviewModal, ProgressModal, LogModal, RenewModal {
     align: center middle; }
 #rental .rfield { height: 3; }
+#rental #st-gates.gate-off { opacity: 45%; }
 #rental #r-error { color: #f59e0b; height: auto; }
 #rental Horizontal { height: auto; }
 #detail, #rental { width: 90%; height: 90%; background: #1e2228;
@@ -92,25 +95,6 @@ ReviewModal, ProgressModal, LogModal, RenewModal {
 #logview VerticalScroll { height: 1fr; }
 #detail .dtitle { color: #2dd4bf; text-style: bold; height: 1; }
 """
-
-WARN_LINES = [
-    "Provisional shortlist, not a rental approval. The sols/h column is a "
-    "reference-rig anchor (~160 approximate; >350 source lower bound), not a "
-    "guaranteed floor for any candidate.",
-    "Reference CPU allocation, epoch and trainer version are unknown; equal "
-    "allocations are not assumed.",
-    "OD$/d includes an assumed 5% renter fee (prior observation, not "
-    "refreshed); creation fee and boot opportunity cost are omitted.",
-    "SpotFlr = observed fee-inclusive spot floor (USD-Blockchain only, "
-    "1.25% fee assumed); '*' = offers present, '-' = not collected/stale. "
-    "Indicative only -- not a winning-bid price or execution guarantee; "
-    "ranking stays on-demand.",
-    "No QUBIC conversion; CPU and GPU it/s are not additive.",
-    "Clore-reported spend/online columns are observe-only (including "
-    "unmanaged web-UI rentals); reported spend is cumulative, not "
-    "epoch-verified.",
-]
-
 
 def age_of(captured_at, now=None):
     if not captured_at:
@@ -130,6 +114,20 @@ def age_of(captured_at, now=None):
     return f"{secs / 86400:.1f}d old"
 
 
+def _ep_header(phase):
+    """EP header fragment: projected cost of the highest-net-profit
+    remaining-epoch fleet plan plus the extra phase budget it would
+    need. The runner supplies these already formatted; an absent
+    additional (older runner) just shows the cost."""
+    plan = phase.get("epoch_plan_usd")
+    if plan is None:
+        return "EP -"
+    extra = phase.get("epoch_plan_additional_usd")
+    if extra is None:
+        return f"EP ~${plan}"
+    return f"EP ~${plan} (+${extra})"
+
+
 def plain(value):
     return Text("" if value is None else str(value))
 
@@ -139,26 +137,19 @@ def _dim(cell):
     return cell
 
 
-def yield_marker(row):
-    sols = row.get("estimated_sols_hr")
-    if sols is None:
-        return "n/a"
-    if row.get("benchmark_kind") == "lower_bound":
-        return f">{sols:.0f}"
-    return f"~{sols:.0f}"
-
-
-CAND_COLS = ("ID", "GPU", "OD$/d", "SpotFlr", "sols/h", "ODsol/$",
-             "est it/s", "it/$", "CC",
+CAND_COLS = ("ID", "GPU", "OD$/d", "Mode", "Est$/h", "Net$/h", "EstRet",
+             "Auto", "Upg", "est it/s", "Spot%", "CC",
              "thr", "CPU model", "ISA", "Rel%")
 MKT_COLS = ("ID", "GPU", "CPU", "Price$/d", "SpotFlr", "Avail", "CC",
-            "sols/h", "ODsol/$", "thr", "CPU model", "ISA", "Rel%",
+            "thr", "CPU model", "ISA", "Rel%",
             "Reason")
-EXP_COLS = ("Order", "Server", "Role", "Tier", "CPU", "GPU", "$/hr",
-            "Age", "Shares", "Last share", "Restarts", "Tree", "Next")
+EXP_COLS = ("Order", "Server", "Role", "Mode", "Tier", "CPU", "GPU",
+            "$/hr", "it/s", "EstRet", "Gross$/h", "Net$/h", "Age",
+            "Shares", "Sh/h",
+            "Last share", "Tree", "Next")
 FLEET_COLS = ("Server", "Pool", "Health", "CPU it/s", "GPU it/s",
               "Epoch", "Found", "Age", "$/hr", "Sh/h", "Sh/¢", "Spend$",
-              "Online", "Control", "Up",
+              "Online", "Control", "Mode", "Up",
               "End", "Order", "GPU", "Worker", "Submitted", "Trainer")
 
 # app actions that only make sense on some tabs -> the footer hides
@@ -259,13 +250,189 @@ def fmt_price(row):
     return f"{price:.2f} ({price / 24:.3f}/h)" if price is not None else "-"
 
 
-def fmt_ratio(row):
-    ratio = row.get("estimated_sols_per_usd")
-    return f"{ratio:.1f}" if ratio is not None else "-"
-
-
 def fmt_rel(row):
     return rel_percent(row.get("reliability"))
+
+
+def _detail_val(v):
+    if isinstance(v, (list, tuple)):
+        return ",".join(str(x) for x in v)
+    if isinstance(v, float):
+        return f"{v:g}"
+    return str(v)
+
+
+_EVENT_REASONS = {
+    "one_rent_per_cycle": "deferred: 1 rental per cycle",
+    "telemetry_stale": "rig telemetry stale",
+    "stale_market": "market snapshot too old",
+    "phase": "phase ended",
+    "pending": "manual rent attempt in flight",
+    "budget": "phase budget exhausted",
+    "probe_guard": "probe near free-window deadline",
+    "balance": "wallet balance too low",
+    "cancel_retry_backoff": "cancel retry backoff",
+    "blacklisted": "server blacklisted",
+    "probe_deadline": "probe hit free-window deadline",
+    "unreachable": "rig unreachable",
+    "dry": "never produced shares",
+    "dry_after_x": "still dry after its x_min arm",
+    "replaced": "replaced by probe winner",
+    "upgraded": "beaten by upgrade probe",
+    "displaced": "displaced by retry-burst winner",
+    "term_end": "rental term ended",
+    "startup": "no shares during startup",
+    "zero_its": "zero it/s",
+    "probe_lost": "lost probe audition",
+    "probe_no_share": "probe never shared",
+    "provision_failed": "provisioning failed",
+    "flaky_ssh": "flaky ssh",
+    "cancelled": "cancelled",
+    "missing": "order missing",
+    "observe-only": "observe-only",
+    "rerent": "scheduled re-rent",
+    "fill": "slot fill",
+    "probe": "burst probe",
+    "manual": "manual request",
+    "upgrade": "upgrade audition",
+    "dry_retry": "dry-slot retry",
+    "outbid": "outbid on spot market",
+    "paused": "order paused by market",
+    "reactivate_blocked": "resumed spot order can't be carried",
+    "reactivated": "resumed spot order audition",
+}
+
+
+def _localize(dt):
+    return dt.astimezone() if dt.tzinfo is not None else dt
+
+
+def _short_ts(v):
+    """ISO timestamp -> local HH:MM when it parses; raw value
+    otherwise."""
+    try:
+        return _localize(datetime.fromisoformat(
+            str(v).replace("Z", "+00:00"))).strftime("%H:%M")
+    except (ValueError, TypeError):
+        return str(v or "-")
+
+
+def _reason_text(reason):
+    """Jargon reason -> short plain phrase; unknown values pass
+    through so nothing is ever hidden."""
+    if reason is None:
+        return ""
+    r = str(reason)
+    if r.startswith("fault:"):
+        return "fault: " + r.split(":", 1)[1]
+    if r.startswith("balance:"):
+        return "wallet check failed: " + r.split(":", 1)[1].strip()
+    return _EVENT_REASONS.get(r, r)
+
+
+def _ev_line(e):
+    """One experiment-log line: HH:MM:SS + a plain-English sentence
+    for the event, then any detail fields the sentence didn't use
+    (flattened, truncated) so no data is ever dropped."""
+    try:
+        hhmmss = _localize(datetime.fromisoformat(
+            str(e["ts"]).replace("Z", "+00:00"))).strftime("%H:%M:%S")
+    except (ValueError, TypeError):
+        hhmmss = str(e.get("ts") or "")[:8]
+    kind = e.get("kind") or "?"
+    detail = e.get("detail") or {}
+    used = {"server_id", "order_id"}
+
+    def take(k):
+        used.add(k)
+        return detail.get(k)
+
+    oid = e.get("order_id")
+    sid = e.get("server_id")
+    who = (f" #{oid}" if oid is not None else "") + \
+          (f" s{sid}" if sid is not None else "")
+    if kind == "note":
+        body = "note " + str(take("text") or "")
+    elif kind == "tick":
+        rigs = take("rigs")
+        take("pulse")
+        body = (f"alive — committed=${take('committed')} "
+                f"remaining=${take('remaining')} "
+                f"burn=${take('burn_hr')}/h "
+                f"opt=${take('optimal_hr') or '-'}/h"
+                + (f"  |  {rigs}" if rigs else ""))
+    elif kind == "rent":
+        body = (f"rent{who} {take('tier')}/"
+                f"{take('role') or 'slot'} ({take('reason')})")
+    elif kind in ("blocked", "cancel", "restart", "ended"):
+        body = (f"{kind}{who}: "
+                f"{_reason_text(take('reason'))}")
+    elif kind == "first_share":
+        age = take("age_min")
+        body = (f"first share{who}"
+                + (f" after {age}m" if age is not None else ""))
+    elif kind == "blacklisted":
+        body = (f"blacklist{who}: {_reason_text(take('reason'))}"
+                f" ({take('ttl_days')}d)")
+    elif kind == "burst_started":
+        body = (f"burst #{take('burst_id')} started"
+                f" ({take('trigger')} n={take('n')}"
+                f" y={take('y_min')}m)")
+    elif kind == "burst_judged":
+        extra = take("promoted_extra") or []
+        body = (f"burst #{take('burst_id')} judged:"
+                f" {take('verdict')}"
+                + (f" +{len(extra)} kept"
+                   + "".join(f" o{e['order_id']}:{e.get('via')}"
+                             for e in extra) if extra else ""))
+    elif kind == "burst_scheduled":
+        body = (f"retry burst for #{take('for_order')}"
+                f" due {_short_ts(take('due_at'))}")
+    elif kind == "burst_requested":
+        body = f"burst requested n={take('n')}"
+    elif kind == "rerent_scheduled":
+        body = f"rerent{who} due {_short_ts(take('due_at'))}"
+    elif kind in ("rerent_expired", "retry_expired", "retry_cleared"):
+        body = f"{kind}{who}"
+    elif kind == "dryrun":
+        reason = take("reason")
+        body = (f"dry-run{who} {take('type')}"
+                + (f" ({_reason_text(reason)})" if reason else ""))
+    elif kind == "rental_value":
+        shares = take("shares") or 0
+        weighted = take("weighted")
+        usd = take("usd_est")
+        cost = take("cost_usd")
+        ret = take("return_x")
+        method = take("method")
+        alloc = ("wallet-average allocation"
+                 if method == "wallet_average"
+                 else "legacy allocation")
+        body = (f"value estimate{who}: {shares:,.0f} shares -> "
+                f"{(weighted or 0):,.0f} weighted ({alloc})"
+                + (f" ~ ${usd:.2f}" if usd is not None else "")
+                + (f" vs ${cost:.2f} cost" if cost is not None else "")
+                + (f" ({ret:.1f}x)" if ret is not None else ""))
+    elif kind == "paused":
+        body = (f"paused{who}: Clore reports the order not running"
+                f" ({take('mode') or 'on-demand'})")
+    elif kind == "reactivated":
+        body = (f"reactivated{who}: spot order resumed after "
+                f"{take('paused_min')}m paused"
+                f" (burst #{take('burst_id')})")
+    else:
+        body = f"{kind}{who}"
+    flat = {}
+    for k, v in detail.items():
+        if isinstance(v, dict):
+            flat.update(v)
+        else:
+            flat[k] = v
+    rest = " ".join(
+        f"{k}={trunc(_detail_val(v), 28)}"
+        for k, v in flat.items()
+        if v is not None and k not in used)
+    return f"{hhmmss} {body}{('  ' + rest) if rest else ''}"
 
 
 def trunc(value, width):
@@ -468,10 +635,7 @@ class ServerDetail(ModalScreen):
             self._kv("rented", d["listing"].get("rented")),
             self._kv("price $/day", (d["listing"].get("price") or {})
                      .get("usd", {}).get("on_demand_usd")),
-            self._kv("source", r.get("benchmark_source") or "-"),
-            self._kv("kind", r.get("benchmark_kind") or "-"),
-            self._kv("reason", r.get("ineligible_reason")
-                     or "benchmark-matched"),
+            self._kv("reason", r.get("ineligible_reason") or "eligible"),
             "",
             "uncertainty:",
             f"  {r.get('reference_uncertainty') or 'unknown'}",
@@ -541,7 +705,7 @@ HELP_TEXT = """keys
              explicit read-only SSH fetch, no polling; ended rigs show
              the locally archived copy instead
   a            toggle available-only
-  s            toggle sort: sols/$ desc <-> $/day asc
+  s            toggle sort: forecast net / value desc <-> $/day asc
   f            toggle fleet view: active rigs <-> all (incl. ended)
   c            reset filters (search, availability, sort, fleet view)
   r            reload the local SQLite db (rereads the db file; NOT an
@@ -562,6 +726,22 @@ data
   auto-cancel-on-bad-receipt rules as the CLI. `l` on a Fleet row
   does ONE read-only SSH fetch of the miner log tail. No other SSH,
   no writes to rigs, no auto-confirm anywhere.
+  Header EP: projected cost of the highest predicted NET-profit
+  gated fleet for the rest of the epoch (not highest ROI, not a
+  payout guarantee); (+$N) is the extra phase budget the plan
+  would need -- $0 means already funded, '-' means no fresh pool
+  calibration, and 'EP needs phase extension' means the projection
+  outlives the current phase deadline (which stays unchanged).
+  Experiment tab: it/s is the runner's smoothed measurement;
+  Gross$/h is forecast revenue before cost (the gross-strategy
+  ranking metric); Net$/h and EstRet are provisional forecasts
+  -- an incumbent's creation fee is sunk (excluded) while a
+  probe's includes a fresh fee over its remaining term. The
+  pinned 'Latest upgrade
+  check' is the newest dated 'upgrade scan:' note -- forecast
+  net $/h against the configured 25% profit-improvement
+  threshold (relative value/$ without a pool model) -- not a
+  live ranking while a burst is in progress.
 
 collector (run these in a shell, not here)
 ------------------------------------------
@@ -589,6 +769,9 @@ spot floors
   SpotFlr is an observed fee-inclusive floor (USD-Blockchain, 1.25%
   fee assumed), indicative only -- never a winning bid. Opt in with
   --spot-limit N (0..10); ranking stays on-demand.
+  On Candidates, Spot% is the discount that quote implies vs the
+  on-demand price and Mode 'spot' marks rows the runner would bid
+  on; both need a live phase with spot_enabled and a fresh quote.
   Price$/d and OD$/d are the fee-inclusive ON-DEMAND daily price
   (5% renter fee assumed, not refreshed).
 
@@ -615,8 +798,8 @@ blacklist
 ---------
   Automatic server blocks expire after 3 days. The experiment runner
   flags fault/unreachable cancellations, failed provisioning, >40% failed
-  reads over 30 minutes (20+ samples), CPU/allocation mismatch, or <50%
-  normal it/s backed by 3 other compatible rentals. Dry trees never count.
+  reads over 30 minutes (20+ samples), or CPU/allocation mismatch.
+  Dry trees never count.
   Blocks prevent automatic rental; manual rental shows a warning.
   python3 blacklist.py list [--all]
   python3 blacklist.py add --server ID --reason TEXT
@@ -795,7 +978,6 @@ class FleetDetail(ModalScreen):
             "miner:",
             self._kv("  running", miner.get("running")),
             self._kv("  started", miner.get("started_at")),
-            self._kv("  restarts", miner.get("restarts")),
             "trainer/package:",
             self._kv("  trainer", " ".join(x for x in (
                 trainer.get("variant"), trainer.get("flavor"),
@@ -850,20 +1032,8 @@ class FleetDetail(ModalScreen):
                 RenewModal(self.rig, self.db_path),
                 lambda _result: self.app.reload_data())
         else:  # fd-copy
-            import clipboard
-            cmd = self._ssh_cmd()
-            tool = clipboard.copy_text(cmd)
-            try:
-                self.app.copy_to_clipboard(cmd)  # OSC 52 fallback (e.g. SSH)
-            except Exception:
-                pass
-            if tool:
-                self.app.notify(f"ssh command copied ({tool})")
-            else:
-                self.app.notify(
-                    "sent via terminal escape; if paste fails your "
-                    "terminal blocks OSC 52 -- install xclip/wl-copy",
-                    severity="warning")
+            self.app.copy_to_clipboard(self._ssh_cmd())
+            self.app.notify_copied("ssh command copied")
 
     def _cancel_returned(self):
         try:
@@ -1217,6 +1387,314 @@ class RentalSetup(ModalScreen):
         self.dismiss(None)
 
 
+class StrategyModal(ModalScreen):
+    """Edit the open phase's score yardstick and the gates the named
+    strategy bundles move. Blank input = leave unchanged; Apply runs
+    one validated set_phase_config (the runner re-reads it live)."""
+
+    BINDINGS = [Binding("escape", "close", "Cancel")]
+
+    # (config key, label); all floats except max_price_hr (Decimal)
+    LIVE_FIELDS = [
+        ("upgrade_margin", "upgrade margin (beat incumbent by 1+x)"),
+        ("promote_margin", "promote margin (probe beats slot by 1+x)"),
+        ("max_price_hr", "max price $/hr"),
+    ]
+    # inert while loss_mining is checked -- rendered greyed out
+    GATE_FIELDS = [
+        ("min_value_ratio", "min value ratio (floor x best prior)"),
+        ("min_return", "min return (predicted $ payout per $ cost)"),
+    ]
+    FIELDS = LIVE_FIELDS + GATE_FIELDS
+    # integer fleet-sizing bounds; slot_min only matters in dynamic
+    # slot_mode and is greyed out under static
+    INT_FIELDS = [
+        ("slot_min", "min slots (hunting floor, dynamic mode only)"),
+        ("max_rentals", "max slots (ceiling the scaler can grow to)"),
+    ]
+    # dynamic-only growth/shrink policy: a rig must beat its peers'
+    # mean score by 1+growth_margin to count exceptional (earn a
+    # growth seat); shrink_mode picks how an over-target fleet drains
+    FLEET_FLOAT_FIELDS = [
+        ("growth_margin",
+         "growth margin (0.25 = exceptional needs 1.25x peer mean)"),
+    ]
+    SHRINK_MODES = ("passive", "no_renew", "cull")
+    # dry-timing knobs: startup_min is a fresh rig's grace to land its
+    # first share; dry_after_min is the silence that marks a
+    # never-producer for cancel and a quiet producer as not-producing
+    TIMING_FIELDS = [
+        ("startup_min", "startup grace min (fresh rig's time to first share)"),
+        ("dry_after_min", "dry after min (silence before cancel/replace)"),
+    ]
+    # spot posture per role: auto = spot only when the discount clears
+    # and a moved market kills the pick; prefer = same, but falls back
+    # to on-demand on a recheck abort; only = no spot quote, no rent;
+    # off = never quote spot
+    SPOT_MODES = ("auto", "prefer", "only", "off")
+    SPOT_SELECTS = [
+        ("spot_probe_mode", "spot probes"),
+        ("spot_slot_mode", "spot slots"),
+    ]
+    SPOT_FLOAT_FIELDS = [
+        ("spot_bid_premium",
+         "spot bid premium (1.01 = min legal margin over top bid)"),
+    ]
+
+    def __init__(self, cfg):
+        super().__init__()
+        self.cfg = cfg
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="rental"):
+            yield Static(
+                "experiment strategy -- the score candidates and "
+                "incumbents are ranked on plus the gates around it; "
+                "blank fields stay unchanged", classes="dtitle")
+            yield VerticalScroll(
+                Static("score"),
+                Select([(k, k) for k in ("net", "gross", "its")],
+                       value=self.cfg.get("score") or "net",
+                       id="st-score", classes="rfield"),
+                Static(self._score_help(self.cfg.get("score")),
+                       id="st-score-help"),
+                *[item for k, lbl in self.LIVE_FIELDS
+                    for item in (
+                        Static(lbl),
+                        Input(value=str(self.cfg.get(k) or ""),
+                              placeholder=k, id=f"st-{k}",
+                              classes="rfield"))],
+                Checkbox(
+                    "loss_mining (ignore floor/return gates; "
+                    "violating picks flagged)",
+                    value=bool(self.cfg.get("loss_mining")),
+                    id="st-loss"),
+                Vertical(
+                    *[item for k, lbl in self.GATE_FIELDS
+                        for item in (
+                            Static(lbl),
+                            Input(value=str(self.cfg.get(k) or ""),
+                                  placeholder=k, id=f"st-{k}",
+                                  classes="rfield"))],
+                    id="st-gates"),
+                Checkbox(
+                    "paused (no new rents/bursts; cancels and "
+                    "judgements keep running)",
+                    value=bool(self.cfg.get("paused")),
+                    id="st-paused"),
+                Checkbox(
+                    "probes_enabled (burst auditions; off = slots "
+                    "cook, vacancies fill direct, no probe spend)",
+                    value=bool(self.cfg.get("probes_enabled", True)),
+                    id="st-probes"),
+                Static("fleet"),
+                Select([(k, k) for k in ("dynamic", "static")],
+                       value=self.cfg.get("slot_mode") or "static",
+                       id="st-slot_mode", classes="rfield"),
+                Static("slot_mode -- dynamic grows to exceptional "
+                       "slots +1 within [slot_min, max_rentals]; "
+                       "static always fills max_rentals",
+                       id="st-slots-help"),
+                Vertical(
+                    *[item for k, lbl in self.INT_FIELDS
+                        for item in (
+                            Static(lbl),
+                            Input(value=str(self.cfg.get(k) or ""),
+                                  placeholder=k, id=f"st-{k}",
+                                  classes="rfield"))],
+                    id="st-ints"),
+                Vertical(
+                    *[item for k, lbl in self.FLEET_FLOAT_FIELDS
+                        for item in (
+                            Static(lbl),
+                            Input(value=str(self.cfg.get(k) or ""),
+                                  placeholder=k, id=f"st-{k}",
+                                  classes="rfield"))],
+                    Select([(k, k) for k in self.SHRINK_MODES],
+                           value=self.cfg.get("shrink_mode")
+                           or "passive",
+                           id="st-shrink_mode", classes="rfield"),
+                    Static("shrink_mode -- over-target policy: "
+                           "passive = attrition only; no_renew = "
+                           "weakest excess exits at term end; "
+                           "cull = cancel weakest below-average "
+                           "excess each cycle",
+                           id="st-shrink-help"),
+                    id="st-fleet-dyn"),
+                Static("timing"),
+                Vertical(
+                    *[item for k, lbl in self.TIMING_FIELDS
+                        for item in (
+                            Static(lbl),
+                            Input(value=str(self.cfg.get(k) or ""),
+                                  placeholder=k, id=f"st-{k}",
+                                  classes="rfield"))],
+                    id="st-timing"),
+                Static("spot"),
+                Checkbox(
+                    "spot_enabled (quote spot where it clears the "
+                    "discount)",
+                    value=bool(self.cfg.get("spot_enabled")),
+                    id="st-spot"),
+                *[item for k, lbl in self.SPOT_SELECTS
+                    for item in (
+                        Static(lbl),
+                        Select([(k, k) for k in self.SPOT_MODES],
+                               value=self.cfg.get(k) or "auto",
+                               id=f"st-{k}", classes="rfield"))],
+                *[item for k, lbl in self.SPOT_FLOAT_FIELDS
+                    for item in (
+                        Static(lbl),
+                        Input(value=str(self.cfg.get(k) or ""),
+                              placeholder=k, id=f"st-{k}",
+                              classes="rfield"))],
+                Static("", id="st-error"),
+                Horizontal(
+                    Button("Apply", id="st-go", variant="primary"),
+                    Button("Cancel", id="st-cancel")))
+
+    @staticmethod
+    def _score_help(value):
+        from experiment import SCORE_HELP
+        return SCORE_HELP.get(value or "net", "")
+
+    def on_select_changed(self, event):
+        if event.select.id == "st-score":
+            self.query_one("#st-score-help", Static).update(
+                self._score_help(str(event.value)))
+        elif event.select.id == "st-slot_mode":
+            self._sync_slots()
+
+    def on_checkbox_changed(self, event):
+        if event.checkbox.id == "st-loss":
+            self._sync_gates()
+        elif event.checkbox.id == "st-spot":
+            self._sync_spot()
+
+    def _sync_gates(self):
+        off = bool(self.query_one("#st-loss", Checkbox).value)
+        for key, _ in self.GATE_FIELDS:
+            self.query_one(f"#st-{key}", Input).disabled = off
+        self.query_one("#st-gates").set_class(off, "gate-off")
+
+    def _sync_slots(self):
+        static = str(self.query_one(
+            "#st-slot_mode", Select).value) == "static"
+        self.query_one("#st-slot_min", Input).disabled = static
+        for key, _ in self.FLEET_FLOAT_FIELDS:
+            self.query_one(f"#st-{key}", Input).disabled = static
+        self.query_one("#st-shrink_mode", Select).disabled = static
+        self.query_one("#st-fleet-dyn").set_class(static, "gate-off")
+
+    def _sync_spot(self):
+        off = not bool(self.query_one("#st-spot", Checkbox).value)
+        for key, _ in self.SPOT_SELECTS:
+            self.query_one(f"#st-{key}", Select).disabled = off
+        for key, _ in self.SPOT_FLOAT_FIELDS:
+            self.query_one(f"#st-{key}", Input).disabled = off
+
+    def on_mount(self):
+        self._sync_gates()
+        self._sync_slots()
+        self._sync_spot()
+        self.query_one("#st-score", Select).focus()
+
+    def _submit(self):
+        updates = {}
+        for key, _ in self.FIELDS:
+            inp = self.query_one(f"#st-{key}", Input)
+            if inp.disabled:
+                continue
+            raw = inp.value.strip()
+            if not raw:
+                continue
+            if key == "max_price_hr":
+                updates[key] = raw
+                continue
+            try:
+                updates[key] = float(raw)
+            except ValueError:
+                self.query_one("#st-error", Static).update(
+                    Text(f"{key} must be a number (or blank)"))
+                return
+        score = str(self.query_one("#st-score", Select).value)
+        if score != (self.cfg.get("score") or "net"):
+            updates["score"] = score
+        loss = bool(self.query_one("#st-loss", Checkbox).value)
+        if loss != bool(self.cfg.get("loss_mining")):
+            updates["loss_mining"] = loss
+        paused = bool(self.query_one("#st-paused", Checkbox).value)
+        if paused != bool(self.cfg.get("paused")):
+            updates["paused"] = paused
+        probes = bool(self.query_one("#st-probes", Checkbox).value)
+        if probes != bool(self.cfg.get("probes_enabled", True)):
+            updates["probes_enabled"] = probes
+        spot_on = bool(self.query_one("#st-spot", Checkbox).value)
+        if spot_on != bool(self.cfg.get("spot_enabled")):
+            updates["spot_enabled"] = spot_on
+        slot_mode = str(self.query_one("#st-slot_mode", Select).value)
+        if slot_mode != (self.cfg.get("slot_mode") or "static"):
+            updates["slot_mode"] = slot_mode
+        if slot_mode != "static":
+            for key, _ in self.FLEET_FLOAT_FIELDS:
+                inp = self.query_one(f"#st-{key}", Input)
+                raw = inp.value.strip()
+                if not raw:
+                    continue
+                try:
+                    updates[key] = float(raw)
+                except ValueError:
+                    self.query_one("#st-error", Static).update(
+                        Text(f"{key} must be a number (or blank)"))
+                    return
+            shrink = str(self.query_one(
+                "#st-shrink_mode", Select).value)
+            if shrink != (self.cfg.get("shrink_mode") or "passive"):
+                updates["shrink_mode"] = shrink
+        for key, _ in (self.INT_FIELDS + self.TIMING_FIELDS):
+            inp = self.query_one(f"#st-{key}", Input)
+            if inp.disabled:
+                continue
+            raw = inp.value.strip()
+            if not raw:
+                continue
+            try:
+                updates[key] = int(raw)
+            except ValueError:
+                self.query_one("#st-error", Static).update(
+                    Text(f"{key} must be a whole number (or blank)"))
+                return
+        if not spot_on:
+            for key, _ in (self.SPOT_SELECTS + self.SPOT_FLOAT_FIELDS):
+                updates.pop(key, None)
+        else:
+            for key, _ in self.SPOT_SELECTS:
+                sel = str(self.query_one(f"#st-{key}", Select).value)
+                if sel != (self.cfg.get(key) or "auto"):
+                    updates[key] = sel
+            for key, _ in self.SPOT_FLOAT_FIELDS:
+                inp = self.query_one(f"#st-{key}", Input)
+                raw = inp.value.strip()
+                if not raw:
+                    continue
+                try:
+                    updates[key] = float(raw)
+                except ValueError:
+                    self.query_one("#st-error", Static).update(
+                        Text(f"{key} must be a number (or blank)"))
+                    return
+        self.dismiss(updates)
+
+    def on_button_pressed(self, event):
+        if event.button.id == "st-go":
+            self._submit()
+        else:
+            self.dismiss(None)
+
+    def action_close(self):
+        self.dismiss(None)
+
+
 class ReviewModal(ModalScreen):
     """Scrollable order review: the exact bounded quote the guarded
     flow computed. Confirm & Rent starts create_order_flow; Cancel (or
@@ -1307,6 +1785,116 @@ class ReviewModal(ModalScreen):
         self._cancel()
 
 
+# --- log colorization --------------------------------------------------
+_LOG_ANSI_RE = re.compile(
+    r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b[()#][0-9A-Za-z]")
+_LOG_TOKEN_RE = re.compile(
+    r"\[(?P<lvl>INFO|WARN(?:ING)?|ERROR|FATAL|CRIT(?:ICAL)?|DEBUG|TRACE)\]"
+    r"|(?P<dev>\[(?:CPU|GPU|CUDA|AVX2|AVX512|SSE\d*)\]"
+    r"|\b(?:QUBJETSKI|QLI|AVX2|AVX512|CUDA)\b|\bGPU\s*#\d+\b)"
+    r"|(?P<ts>\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?"
+    r"(?:Z|[+-]\d{2}:?\d{2})?|\b\d{2}:\d{2}:\d{2}\b)"
+    r"|SHARES:\s*(?P<sf>\d+)/(?P<ss>\d+)\s*\(R:(?P<sr>\d+)\)"
+    r"|(?P<epoch>\bE:\d+)"
+    r"|(?P<rate>\b\d+\s+(?:avg\s+)?it/s\b)"
+    r"|(?P<key>\b(?:ID|SEED):)"
+    r"|(?P<ref>#\d+|\bs\d+\b)"
+    r"|(?P<kv>\b[a-zA-Z_][a-zA-Z0-9_]*=)"
+    r"|(?P<info>\bburst\b|\brerent\b|\bjudge[sd]?\b)"
+    r"|(?P<kbad>\bblocked\b|\bblacklist(?:ed)?\b)"
+    r"|(?P<kwarn>\bcancell?ed\b|\bended\b|\brestart(?:ed|s)?\b|"
+    r"\bexpired\b)"
+    r"|(?P<bad>\b(?:error|fail(?:ed|ure|s)?|fatal|refused|denied|"
+    r"timeout|timed out|reject(?:ed|ion|s)?|stall(?:ed|s)?|invalid|"
+    r"unreachable|ambiguous|unable|abort(?:ed|ing)?|stale|lost|"
+    r"disconnect(?:ed|s)?)\b)"
+    r"|(?P<good>\bfirst\s+share\b|\bshare\s*found\b|\brent\b|"
+    r"\balive\b|\baccepted\b|\bready\b|\bconnected\b)",
+    re.IGNORECASE)
+
+_LOG_DIM = "#6b7280"
+_LOG_TEAL = "#2dd4bf"
+_LOG_WARN = "#f59e0b"
+_LOG_ERR = "#f87171"
+_LOG_GOOD = "#4ade80"
+_LOG_EPOCH = "#bb9af7"
+_LOG_LVL = {"INFO": _LOG_DIM, "WARN": _LOG_WARN, "WARNING": _LOG_WARN,
+            "ERROR": "bold " + _LOG_ERR, "FATAL": "bold " + _LOG_ERR,
+            "CRIT": "bold " + _LOG_ERR, "CRITICAL": "bold " + _LOG_ERR,
+            "DEBUG": _LOG_DIM, "TRACE": _LOG_DIM}
+_ERR_LVLS = {"ERROR", "FATAL", "CRIT", "CRITICAL"}
+_WARN_LVLS = {"WARN", "WARNING"}
+
+
+def _colorize_log_line(line):
+    """One log line -> Text. The whole line is tinted red when it
+    carries an error tag/word and amber for [WARN]; timestamps are
+    dimmed and known tokens recolored on top."""
+    matches = list(_LOG_TOKEN_RE.finditer(line))
+    base = None
+    for m in matches:
+        lvl = m.group("lvl")
+        if (lvl and lvl.upper() in _ERR_LVLS) or m.group("bad") \
+                or m.group("kbad"):
+            base = _LOG_ERR
+            break
+        if (lvl and lvl.upper() in _WARN_LVLS) or m.group("kwarn"):
+            base = _LOG_WARN
+    out = Text()
+    pos = 0
+    for m in matches:
+        if m.start() > pos:
+            out.append(line[pos:m.start()], style=base)
+        if m.group("lvl"):
+            out.append(m.group(0), style=_LOG_LVL[m.group("lvl").upper()])
+        elif m.group("dev"):
+            out.append(m.group(0), style=_LOG_TEAL)
+        elif m.group("ts"):
+            out.append(m.group(0), style=_LOG_DIM)
+        elif m.group("sf") is not None:
+            out.append(line[m.start():m.start("sf")], style=_LOG_TEAL)
+            out.append(line[m.start("sf"):m.end("ss")],
+                       style=_LOG_GOOD if int(m.group("sf")) else _LOG_DIM)
+            out.append(line[m.end("ss"):m.end()],
+                       style=_LOG_ERR if int(m.group("sr")) else _LOG_DIM)
+        elif m.group("epoch"):
+            out.append(m.group(0), style=_LOG_EPOCH)
+        elif m.group("rate"):
+            out.append(m.group(0), style=_LOG_GOOD)
+        elif m.group("key"):
+            out.append(m.group(0), style=_LOG_WARN)
+        elif m.group("ref"):
+            out.append(m.group(0), style=_LOG_EPOCH)
+        elif m.group("kv"):
+            out.append(m.group(0), style=_LOG_DIM)
+        elif m.group("info"):
+            out.append(m.group(0), style=_LOG_TEAL)
+        elif m.group("kbad"):
+            out.append(m.group(0), style=_LOG_ERR)
+        elif m.group("kwarn"):
+            out.append(m.group(0), style=_LOG_WARN)
+        elif m.group("bad"):
+            out.append(m.group(0), style=_LOG_ERR)
+        else:
+            out.append(m.group(0), style=_LOG_GOOD)
+        pos = m.end()
+    if pos < len(line):
+        out.append(line[pos:], style=base)
+    return out
+
+
+def colorize_log(text):
+    """Miner/rent log text -> Text with semantic colors. ANSI escapes
+    are stripped first (raw codes would render as garbage)."""
+    out = Text()
+    for i, raw in enumerate(text.split("\n")):
+        if i:
+            out.append("\n")
+        out.append_text(
+            _colorize_log_line(_LOG_ANSI_RE.sub("", raw)))
+    return out
+
+
 class ProgressModal(ModalScreen):
     """Live timestamped log of the guarded create flow. Escape/Hide
     only hides the view -- the worker keeps running (there is no
@@ -1338,7 +1926,7 @@ class ProgressModal(ModalScreen):
     def _paint_log(self):
         try:
             self.query_one("#plog", Static).update(
-                Text("\n".join(self._lines[-400:])))
+                colorize_log("\n".join(self._lines[-400:])))
         except Exception:
             pass
 
@@ -1422,18 +2010,21 @@ class LogModal(ModalScreen):
             if archive:
                 status.update(Text(
                     f"live fetch failed: {err} -- archived copy, "
-                    f"last captured {archive['last_captured_at']}"))
-                log.update(Text("\n".join(
+                    f"last captured {archive['last_captured_at']}",
+                    style=_LOG_WARN))
+                log.update(colorize_log("\n".join(
                     archive["text"].splitlines()[-self.lines:])))
             else:
-                status.update(Text(f"fetch failed: {err}"))
+                status.update(Text(f"fetch failed: {err}",
+                                   style=_LOG_ERR))
                 log.update(Text("(no log)"))
             return
         stamp = datetime.now(timezone.utc).strftime(
             "%Y-%m-%dT%H:%M:%SZ")
         status.update(Text(
             f"fetched {stamp} UTC -- {len(text)} chars"))
-        log.update(Text(text if text else "(empty log)"))
+        log.update(
+            colorize_log(text) if text else Text("(empty log)"))
 
     def on_button_pressed(self, event):
         if event.button.id == "l-refresh":
@@ -1447,11 +2038,62 @@ class LogModal(ModalScreen):
         self.dismiss()
 
 
+class LogTextArea(TextArea):
+    """Read-only log pane with working copy: the stock ctrl+c only
+    emits an OSC 52 escape, which tmux and many terminals swallow;
+    MarketTui.copy_to_clipboard additionally calls the local clipboard
+    tools. Right-click copies the selection (or the clicked line when
+    nothing is selected); a right-press must not reset the selection
+    the way a left-press does."""
+
+    def get_line(self, line_index):
+        # documented styling hook: the selection/cursor styles are
+        # applied on top of what we return, so colorize per line
+        line = _colorize_log_line(_LOG_ANSI_RE.sub(
+            "", self.document.get_line(line_index)))
+        line.end = ""
+        line.no_wrap = True
+        return line
+
+    def action_copy(self):
+        text = self.selected_text
+        if not text:
+            self.app.notify("nothing selected", severity="warning")
+            return
+        super().action_copy()
+        self.app.notify_copied(f"copied {len(text)} chars")
+
+    async def _on_mouse_down(self, event):
+        if event.button != 1:
+            event.stop()
+            return
+        await super()._on_mouse_down(event)
+
+    def _on_click(self, event):
+        if event.button != 3:
+            return
+        event.stop()
+        text = self.selected_text
+        if not text:
+            row, _ = self.get_target_document_location(event)
+            if row < self.document.line_count:
+                line = self.document[row]
+                if line:
+                    self.selection = Selection(
+                        (row, 0), (row, len(line)))
+                    text = line
+        if text:
+            self.app.copy_to_clipboard(text)
+            self.app.notify_copied(f"copied {len(text)} chars")
+        else:
+            self.app.notify("nothing to copy", severity="warning")
+
+
 class MarketTui(App):
     TITLE = "clorqub marketplace"
     CSS = CSS
-    # drags scroll (touch-style); copying still works via the terminal's
-    # own selection
+    # drags scroll (touch-style); copying is handled by LogTextArea
+    # (ctrl+c / right-click), not the terminal's own selection
     ALLOW_SELECT = False
     BINDINGS = [
         Binding("q", "quit", "Quit"),
@@ -1464,6 +2106,8 @@ class MarketTui(App):
         Binding("b", "rent_selected",
                 "Rent"),
         Binding("l", "log_selected", "Miner log"),
+        Binding("e", "toggle_loss_mining", "LossMining"),
+        Binding("g", "strategy", "Strategy"),
         Binding("?", "help", "Help"),
         Binding("escape", "leave_search", "Back", show=False),
     ]
@@ -1487,8 +2131,26 @@ class MarketTui(App):
         self._search_pinned = True
         self._compact = False
         self._drag_scroll = None
+        self._clipboard_tool = None
         # gentler horizontal pointer/trackpad scrolling (default is 4.0)
         self.scroll_sensitivity_x = 2.0
+
+    def copy_to_clipboard(self, text):
+        """OSC 52 (works over SSH) plus local tools -- the escape alone
+        is dropped by tmux and many terminals. Records the tool used in
+        `self._clipboard_tool` for notify_copied() feedback."""
+        super().copy_to_clipboard(text)
+        self._clipboard_tool = clipboard.copy_text(text)
+
+    def notify_copied(self, label):
+        """Toast feedback after copy_to_clipboard."""
+        if self._clipboard_tool:
+            self.notify(f"{label} ({self._clipboard_tool})")
+        else:
+            self.notify(
+                f"{label}: sent via terminal escape; if paste fails "
+                "install xclip/wl-copy (or check tmux set-clipboard)",
+                severity="warning")
 
     def compose(self) -> ComposeResult:
         with Vertical(id="hdr"):
@@ -1511,8 +2173,6 @@ class MarketTui(App):
                     yield Button("◀", id="mkt-left", classes="nudge")
                     yield DataTable(id="mkt", cursor_type="row")
                     yield Button("▶", id="mkt-right", classes="nudge")
-            with TabPane("Benchmarks", id="benchmarks"):
-                yield VerticalScroll(Static(id="bench"))
             with TabPane("Fleet", id="fleet"):
                 with Vertical():
                     yield Static("", id="fleet-status")
@@ -1526,6 +2186,7 @@ class MarketTui(App):
             with TabPane("Experiment", id="experiment"):
                 with Vertical():
                     yield Static("", id="exp-status")
+                    yield Static("", id="exp-upgrade")
                     with Horizontal(classes="twrap"):
                         yield Button("◀", id="exp-table-left",
                                      classes="nudge")
@@ -1533,7 +2194,7 @@ class MarketTui(App):
                                         cursor_type="row")
                         yield Button("▶", id="exp-table-right",
                                      classes="nudge")
-                    yield TextArea(id="exp-log", read_only=True)
+                    yield LogTextArea(id="exp-log", read_only=True)
         yield Footer()
 
     def on_mount(self):
@@ -1572,6 +2233,92 @@ class MarketTui(App):
     def action_reload(self):
         self.reload_data()
 
+    def action_toggle_loss_mining(self):
+        """Flip loss_mining on the open phase -- the runner re-reads
+        config_json each cycle, so this takes effect within one tick.
+        When on, the below_floor/below_return gates are dropped
+        outright: probes, slot fills and burst promotion rank purely
+        on score, and picks that would have failed are flagged
+        loss_mining. It is the operator's call whether the current
+        QU price justifies mining at a loss until an upgrade frees
+        a better rig."""
+        if len(self.screen_stack) != 1:
+            return
+        import experiment
+        try:
+            db = experiment.open_db(self.db_path)
+            try:
+                ph = db.execute(
+                    "SELECT config_json FROM experiment_phases "
+                    "WHERE closed_at IS NULL ORDER BY phase_id DESC "
+                    "LIMIT 1").fetchone()
+                if ph is None:
+                    self.notify("no open experiment phase",
+                                severity="warning")
+                    return
+                cur = json.loads(ph["config_json"]).get(
+                    "loss_mining", False)
+                new = experiment.set_phase_config(
+                    db, loss_mining=not cur)["loss_mining"]
+            finally:
+                db.close()
+        except Exception as exc:
+            self.notify(f"loss_mining toggle failed: {exc}",
+                        severity="error")
+            return
+        self.notify(f"loss_mining {'on' if new else 'off'}")
+        self.action_reload()
+
+    def action_strategy(self):
+        """Open the strategy modal: score yardstick + the gates the
+        named bundles move, applied live via set_phase_config."""
+        if len(self.screen_stack) != 1:
+            return
+        import experiment
+        try:
+            db = experiment.open_db(self.db_path)
+            try:
+                ph = db.execute(
+                    "SELECT config_json FROM experiment_phases "
+                    "WHERE closed_at IS NULL ORDER BY phase_id DESC "
+                    "LIMIT 1").fetchone()
+            finally:
+                db.close()
+            if ph is None:
+                self.notify("no open experiment phase",
+                            severity="warning")
+                return
+            cfg = json.loads(ph["config_json"])
+        except Exception as exc:
+            self.notify(f"strategy open failed: {exc}",
+                        severity="error")
+            return
+        self.push_screen(
+            StrategyModal(cfg),
+            lambda updates: self._strategy_apply(updates))
+
+    def _strategy_apply(self, updates):
+        if not updates:
+            return
+        import experiment
+        try:
+            db = experiment.open_db(self.db_path)
+            try:
+                cfg = experiment.set_phase_config(db, **updates)
+            finally:
+                db.close()
+            if cfg is None:
+                self.notify("no open experiment phase",
+                            severity="warning")
+                return
+        except Exception as exc:
+            self.notify(f"strategy apply failed: {exc}",
+                        severity="error")
+            return
+        self.notify("strategy: " + " ".join(
+            f"{k}={cfg[k]}" for k in updates))
+        self.action_reload()
+
     @work(thread=True, exclusive=True)
     def reload_data(self):
         try:
@@ -1597,19 +2344,18 @@ class MarketTui(App):
                   (dash.get("order_inventory") or {}).get("revision"),
                   dash.get("fleet_signature"),
                   dash.get("experiment_signature"),
+                  dash.get("candidate_signature"),
                   self.avail_only, self.sort_by_price,
                   self.fleet_show_all,
                   self._search_text())
             if fp != self.fingerprint:
                 self.fingerprint = fp
                 self.render_tables()
-                self.render_benchmarks()
             self.update_header()
         else:
             self.update_header()
             if self.dash is None:
                 self.render_tables()
-                self.render_benchmarks()
         banner = self.query_one("#banner", Static)
         if self.error:
             prev = ""
@@ -1642,12 +2388,21 @@ class MarketTui(App):
         money = ""
         if phase:
             opt = phase.get("optimal_burn_hr")
+            burn = phase.get("active_burn_hr")
+            # flag when the actual burn lags the epoch-end pace the
+            # way decide() does (>10% deficit)
+            low = (opt is not None and burn is not None
+                   and float(burn) < 0.9 * float(opt))
             money = (
                 f"BAL {'$' + format(bal, '.2f') if bal is not None else '-'}  "
                 f"BUD ${phase.get('committed', '?')}"
                 f"/${phase.get('budget', '?')}  "
+                f"BURN {('$' + format(float(burn), '.3f') + '/h')
+                        if burn is not None else '-'}"
+                f"{'!' if low else ''}  "
                 f"OPT {('$' + format(float(opt), '.3f') + '/h')
-                       if opt is not None else '-'}  |  ")
+                       if opt is not None else '-'}  "
+                f"{_ep_header(phase)}  |  ")
         if d["captured_at"]:
             h2.update(Text(
                 money +
@@ -1658,14 +2413,36 @@ class MarketTui(App):
         warn = "  anchors != guarantees"
         if self.error:
             warn = "  STALE -- reload failed"
+        exp = d.get("experiment") or {}
+        vsrc = (phase.get("value_model") or {}).get("source")
+        term_h = exp.get("candidate_term_hours")
+        if not phase:
+            cand_val = "value=unavailable"
+        elif vsrc in (None, "unavailable"):
+            cand_val = (f"value=relative/{term_h}h"
+                        if term_h else "value=relative")
+        else:
+            cand_val = (f"value=provisional/{term_h}h"
+                        if term_h else "value=provisional")
         bal = d.get("balance_usd")
+        ep_bits = []
+        if phase.get("epoch_plan_profit_usd") is not None:
+            ep_bits.append(
+                f"EP profit~${phase['epoch_plan_profit_usd']}")
+        if (phase.get("epoch_plan_usd") is not None
+                and phase.get("epoch_plan_phase_limited")):
+            # the projection runs to epoch end; the phase deadline
+            # itself is unchanged
+            ep_bits.append("EP needs phase extension")
         h3.update(Text(
             f"rows={d['total']} avail={d['available']} "
             f"ranked={d['ranked']} "
             f"noncuda-hidden={d.get('cuda_hidden', 0)} "
+            f"{cand_val} "
             f"bal={'$' + format(bal, '.2f') if bal is not None else '-'}"
             f"{(' (' + age_of(d['balance_at']) + ')'
-                ) if bal is not None else ''} "
+                ) if bal is not None else ''}"
+            f"{'  ' + '  '.join(ep_bits) if ep_bits else ''} "
             f"src={kind}"
             f"{(' rld ' + self.reloaded_at.strftime('%H:%M:%S'))
                 if self.reloaded_at else ''}{warn}"))
@@ -1698,10 +2475,27 @@ class MarketTui(App):
             rows = sorted(rows, key=lambda r: (
                 r.get("effective_price_day_usd") is None,
                 r.get("effective_price_day_usd") or 0))
+        elif any(r.get("forecast_net_hr") is not None for r in rows):
+            # the runner's own ranking once calibrated: forecast net
+            # $/h desc, then the same price/id tie-breaks _candidates
+            # uses
+            rows = sorted(rows, key=lambda r: (
+                r.get("forecast_net_hr") is None,
+                -(r.get("forecast_net_hr") or 0),
+                r.get("hourly_cost_usd")
+                or r.get("effective_price_day_usd") or 0,
+                r.get("server_id") or 0))
+        elif any("auto_prior" in r for r in rows):
+            # relative value per $ when there is no dollar forecast
+            rows = sorted(rows, key=lambda r: (
+                r.get("auto_prior") is None,
+                -(r.get("auto_prior") or 0),
+                r.get("hourly_cost_usd")
+                or r.get("effective_price_day_usd") or 0,
+                r.get("server_id") or 0))
         else:
             rows = sorted(rows, key=lambda r: (
-                r.get("estimated_sols_per_usd") is None,
-                -(r.get("estimated_sols_per_usd") or 0),
+                r.get("est_its_per_usd") is None,
                 -(r.get("est_its_per_usd") or 0)))
         return rows
 
@@ -1720,14 +2514,17 @@ class MarketTui(App):
         lives in a terminal (`experiment.py run`)."""
         exp = (self.dash or {}).get("experiment")
         status = self.query_one("#exp-status", Static)
+        upgrade = self.query_one("#exp-upgrade", Static)
         table = self.query_one("#exp-table", DataTable)
         logw = self.query_one("#exp-log", TextArea)
         snap = self._snapshot(table)
         keep_log_scroll = self._keep_log_scroll()
         table.clear()
+        self._autofit_reset(table)
         logw.load_text("")
         if not exp or not exp.get("phase"):
             status.update(Text("no experiment phase"))
+            upgrade.update(Text(""))
             return
         ph = exp["phase"]
         alive = exp.get("runner_alive")
@@ -1738,19 +2535,33 @@ class MarketTui(App):
             f"{ph['ends_at']}",
             f"budget ${ph['budget']} committed ${ph['committed']} "
             f"remaining ${ph['remaining']}",
-            f"runner: {runner}"]
+            f"runner: {runner}",
+            f"loss mining {'on' if ph.get('loss_mining') else 'off'}",
+            f"score={ph.get('score') or 'net'}"]
         if exp.get("pending_rerents"):
             parts.append(
                 "rerents: " + ", ".join(
                     f"{p['server_id']} due {end_label(p['due_at'])}"
                     for p in exp["pending_rerents"]))
-        if exp.get("burst"):
-            b = exp["burst"]
+        for b in exp.get("bursts") or (
+                [exp["burst"]] if exp.get("burst") else []):
             parts.append(
                 f"burst {b['burst_id']} ({b['trigger']}) "
                 f"{len(b['probes'])}/{b['n_target']} probes "
                 f"judge in {int(b['judge_in_s'] // 60)}m")
         status.update(Text("  |  ".join(parts)))
+        # pin the newest 'upgrade scan:' note (events arrive
+        # newest-first): a dated assessment of the last comparison,
+        # not a live ranking while a burst is in progress
+        scan = next(
+            (e for e in exp.get("events") or []
+             if e.get("kind") == "note"
+             and str((e.get("detail") or {}).get("text") or "")
+             .startswith("upgrade scan:")), None)
+        upgrade.update(Text(
+            "Latest upgrade check: " + _ev_line(scan)
+            if scan is not None
+            else "Upgrade check: no assessment yet"))
         text = self._search_text()
         items = exp.get("rentals") or []
         if text:
@@ -1761,38 +2572,36 @@ class MarketTui(App):
         for r in items:
             table.add_row(
                 plain(r.get("order_id")), plain(r.get("server_id")),
-                plain(r.get("role")), plain(r.get("tier")),
+                plain(r.get("role")),
+                plain("spot" if r.get("mode") == "spot" else "-"),
+                plain(r.get("tier")),
                 plain(trunc(cpu_compact(r.get("cpu")), 16)),
                 plain(trunc(r.get("gpu"), 12)),
                 plain(f"{float(r['hourly_usd']):.3f}"
                       if r.get("hourly_usd") is not None else "-"),
+                plain(str(round(float(r["its_total"])))
+                      if r.get("its_total") is not None else "-"),
+                plain(f"~{float(r['forecast_return_x']):.2f}x"
+                      if r.get("forecast_return_x") is not None
+                      else "-"),
+                plain(f"~${float(r['forecast_usd_hr']):.3f}"
+                      if r.get("forecast_usd_hr") is not None
+                      else "-"),
+                plain(f"~${float(r['forecast_net_hr']):.3f}"
+                      if r.get("forecast_net_hr") is not None
+                      else "-"),
                 plain(age_s_label(r.get("age_s"))),
                 plain(r.get("shares")),
+                plain(f"{r['shares_per_h']:.0f}"
+                      if r.get("shares_per_h") is not None else "-"),
                 plain(age_of(r.get("last_share_at"))
                       if r.get("last_share_at") else "-"),
-                plain(r.get("restarts")),
                 plain(trunc(r.get("tree_id"), 10)),
                 plain(r.get("next") or "-"),
                 key=str(r.get("order_id")))
         self._apply_sort(table)
         self._restore(table, snap)
-        lines = []
-        for e in exp.get("events") or []:
-            try:
-                hhmmss = datetime.fromisoformat(
-                    e["ts"].replace("Z", "+00:00")).strftime("%H:%M:%S")
-            except (ValueError, TypeError):
-                hhmmss = str(e.get("ts") or "")[:8]
-            detail = e.get("detail") or {}
-            extras = " ".join(
-                f"{k}={detail[k]}" for k in (
-                    "reason", "tier", "x_min", "y_min", "tree_id_before",
-                    "n", "trigger", "type") if k in detail)
-            lines.append(
-                f"{hhmmss} {e.get('kind')}"
-                f"{' ' + str(e['order_id']) if e.get('order_id') else ''}"
-                f"{' s' + str(e['server_id']) if e.get('server_id') else ''}"
-                f"{' ' + extras if extras else ''}")
+        lines = [_ev_line(e) for e in exp.get("events") or []]
         keep_log_scroll("\n".join(lines))
 
     def _cells(self, r):
@@ -1804,15 +2613,31 @@ class MarketTui(App):
                 else "")),
             "Price$/d": plain(fmt_price(r)),
             "OD$/d": plain(fmt_price(r)),
+            "Mode": plain("spot" if r.get("mode") == "spot" else "-"),
+            "Spot%": plain(
+                f"-{round(r['spot_discount'] * 100)}%"
+                if isinstance(r.get("spot_discount"), (int, float))
+                and r["spot_discount"] > 0
+                else "-"),
             "SpotFlr": plain(spot_floor_label(r)),
             "Avail": plain("yes" if r.get("available") else "no"),
             "CC": plain(r.get("country") or "--"),
-            "sols/h": plain(yield_marker(r)),
-            "ODsol/$": plain(fmt_ratio(r)),
+            "Est$/h": plain(
+                f"~${r['forecast_usd_hr']:.3f}"
+                if r.get("forecast_usd_hr") is not None else "-"),
+            "Net$/h": plain(
+                f"~${r['forecast_net_hr']:.3f}"
+                if r.get("forecast_net_hr") is not None else "-"),
+            "EstRet": plain(
+                f"~{r['forecast_return_x']:.2f}x"
+                if r.get("forecast_return_x") is not None else "-"),
+            "Auto": plain(r.get("value_fill_status") or "-"),
+            "Upg": plain(r.get("upgrade_status") or "-"),
             "est it/s": plain(
-                (f"~{r['est_its']:.0f}" if r.get("est_extrapolated")
-                 else f"{r['est_its']:.0f}") if r.get("est_its")
-                else "-"),
+                ((f"~" if r.get("est_extrapolated") else "")
+                 + f"{r['est_its']:.0f}"
+                 + ("*" if r.get("est_cross_epoch") else ""))
+                if r.get("est_its") else "-"),
             "it/$": plain(
                 f"{r['est_its_per_usd']:.0f}"
                 if r.get("est_its_per_usd") else "-"),
@@ -1820,9 +2645,7 @@ class MarketTui(App):
             "CPU model": plain(r.get("cpu")),
             "ISA": plain(isa_label(r.get("cpu_isa"))),
             "Rel%": plain(fmt_rel(r)),
-            "Reason": plain(r.get("ineligible_reason") or (
-                "unbenchmarked" if not r.get("benchmarked")
-                else "matched")),
+            "Reason": plain(r.get("ineligible_reason") or ""),
         }
 
     def _snapshot(self, table):
@@ -1883,10 +2706,20 @@ class MarketTui(App):
                     lambda: w.scroll_to(y=sy, animate=False))
         return _apply
 
+    @staticmethod
+    def _autofit_reset(table):
+        """Drop ratcheted column widths so auto_width columns re-fit
+        the current rows: clear() keeps Column.content_width, and
+        _update_dimensions only ever max()es it, so without this the
+        widest cell ever seen pins the column forever."""
+        for col in table.columns.values():
+            col.content_width = len(col.label.plain)
+
     def _fill(self, table, rows, cols, which):
         selected = self.sel_id[which]
         snap = self._snapshot(table)
         table.clear()
+        self._autofit_reset(table)
         sel_row = None
         for i, r in enumerate(rows):
             cells = self._cells(r)
@@ -1955,6 +2788,7 @@ class MarketTui(App):
                 f"End* = auto-renewing term  |  {totals}"))
         snap = self._snapshot(table)
         table.clear()
+        self._autofit_reset(table)
         for r in items:
             st = r.get("status") or {}
             its = st.get("its") or {}
@@ -1984,6 +2818,7 @@ class MarketTui(App):
                 plain("yes" if r.get("online_reported") is True else
                       "no" if r.get("online_reported") is False else "?"),
                 plain(r.get("control") or "-"),
+                plain("spot" if r.get("mode") == "spot" else "-"),
                 plain(uptime_label(r.get("created_at"),
                                    r.get("up_until"))),
                 plain(end_label(r.get("end_at"))
@@ -2001,43 +2836,6 @@ class MarketTui(App):
             table.add_row(*cells, key=str(r.get("order_id")))
         self._apply_sort(table)
         self._restore(table, snap)
-
-    def render_benchmarks(self):
-        bench = self.query_one("#bench", Static)
-        scroll = bench.parent
-        sy = scroll.scroll_target_y if scroll is not None else 0
-        if self.dash is None:
-            bench.update(Text("no data loaded"))
-            return
-        lines = [f"snapshot source: {self.dash['source']}",
-                 "stored scoring anchors (performance_benchmarks)", ""]
-        for b in self.dash["benchmarks"]:
-            hi = b.get("max_sols_hr")
-            rng = f"{b['min_sols_hr']:.0f}-{hi:.0f}" if hi else (
-                f">{b['min_sols_hr']:.0f}" if b.get("observation_kind")
-                == "lower_bound" else f"~{b['min_sols_hr']:.0f}")
-            lines.append(
-                f"{b['gpu_model']:<12} {b['cpu_profile']:<26} "
-                f"{b['cpu_isa']:<7} pool={b['pool']} "
-                f"kind={b['observation_kind']} sols/h={rng}")
-            lines.append(
-                f"    source={b['source']} threads={b.get('thread_count')}"
-                f" epoch={b.get('epoch')} trainer={b.get('trainer_version')}")
-            lines.append(f"    {b.get('notes')}")
-        lines += ["", "context observations (provenance only -- NOT scored)",
-                  ""]
-        for o in self.dash["observations"]:
-            lines.append(
-                f"{o.get('id')}: device={o.get('device')} "
-                f"gpu={o.get('gpu_model')} its={o.get('its')} "
-                f"qualifier={o.get('qualifier')}")
-            if o.get("notes"):
-                lines.append(f"    {o['notes']}")
-        lines += ["", "warnings", ""] + [f"- {w}" for w in WARN_LINES]
-        bench.update(Text("\n".join(lines)))
-        if sy and scroll is not None:
-            self.call_after_refresh(
-                lambda: scroll.scroll_to(y=sy, animate=False))
 
     # -- input -------------------------------------------------------------
 
@@ -2396,7 +3194,7 @@ class MarketTui(App):
         self.fingerprint = None
         self.render_tables()
         self.notify("sort: fee-inclusive $/day asc" if self.sort_by_price
-                    else "sort: sols/$ desc")
+                    else "sort: forecast return / value desc")
 
     def on_data_table_header_selected(self, event):
         """Click a column header to sort ascending; again to reverse."""

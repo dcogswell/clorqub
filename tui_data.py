@@ -2,17 +2,19 @@
 
 import json
 import sqlite3
+import threading
+import time
+from collections import Counter
 from contextlib import closing
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import blacklist
 import experiment
 import fleet_store
-from market import (GPU_IT_SCALE, available, cpu_profile, cuda_capable,
-                    score_listing)
+from market import RENTER_FEES, available, cuda_capable, score_listing
 from orders import latest_wallets, read_inventory
-from spot import latest_quotes, summarize_quote
+from spot import bid_for, latest_quotes, summarize_quote
 from telemetry_policy import health, timestamp
 
 
@@ -79,6 +81,19 @@ def _fleet_visible(rig, inventory):
         o.get("order_id") for o in inventory.get("orders") or []}
 
 
+def _order_modes(inventory):
+    """order_id -> rental mode from the last good inventory: 'spot' /
+    'on-demand', or None when Clore reported no spot flag."""
+    modes = {}
+    for o in (inventory or {}).get("orders") or []:
+        if isinstance(o, dict):
+            spot = o.get("spot")
+            modes[o.get("order_id")] = (
+                "spot" if spot is True else
+                "on-demand" if spot is False else None)
+    return modes
+
+
 def _shares_per_hr(db, order_id):
     """Submitted shares/hour across recent successful polls; None if n/a."""
     rows = db.execute(
@@ -106,6 +121,47 @@ def _shares_per_hr(db, order_id):
     if span < 120 or e_new != e_old or s_new < s_old:
         return None
     return (s_new - s_old) * 3600.0 / span
+
+
+def _its_per_order(db, order_id):
+    """Median measured it/s across the order's good observations,
+    skipping the 2-min post-t0 warmup like the runner's smoothed
+    its_total; None when the rig was never reached."""
+    good = []
+    for row in db.execute(
+            "SELECT captured_at, status_json FROM rig_observations"
+            " WHERE order_id=? AND status_json IS NOT NULL"
+            " ORDER BY id", (order_id,)):
+        try:
+            good.append((timestamp(row["captured_at"]),
+                         json.loads(row["status_json"])))
+        except (ValueError, TypeError):
+            continue
+    if not good:
+        return None
+    t0 = good[0][0]
+    post = [s for ts, s in good if ts >= t0 + timedelta(minutes=2)]
+    return experiment._median(
+        [experiment._its_total(s) for s in (post or [s for _, s in good])])
+
+
+def _last_share_at(db, order_id):
+    """ISO time of the last share arrival under the runner's
+    cumulative-counter rules (experiment.share_arrivals); None when
+    no share has ever been observed. Distinct from observed_at,
+    which only says the rig answered a poll."""
+    good = []
+    for row in db.execute(
+            "SELECT captured_at, status_json FROM rig_observations"
+            " WHERE order_id=? AND status_json IS NOT NULL"
+            " ORDER BY id", (order_id,)):
+        try:
+            good.append((timestamp(row["captured_at"]),
+                         json.loads(row["status_json"])))
+        except (ValueError, TypeError):
+            continue
+    arrivals = experiment.share_arrivals(good)
+    return arrivals[-1][0].isoformat() if arrivals else None
 
 
 def _shares_per_cent(order):
@@ -195,7 +251,10 @@ def _history_stats_cached(db):
         "SELECT COALESCE(MAX(id),0) FROM rig_observations"
     ).fetchone()[0], db.execute(
         "SELECT COUNT(*) FROM fleet_rentals"
-    ).fetchone()[0]
+    ).fetchone()[0], db.execute(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table'"
+        " AND name='pool_worker_snapshots'").fetchone()[0] and db.execute(
+        "SELECT COUNT(*) FROM pool_worker_snapshots").fetchone()[0]
     if _STATS_CACHE.get("key") == key:
         return _STATS_CACHE["stats"]
     ids = [r[0] for r in db.execute(
@@ -212,36 +271,127 @@ def _history_stats_cached(db):
     return stats
 
 
-def _gpu_est(stats, gpu):
-    """Measured prior if the model was rented, else extrapolated from
-    the measured models via GPU_IT_SCALE relative multipliers."""
-    prior = stats["gpu_prior"].get(gpu)
-    if prior is not None:
-        return prior, False
-    scale = GPU_IT_SCALE.get(gpu)
-    if scale is None:
-        return None, False
-    base = [p / GPU_IT_SCALE[g]
-            for g, p in stats["gpu_prior"].items()
-            if g in GPU_IT_SCALE]
-    if not base:
-        return None, False
-    base = sorted(base)[len(base) // 2]
-    return base * scale, True
+_exp_lock = threading.Lock()
+_exp_cache = {"path": None, "at": 0.0, "data": None}
+_EXP_CACHE_TTL = 10.0
 
 
-def _cpu_est(stats, cpu):
-    """Measured prior if the CPU was rented, else the median prior of
-    its ISA class (AVX-512 vs AVX2/unclassified differ by ~8x)."""
-    prior = stats["cpu_prior"].get(cpu)
-    if prior is not None:
-        return prior, False
-    _, isa = cpu_profile(cpu)
-    vals = [p for c, p in stats["cpu_prior"].items()
-            if cpu_profile(c)[1] == isa]
-    if not vals:
-        return None, False
-    return sorted(vals)[len(vals) // 2], True
+def read_experiment(path):
+    """experiment.summary() behind a short TTL: every section
+    endpoint needs the same build_state pass, so parallel calls share
+    one result instead of each recomputing it."""
+    with _exp_lock:
+        if _exp_cache["path"] == path \
+                and time.time() - _exp_cache["at"] < _EXP_CACHE_TTL:
+            return _exp_cache["data"]
+        with closing(open_readonly(path)) as db:
+            try:
+                data = experiment.summary(
+                    db, datetime.now(timezone.utc), db_path=path)
+            except Exception:
+                data = None
+        _exp_cache.update(path=path, data=data, at=time.time())
+        return data
+
+
+def read_experiment_events(path, limit=200):
+    """The event log without build_state: the cheapest section of the
+    experiment summary, for views that only need the log."""
+    with closing(open_readonly(path)) as db:
+        if db.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table'"
+                " AND name='experiment_phases'").fetchone() is None:
+            return []
+        phase = db.execute(
+            "SELECT phase_id FROM experiment_phases"
+            " WHERE closed_at IS NULL ORDER BY phase_id DESC LIMIT 1"
+        ).fetchone() or db.execute(
+            "SELECT phase_id FROM experiment_phases"
+            " ORDER BY phase_id DESC LIMIT 1").fetchone()
+        if phase is None:
+            return []
+        return [{
+            "id": e["id"], "ts": e["ts"], "kind": e["kind"],
+            "order_id": e["order_id"], "server_id": e["server_id"],
+            "detail": json.loads(e["detail_json"])}
+            for e in db.execute(
+                "SELECT * FROM experiment_events WHERE phase_id=?"
+                " ORDER BY id DESC LIMIT ?",
+                (phase["phase_id"], limit))]
+
+
+def _open_or_latest_phase_id(db):
+    return db.execute(
+        "SELECT phase_id FROM experiment_phases"
+        " WHERE closed_at IS NULL ORDER BY phase_id DESC LIMIT 1"
+    ).fetchone() or db.execute(
+        "SELECT phase_id FROM experiment_phases"
+        " ORDER BY phase_id DESC LIMIT 1").fetchone()
+
+
+def read_experiment_verdicts(path, limit=200):
+    """One row per decided outcome, newest first: ended rentals with
+    their cancel evidence plus the burst verdict the rental took part
+    in, so 'what was decided and on what numbers' reads without
+    cross-referencing the raw event stream."""
+    with closing(open_readonly(path)) as db:
+        if db.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table'"
+                " AND name='experiment_rentals'").fetchone() is None:
+            return []
+        phase = _open_or_latest_phase_id(db)
+        if phase is None:
+            return []
+        # order -> burst outcome text, from burst_judged details
+        order_outcome = {}
+        for b in db.execute(
+                "SELECT detail_json FROM experiment_events"
+                " WHERE phase_id=? AND kind='burst_judged' ORDER BY id",
+                (phase["phase_id"],)):
+            d = json.loads(b["detail_json"])
+            st = d.get("stats") or {}
+            bid, verdict = d.get("burst_id"), d.get("verdict")
+            bits = []
+            if st.get("probe_its") is not None:
+                bits.append(f"probe {st['probe_its']:.0f}its")
+            if st.get("probe_net_usd_hr") is not None:
+                bits.append(f"${st['probe_net_usd_hr']:.2f}/h")
+            if st.get("orig_its") is not None:
+                bits.append(f"vs {st['orig_its']:.0f}its")
+            if st.get("orig_net_usd_hr") is not None:
+                bits.append(f"${st['orig_net_usd_hr']:.2f}/h")
+            text = (f"burst {bid} · {verdict}"
+                    + (f" ({' '.join(bits)})" if bits else ""))
+            for oid in (d.get("finders") or []) + \
+                    (d.get("cancelled") or []) + \
+                    [d.get("promote"), d.get("cancel_original")]:
+                if oid is not None and oid not in order_outcome:
+                    order_outcome[oid] = text
+        rows = []
+        for r in db.execute(
+                "SELECT r.order_id, r.server_id, r.role, r.mode,"
+                " r.tier, r.created_at, r.ended_at, r.end_reason,"
+                " r.hourly_usd, r.quoted_cost_usd,"
+                " (SELECT e.detail_json FROM experiment_events e"
+                "  WHERE e.order_id=r.order_id AND e.kind='cancel'"
+                "  ORDER BY e.id DESC LIMIT 1) AS cancel_json"
+                " FROM experiment_rentals r"
+                " WHERE r.phase_id=? AND r.ended_at IS NOT NULL"
+                " ORDER BY r.ended_at DESC LIMIT ?",
+                (phase["phase_id"], limit)):
+            cd = json.loads(r["cancel_json"]) if r["cancel_json"] else {}
+            rows.append({
+                "order_id": r["order_id"], "server_id": r["server_id"],
+                "role": r["role"], "mode": r["mode"],
+                "tier": r["tier"], "ended_at": r["ended_at"],
+                "verdict": r["end_reason"],
+                "decided": cd.get("decided"),
+                "its": cd.get("its"), "shares": cd.get("shares"),
+                "age_min": cd.get("age_min"),
+                "cost_usd": float(r["quoted_cost_usd"] or 0),
+                "outcome": order_outcome.get(r["order_id"]),
+            })
+        return rows
 
 
 def read_dashboard(path):
@@ -295,6 +445,8 @@ def read_dashboard(path):
                 rig["country"] = cc_map.get(rig.get("server_id"))
                 rig["health"] = health(rig)
                 rig["shares_hr"] = _shares_per_hr(db, rig["order_id"])
+                rig["last_share_at"] = _last_share_at(
+                    db, rig["order_id"])
                 _rig_cost(rig, order_index, price_index)
             # Clore orders not enrolled as rigs (e.g. manual web-UI
             # rentals): minimal rows so Fleet still shows them
@@ -335,7 +487,11 @@ def read_dashboard(path):
                     " AND name='experiment_rentals'").fetchone():
                 exp_ids = {row["order_id"] for row in db.execute(
                     "SELECT order_id FROM experiment_rentals")}
+            modes = _order_modes(inventory)
             for rig in fleet_all:
+                # an order the last good inventory no longer lists is
+                # presumed on-demand rather than unknown
+                rig["mode"] = modes.get(rig.get("order_id"), "on-demand")
                 if rig.get("unmanaged"):
                     rig["control"] = "unmanaged"
                 elif rig["order_id"] in exp_ids:
@@ -347,17 +503,27 @@ def read_dashboard(path):
             fleet = [rig for rig in fleet_all
                      if _fleet_visible(rig, inventory)]
             wallets = latest_wallets(db)
-            try:
-                exp = experiment.summary(
-                    db, datetime.now(timezone.utc), db_path=path)
-            except Exception:
-                exp = None
+            exp = read_experiment(path)
             blocked = blacklist.active(db)
             try:
                 stats = _history_stats_cached(db)
             except Exception:
                 stats = None
+            # orders seen on this account per server — "previously
+            # rented" for the Candidates/Marketplace quick filters
+            prior_counts = Counter(
+                o["server_id"] for o in history if o.get("server_id"))
         listings = json.loads(latest["raw_json"])["servers"] if latest else []
+        # the experiment's static eligibility gates, so the Candidates
+        # tab shows the same pool auto-rental/burst/upgrade draws from
+        ph = (exp or {}).get("phase") or {}
+        min_rel = ph.get(
+            "min_reliability",
+            experiment.DEFAULT_CONFIG["min_reliability"])
+        max_price = ph.get(
+            "max_price_hr",
+            float(experiment._dec(
+                experiment.DEFAULT_CONFIG["max_price_hr"])))
         rows = []
         cuda_hidden = 0
         for listing in listings:
@@ -370,30 +536,81 @@ def read_dashboard(path):
                 row["eligible"] = False
                 row["ineligible_reason"] = f"blacklisted: {entry['reason']}"
                 row["blacklist"] = entry
+            if row["eligible"]:
+                rel = row.get("reliability")
+                if min_rel and (rel is None or rel < min_rel):
+                    row["eligible"] = False
+                    row["ineligible_reason"] = \
+                        f"reliability < {min_rel * 100:g}%"
+                elif (row["hourly_cost_usd"] is not None
+                        and row["hourly_cost_usd"] > max_price):
+                    row["eligible"] = False
+                    row["ineligible_reason"] = \
+                        f"over ${max_price:.2f}/h cap"
             row["listing"] = listing
             row["available"] = available(listing)
+            row["prior_rentals"] = prior_counts.get(row["server_id"], 0)
             row["spot"] = summarize_quote(quotes.get(row["server_id"]))
+            bid = bid_for(quotes.get(row["server_id"]))
+            od = row.get("hourly_cost_usd")
+            if bid is not None and isinstance(od, (int, float)) \
+                    and not isinstance(od, bool) and od > 0:
+                row["spot_discount"] = 1 - (
+                    bid["bid_usd_day"] / 24
+                    * (1 + RENTER_FEES["spot"])) / float(od)
             rows.append(row)
         if stats:
             for row in rows:
-                entry = stats["server_prior"].get(row["server_id"])
-                prior = entry["its"] if entry else None
-                extrapolated = False
-                if prior is None:
-                    # est is cpu+gpu: a single-side prior is not an
-                    # estimate, it just looks like a tiny rig. Missing
-                    # sides are extrapolated from model-class data.
-                    cpu_p, cpu_x = _cpu_est(stats, row["cpu"])
-                    gpu_p, gpu_x = _gpu_est(stats, row["gpu"])
-                    if cpu_p is not None and gpu_p is not None:
-                        prior = cpu_p + gpu_p
-                        extrapolated = cpu_x or gpu_x
+                prior, extrapolated, cross_ep = experiment.est_its(
+                    stats, row["server_id"], row["cpu"], row["gpu"],
+                    gpu_count=row.get("gpu_count") or 1)
                 if prior:
                     row["est_its"] = prior
                     row["est_extrapolated"] = extrapolated
+                    row["est_cross_epoch"] = cross_ep
                     if row["hourly_cost_usd"]:
                         row["est_its_per_usd"] = \
                             prior / float(row["hourly_cost_usd"])
+        # when an experiment phase is live, the runner's own scored
+        # pool decides Candidates membership: it keeps rows the static
+        # gates pass (incl. "no matching benchmark" estimates) so an
+        # economically rejected candidate still shows with its Auto
+        # status; non-members stay in the Marketplace.
+        auto_pool = None
+        if exp:
+            cand_vals = exp.get("candidate_values")
+            if cand_vals is not None:
+                auto_pool = {cv["server_id"]: cv
+                             for cv in cand_vals}
+        if auto_pool is not None:
+            for row in rows:
+                cv = auto_pool.get(row["server_id"])
+                if cv is None:
+                    row["eligible"] = False
+                    if not row.get("ineligible_reason"):
+                        row["ineligible_reason"] = "not in auto pool"
+                    continue
+                row["auto_prior"] = cv["prior"]
+                row["forecast_usd_hr"] = cv["usd_hr"]
+                row["forecast_return_x"] = cv["return_x"]
+                row["forecast_net_hr"] = cv.get("net_hr")
+                row["value_fill_status"] = cv["fill_status"]
+                row["upgrade_status"] = cv.get("upgrade_status")
+                row["mode"] = cv.get("mode")
+                row["od_hourly"] = cv.get("od_hourly")
+                row["spot_hourly"] = cv.get("spot_hourly")
+                row["spot_discount"] = (
+                    cv.get("spot_discount") or row.get("spot_discount"))
+                row["eligible"] = True
+                row["ineligible_reason"] = None
+                row["est_its"] = cv["est_its"]
+                row["est_extrapolated"] = cv["extrapolated"]
+                row["est_cross_epoch"] = cv.get("cross_epoch")
+                if cv["est_its"] and row["hourly_cost_usd"]:
+                    row["est_its_per_usd"] = \
+                        cv["est_its"] / float(row["hourly_cost_usd"])
+                else:
+                    row.pop("est_its_per_usd", None)
         return {
             "blacklist_signature": tuple(
                 (sid, e["reason"], e["source"], e["added_at"], e["expires_at"])
@@ -428,6 +645,18 @@ def read_dashboard(path):
                 (exp["events"][0]["id"] if exp["events"] else 0,
                  len(exp["rentals"]))
                 if exp else None),
+            # pool refresh must repaint Candidates even when the
+            # marketplace snapshot and event stream are unchanged
+            "candidate_signature": (
+                ((exp.get("candidate_term_hours"),
+                  ((exp.get("phase") or {}).get("value_model") or {})
+                  .get("source")),
+                 tuple(
+                     (cv["server_id"], cv["est_its"], cv["usd_hr"],
+                      cv["return_x"], cv.get("net_hr"), cv["prior"],
+                      cv["fill_status"], cv.get("mode"))
+                     for cv in (exp.get("candidate_values") or ())))
+                if exp else None),
         }
     except (sqlite3.Error, OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
         raise DashboardError(
@@ -436,11 +665,14 @@ def read_dashboard(path):
         ) from exc
 
 
-def read_log_archive(path, order_id, pool, max_chars=200000):
-    """Archived miner-log tail for a rig; empty result when none/no table."""
+def read_log_archive(path, order_id, pool, max_chars=200000,
+                     head=False):
+    """Archived miner-log tail (or head when head=True) for a rig;
+    empty result when none/no table."""
     try:
         with closing(open_readonly(path)) as db:
-            return fleet_store.read_log_archive(db, order_id, pool, max_chars)
+            return fleet_store.read_log_archive(
+                db, order_id, pool, max_chars, head=head)
     except (sqlite3.Error, OSError, ValueError):
         return {"text": "", "last_captured_at": None, "chunks": 0}
 
@@ -479,6 +711,7 @@ def read_server_details(path, server_id):
                 for row in rows:
                     rig = dict(row)
                     rig["shares_hr"] = _shares_per_hr(db, rig["order_id"])
+                    rig["its_total"] = _its_per_order(db, rig["order_id"])
                     _rig_cost(rig, order_index)
                     rentals.append(rig)
         result = dict(server)
