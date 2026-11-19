@@ -275,6 +275,7 @@ def experiment_status():
         "offering_dead": exp.get("offering_dead"),
         "dead_trees": exp.get("dead_trees") or [],
         "tree_lifetime_min": exp.get("tree_lifetime_min"),
+        "pool_share": exp.get("pool_share"),
     })
 
 
@@ -304,7 +305,7 @@ _CONFIG_KEYS = ("score", "upgrade_margin", "promote_margin",
                 "startup_min", "dry_after_min",
                 "kill_lambda", "kill_lambda_free",
                 "spot_enabled", "spot_probe_mode", "spot_slot_mode",
-                "spot_bid_premium")
+                "spot_bid_premium", "pool_share_target_pct")
 
 
 @app.get("/api/config")
@@ -347,6 +348,7 @@ class ConfigRequest(BaseModel):
     spot_probe_mode: str | None = None
     spot_slot_mode: str | None = None
     spot_bid_premium: float | None = None
+    pool_share_target_pct: float | None = None
     strategy: str | None = None
 
 

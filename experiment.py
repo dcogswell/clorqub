@@ -198,6 +198,11 @@ DEFAULT_CONFIG = {
     # series (Zen4/5: 9654/9754/9455P/9255...) has AVX512 + high
     # clocks and stays eligible. Manual rentals are unaffected.
     "cpu_blocklist_re": r"\bEPYC\s+[1-8]",
+    # target pool-window share (percent of pool total_sol): 0 = off.
+    # Not a controller yet -- the Experiment tab shows the estimated
+    # budget to hold the share from live pool telemetry, and the
+    # operator tunes the target against that estimate.
+    "pool_share_target_pct": 0.0,
     # Poisson kill evidence: dry/low-yield verdicts wait for
     # kill_lambda expected shares to have elapsed -- P(0 observed |
     # healthy) ~= e^-lambda -- so judgement windows stretch with
@@ -507,6 +512,10 @@ def validate_config(cfg):
         re.compile(cfg["cpu_blocklist_re"] or "")
     except re.error as exc:
         raise ValueError(f"cpu_blocklist_re: {exc}") from None
+    if not isinstance(cfg["pool_share_target_pct"], (int, float)) \
+            or isinstance(cfg["pool_share_target_pct"], bool) \
+            or not 0 <= cfg["pool_share_target_pct"] <= 100:
+        raise ValueError("pool_share_target_pct must be a number 0..100")
     if not math.isfinite(cfg["kill_lambda"]) or cfg["kill_lambda"] <= 0:
         raise ValueError("kill_lambda must be > 0")
     if not math.isfinite(cfg["kill_lambda_free"]) \
@@ -1408,6 +1417,87 @@ def history_stats(db, known_listings, exclude_order_id=None, now=None):
         # suspicion -- the pool algorithm may have moved the unit.
         "cross_epoch": {"cpu": cpu_ce, "gpu": gpu_ce,
                         "server": srv_ce},
+    }
+
+
+def pool_share_estimate(db, rentals, cfg, now=None):
+    """Budget estimate for holding cfg['pool_share_target_pct']% of
+    the pool's window presence (total_sol).
+
+    Chain: needed_sol = target x total_sol;
+    needed_its = needed_sol / sol-per-its (ours measured, pool's as
+    fallback); est_cost_hr = needed_its / fleet-measured its-per-$.
+
+    Returns None when no pool snapshot is available. Fields stay
+    honest about which inputs are measured vs fallbacks.
+    """
+    row = db.execute(
+        "SELECT source_ts, extra_json FROM pool_snapshots"
+        " ORDER BY source_ts DESC LIMIT 1").fetchone()
+    if not row:
+        return None
+    ext = json.loads(row["extra_json"] or "{}")
+    total_sol, total_its = ext.get("pool_total_sol"), \
+        ext.get("pool_total_its")
+    workers = db.execute(
+        "SELECT COALESCE(SUM(w.sol),0), COALESCE(SUM(w.its),0)"
+        " FROM pool_worker_snapshots w JOIN pool_snapshots s"
+        "   ON s.id=w.snapshot_id WHERE s.source_ts=?",
+        (row["source_ts"],)).fetchone()
+    our_sol, our_its = workers[0] or 0.0, workers[1] or 0.0
+
+    # measured sol per its; fall back to the pool-wide ratio
+    if our_its > 0 and our_sol > 0:
+        sol_per_its = our_sol / our_its
+    elif total_its:
+        sol_per_its = (total_sol or 0) / total_its
+    else:
+        sol_per_its = None
+
+    # fleet-measured its per $/hr across share-proven stints;
+    # candidates' est_its/price is the fallback, a bare None last
+    effs = [r["its_total"] / float(r["hourly_usd"])
+            for r in rentals
+            if r.get("its_total") and float(r["hourly_usd"] or 0) > 0
+            and sum(c for _, c in r.get("share_arrivals", [])) > 0]
+    eff = _median(effs)
+
+    target_pct = float(cfg.get("pool_share_target_pct") or 0)
+    needed_sol = (target_pct / 100.0) * total_sol \
+        if total_sol else None
+    needed_its = (needed_sol / sol_per_its
+                  if needed_sol is not None and sol_per_its else None)
+    est_cost_hr = (needed_its / eff
+                   if needed_its is not None and eff else None)
+
+    epoch_h_left = None
+    prog = ext.get("epoch_progress")
+    if isinstance(prog, str) and prog.endswith("%"):
+        try:
+            epoch_h_left = max(
+                0.0, (1.0 - float(prog[:-1]) / 100.0) * 168.0)
+        except ValueError:
+            pass
+
+    return {
+        "target_pct": target_pct,
+        "share_now_pct": (100.0 * our_sol / total_sol
+                          if total_sol else None),
+        "our_sol": our_sol, "our_its": our_its,
+        "total_sol": total_sol, "total_its": total_its,
+        "pool_miners": ext.get("pool_miners"),
+        "sol_per_its": sol_per_its,
+        "eff_its_per_usd": eff,
+        "eff_n": len(effs),
+        "needed_sol": needed_sol, "needed_its": needed_its,
+        "est_cost_hr": est_cost_hr,
+        "est_cost_day": (est_cost_hr * 24 if est_cost_hr else None),
+        "est_cost_epoch": (est_cost_hr * epoch_h_left
+                           if est_cost_hr and epoch_h_left else None),
+        "epoch_h_left": epoch_h_left,
+        "snapshot_ts": row["source_ts"],
+        "snapshot_age_s": ((now - _dt(row["source_ts"])).total_seconds()
+                           if now else None),
     }
 
 
@@ -2377,6 +2467,7 @@ def build_state(db, phase, now, cfg, apply_endings=True, say=print):
                            if snapshot_at else None),
         "pending_attempts": bool(fleet_store.pending_attempts(db)),
         "stats": stats,
+        "pool_share": pool_share_estimate(db, rentals, cfg, now),
         "value_model": vm,
         # tried only counts rentals placed after the latest
         # tried_reset event -- a manual reset re-opens the upgrade
@@ -5312,6 +5403,7 @@ def summary(db, now, db_path=None):
         "offering_dead": bool(
             (state.get("agent") or {}).get("tree_id")
             in state["dead_trees"]),
+        "pool_share": state.get("pool_share"),
         "runner_alive": alive}
 
 

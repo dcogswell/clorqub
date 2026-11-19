@@ -58,6 +58,11 @@ def make_doc(ts_min=0, epoch=240, shares=1000, counted=800,
         "PPLNSPOOL": {
             "metadata": {"timestamp": _ts(ts_min)[:19]},  # naive ISO
             "miners": miners,
+            "summary": {
+                "total_sol": 278340.0, "total_its": 56156.0,
+                "total_miners": 2526, "epoch_progress": "16.8%",
+                "average_sol": 110.19, "average_its": 22.23,
+            },
         },
         "SOLOPOOL": {"miners": [
             {"alias": "solo-rig", "wallet": PREFIX + ".solo",
@@ -131,6 +136,10 @@ class ExtractTests(unittest.TestCase):
         self.assertAlmostEqual(ext["solo"]["est_gains_usd"], 0.06)
         self.assertEqual(ext["solo_workers"],
                          [{"alias": "solo-rig", "sol": 33.0}])
+        self.assertAlmostEqual(ext["pool_total_sol"], 278340.0)
+        self.assertAlmostEqual(ext["pool_total_its"], 56156.0)
+        self.assertEqual(ext["pool_miners"], 2526)
+        self.assertEqual(ext["epoch_progress"], "16.8%")
 
     def test_absent_wallet(self):
         ext = pool_stats.extract(make_doc(), "MISSINGWALLET")
@@ -167,6 +176,10 @@ class RecordTests(unittest.TestCase):
         self.assertEqual(extra["solo_counted"], 42)
         self.assertEqual(extra["solo_workers"],
                          [{"alias": "solo-rig", "sol": 33.0}])
+        self.assertEqual(extra["pool_total_sol"], 278340.0)
+        self.assertEqual(extra["pool_total_its"], 56156.0)
+        self.assertEqual(extra["pool_miners"], 2526)
+        self.assertEqual(extra["epoch_progress"], "16.8%")
         self.assertNotIn(WALLET, json.dumps(extra))
         self.assertNotIn(PREFIX, json.dumps(extra))
 

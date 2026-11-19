@@ -1,8 +1,9 @@
-import { useMemo, useState, type ReactNode } from 'react'
+import { useEffect, useMemo, useState, type ReactNode } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import type { ColDef } from 'ag-grid-community'
 import { api } from '../api'
-import type { Candidate, ExpEvent, ExpRental, GpuStat, Verdict } from '../api'
+import type { Candidate, ExpEvent, ExpRental, GpuStat,
+  PoolShareEstimate, Verdict } from '../api'
 import { Badge, Grid, Panel, Stat, pinColumn } from '../components/ui'
 import { ago, dt, num, usd } from '../lib/format'
 
@@ -478,6 +479,83 @@ function GrowthAlert({ evs }: { evs: ExpEvent[] | undefined }) {
 type ExpTab = 'rentals' | 'verdicts' | 'candidates' | 'priors' | 'events'
 const EXP_TABS: ExpTab[] = ['rentals', 'verdicts', 'candidates', 'priors', 'events']
 
+function PoolSharePanel({ ps, cfgPct }: {
+  ps: PoolShareEstimate | null | undefined
+  cfgPct: number | null | undefined
+}) {
+  const qc = useQueryClient()
+  const [val, setVal] = useState('')
+  const [msg, setMsg] = useState('')
+  const [busy, setBusy] = useState(false)
+  useEffect(() => {
+    if (cfgPct != null) setVal(String(cfgPct))
+  }, [cfgPct])
+  const save = () => {
+    const n = val.trim() === '' ? 0 : Number(val)
+    if (!Number.isFinite(n) || n < 0 || n > 100) {
+      setMsg('target must be 0–100')
+      return
+    }
+    setBusy(true)
+    setMsg('')
+    api.updateConfig({ pool_share_target_pct: n }).then(() => {
+      setMsg('saved')
+      qc.invalidateQueries({ queryKey: ['config'] })
+      qc.invalidateQueries({ queryKey: ['experiment'] })
+    }).catch((e) => setMsg(String(e.message ?? e)))
+      .finally(() => setBusy(false))
+  }
+  const usdOr = (v: number | null | undefined, p = 2) =>
+    v == null ? '—' : usd(v, p)
+  return (
+    <Panel title="pool share target">
+      <div className="flex flex-wrap items-end gap-x-6 gap-y-2 text-sm">
+        <label className="text-xs text-gray-500">
+          target %
+          <input
+            className="ml-1 w-16 rounded border border-gray-700
+              bg-gray-900 px-1.5 py-0.5 text-right text-gray-200"
+            value={val} inputMode="decimal" disabled={busy}
+            onChange={(e) => setVal(e.target.value)}
+            onBlur={() => { if (val !== String(cfgPct ?? '')) save() }}
+            onKeyDown={(e) => { if (e.key === 'Enter') save() }} />
+        </label>
+        <div>
+          <span className="text-gray-500">now </span>
+          {ps?.share_now_pct != null
+            ? `${num(ps.share_now_pct, 2)}%` : '—'}
+          <span className="text-gray-500">
+            {` (${num(ps?.our_sol ?? 0, 0)} sol / ${num(ps?.total_sol ?? 0, 0)})`}
+          </span>
+        </div>
+        <div>
+          <span className="text-gray-500">needs </span>
+          {ps?.needed_its != null
+            ? `${num(ps.needed_its, 0)} it/s (${num(ps.needed_sol ?? 0, 0)} sol)`
+            : '—'}
+        </div>
+        <div>
+          <span className="text-gray-500">est </span>
+          {`${usdOr(ps?.est_cost_hr)}/hr · ${usdOr(ps?.est_cost_day)}/day · `}
+          {ps?.epoch_h_left != null
+            ? `${usdOr(ps.est_cost_epoch)} over ${num(ps.epoch_h_left, 0)}h left`
+            : '—'}
+        </div>
+        {msg && <span className="text-teal-400">{msg}</span>}
+      </div>
+      <div className="mt-1 text-[10px] text-gray-600">
+        eff basis: {ps?.eff_its_per_usd != null
+          ? `${num(ps.eff_its_per_usd, 0)} it/s per $/hr over ${ps.eff_n} proven stints`
+          : 'no proven stints yet'}
+        {` · sol/its ${ps?.sol_per_its != null ? num(ps.sol_per_its, 2) : '—'}`}
+        {` · pool snap ${ps?.snapshot_age_s != null
+          ? `${Math.round(ps.snapshot_age_s / 60)}m old` : '—'}`}
+        {' · linear projection — share presence is window-lagged (~hours), budget estimate moves with pool totals'}
+      </div>
+    </Panel>
+  )
+}
+
 export default function Experiment() {
   // one query per panel: sections load independently and share the
   // backend's cached build_state pass; events bypasses it entirely
@@ -522,6 +600,9 @@ export default function Experiment() {
         <Stat label="Phase ends" value={String(ph.ends_at ?? '—').slice(5, 16)}
           sub={`started ${String(ph.started_at ?? '—').slice(5, 16)}`} />
       </div>
+
+      <PoolSharePanel ps={d?.pool_share}
+        cfgPct={cfg.data?.pool_share_target_pct} />
 
       {(upgradeScan || d?.offering_dead ||
         (d?.pending_rerents?.length ?? 0) > 0 ||

@@ -163,9 +163,9 @@ def add_history(db, server_id, cpu="Intel Core i9-10980XE",
 
 
 def add_pool_snap(db, ts_min, epoch=240, shares=1000, counted=800,
-                  usd_per_counted=0.002, workers=None):
+                  usd_per_counted=0.002, workers=None, extra=None):
     """Insert a pool snapshot directly (ts_min = minutes ago);
-    workers: {alias: (sol, its)}."""
+    workers: {alias: (sol, its)}; extra -> extra_json."""
     cur = db.execute(
         "INSERT INTO pool_snapshots(fetched_at, source_ts, epoch,"
         " shares, solutions, counted, est_gains_usd, est_qus,"
@@ -175,7 +175,7 @@ def add_pool_snap(db, ts_min, epoch=240, shares=1000, counted=800,
          counted, (counted * usd_per_counted
                    if counted is not None and usd_per_counted is not None
                    else None), 1.0, usd_per_counted,
-         2e-6, 100.0, "{}"))
+         2e-6, 100.0, json.dumps(extra or {})))
     sid = cur.lastrowid
     for alias, (sol, its) in (workers or {}).items():
         db.execute(
@@ -6647,6 +6647,120 @@ class OperatorLeverTests(unittest.TestCase):
                 spot.bid_for(rec, NOW)["bid_usd_day"], 1.01)
         finally:
             db.close()
+
+
+class PoolShareEstimateTests(unittest.TestCase):
+    EXTRA = {"pool_total_sol": 280000.0, "pool_total_its": 56000.0,
+             "pool_miners": 2500, "epoch_progress": "50.0%"}
+
+    def _rentals(self):
+        return [
+            {"its_total": 200.0, "hourly_usd": "0.10",
+             "share_arrivals": [("t", 5)]},   # 2000 its per $/hr
+            {"its_total": 400.0, "hourly_usd": "0.10",
+             "share_arrivals": [("t", 3)]},   # 4000
+            {"its_total": 100.0, "hourly_usd": "0.05",
+             "share_arrivals": []},           # unproven, excluded
+        ]
+
+    def test_measured_path(self):
+        db = make_db()
+        try:
+            add_pool_snap(db, 10, workers={"a": (200.0, 100.0)},
+                          extra=self.EXTRA)
+            est = experiment.pool_share_estimate(
+                db, self._rentals(),
+                dict(CFG, pool_share_target_pct=1.0), now=NOW)
+            # measured sol/its = 200/100; pool ratio (5.0) unused
+            self.assertAlmostEqual(est["sol_per_its"], 2.0)
+            self.assertAlmostEqual(est["needed_sol"], 2800.0)
+            self.assertAlmostEqual(est["needed_its"], 1400.0)
+            # median(2000, 4000) = 3000 -> 1400/3000 $/hr
+            self.assertAlmostEqual(est["eff_its_per_usd"], 3000.0)
+            self.assertEqual(est["eff_n"], 2)
+            self.assertAlmostEqual(est["est_cost_hr"],
+                                   1400.0 / 3000.0)
+            self.assertAlmostEqual(est["est_cost_day"],
+                                   1400.0 / 3000.0 * 24)
+            self.assertAlmostEqual(est["epoch_h_left"], 84.0)
+            self.assertAlmostEqual(est["est_cost_epoch"],
+                                   1400.0 / 3000.0 * 84)
+            self.assertAlmostEqual(est["share_now_pct"],
+                                   100 * 200.0 / 280000.0)
+            self.assertAlmostEqual(est["our_sol"], 200.0)
+            self.assertEqual(est["pool_miners"], 2500)
+            self.assertAlmostEqual(est["snapshot_age_s"], 600.0)
+        finally:
+            db.close()
+
+    def test_off_target_zeroes_needs(self):
+        db = make_db()
+        try:
+            add_pool_snap(db, 1, workers={"a": (200.0, 100.0)},
+                          extra=self.EXTRA)
+            est = experiment.pool_share_estimate(
+                db, self._rentals(),
+                dict(CFG, pool_share_target_pct=0), now=NOW)
+            self.assertEqual(est["needed_sol"], 0.0)
+            self.assertEqual(est["needed_its"], 0.0)
+            self.assertEqual(est["est_cost_hr"], 0.0)
+            self.assertEqual(est["target_pct"], 0.0)
+            self.assertIsNotNone(est["share_now_pct"])
+        finally:
+            db.close()
+
+    def test_missing_snapshot_returns_none(self):
+        db = make_db()
+        try:
+            self.assertIsNone(experiment.pool_share_estimate(
+                db, [], CFG, now=NOW))
+        finally:
+            db.close()
+
+    def test_pool_ratio_fallback_and_unproven_eff(self):
+        db = make_db()
+        try:
+            add_pool_snap(db, 1, workers=None, extra=self.EXTRA)
+            est = experiment.pool_share_estimate(
+                db, [], dict(CFG, pool_share_target_pct=2.0), now=NOW)
+            # no workers -> pool-wide ratio 280000/56000 = 5.0
+            self.assertAlmostEqual(est["sol_per_its"], 5.0)
+            self.assertAlmostEqual(est["needed_sol"], 5600.0)
+            self.assertAlmostEqual(est["needed_its"], 1120.0)
+            # no proven stints -> costs stay unknown, needs still show
+            self.assertIsNone(est["eff_its_per_usd"])
+            self.assertIsNone(est["est_cost_hr"])
+            self.assertIsNone(est["est_cost_day"])
+            self.assertIsNone(est["est_cost_epoch"])
+            self.assertEqual(est["eff_n"], 0)
+            self.assertEqual(est["our_sol"], 0)
+        finally:
+            db.close()
+
+    def test_no_epoch_progress_means_no_epoch_cost(self):
+        db = make_db()
+        try:
+            add_pool_snap(
+                db, 1, workers={"a": (200.0, 100.0)},
+                extra=dict(self.EXTRA, epoch_progress=None))
+            est = experiment.pool_share_estimate(
+                db, self._rentals(),
+                dict(CFG, pool_share_target_pct=1.0), now=NOW)
+            self.assertIsNone(est["epoch_h_left"])
+            self.assertIsNone(est["est_cost_epoch"])
+            self.assertIsNotNone(est["est_cost_hr"])
+        finally:
+            db.close()
+
+    def test_target_pct_validated(self):
+        for bad in ("x", True, -1, 101, float("nan"), float("inf")):
+            with self.assertRaises(ValueError, msg=str(bad)):
+                experiment.validate_config(
+                    dict(CFG, pool_share_target_pct=bad))
+        for ok in (0, 0.5, 100):
+            self.assertEqual(experiment.validate_config(
+                dict(CFG, pool_share_target_pct=ok))[
+                    "pool_share_target_pct"], ok)
 
 
 if __name__ == "__main__":

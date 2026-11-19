@@ -141,12 +141,17 @@ def extract(doc, wallet):
         "last_seen": m.get("last_seen"),
     } for m in pplns.get("miners") or []
        if str(m.get("wallet") or "").split(".")[0] == prefix]
+    summary = pplns.get("summary") or {}
     return {
         "source_ts": _source_ts(doc),
         "epoch": _num(sub.get("epoch"), int) if sub else None,
         "shares": _num(sub.get("shares"), int) if sub else None,
         "solutions": _num(sub.get("solutions"), int) if sub else None,
         "counted": counted,
+        "pool_total_sol": _num(summary.get("total_sol")),
+        "pool_total_its": _num(summary.get("total_its")),
+        "pool_miners": _num(summary.get("total_miners"), int),
+        "epoch_progress": summary.get("epoch_progress"),
         "est_gains_usd": gains,
         "est_qus": _num(sub.get("estimated_qus")) if sub else None,
         "invalid_shares": (_num(sub.get("invalid_shares"), int)
@@ -206,6 +211,10 @@ def record_once(db, wallet, now=None, url=POOL_STATS_URL):
                  ext["pool_sol_per_hour"],
                  json.dumps({"trainers": ext["trainers"],
                              "pplns_total_its": ext["pplns_total_its"],
+                             "pool_total_sol": ext["pool_total_sol"],
+                             "pool_total_its": ext["pool_total_its"],
+                             "pool_miners": ext["pool_miners"],
+                             "epoch_progress": ext["epoch_progress"],
                              "invalid_shares": ext["invalid_shares"],
                              "obsolete_shares":
                                  ext["obsolete_shares"],

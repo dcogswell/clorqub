@@ -227,6 +227,27 @@ export interface Experiment {
   candidate_term_hours: number | null
 }
 
+export interface PoolShareEstimate {
+  target_pct: number
+  share_now_pct: number | null
+  our_sol: number
+  our_its: number
+  total_sol: number | null
+  total_its: number | null
+  pool_miners: number | null
+  sol_per_its: number | null
+  eff_its_per_usd: number | null
+  eff_n: number
+  needed_sol: number | null
+  needed_its: number | null
+  est_cost_hr: number | null
+  est_cost_day: number | null
+  est_cost_epoch: number | null
+  epoch_h_left: number | null
+  snapshot_ts: string
+  snapshot_age_s: number | null
+}
+
 export interface ExperimentStatus {
   runner_alive: boolean | null
   phase: Record<string, unknown> | null
@@ -238,6 +259,7 @@ export interface ExperimentStatus {
   offering_dead?: boolean
   dead_trees?: string[]
   tree_lifetime_min?: number | null
+  pool_share?: PoolShareEstimate | null
 }
 
 export interface PoolPoint {
@@ -302,6 +324,7 @@ export interface ExpConfig {
   spot_probe_mode: string | null
   spot_slot_mode: string | null
   spot_bid_premium: number | null
+  pool_share_target_pct: number | null
   score_help?: Record<string, string>
   strategies?: string[]
 }
@@ -331,6 +354,7 @@ export interface ConfigUpdate {
   spot_probe_mode?: string
   spot_slot_mode?: string
   spot_bid_premium?: number
+  pool_share_target_pct?: number
   strategy?: string
 }
 
