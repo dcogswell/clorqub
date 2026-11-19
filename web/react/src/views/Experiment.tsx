@@ -229,6 +229,7 @@ function CandidatesPanel() {
     () => new Set((pins.data?.pins ?? []).map((p) => p.server_id)),
     [pins.data])
   const [rentedOnly, setRentedOnly] = useState(false)
+  const [hideDead, setHideDead] = useState(true)
   const cols = useMemo<ColDef<Candidate>[]>(() => [
     pinColumn<Candidate>(pinSet, (sid, on) =>
       api.setProbePin(sid, on)
@@ -236,13 +237,23 @@ function CandidatesPanel() {
     ...CAND_COLS], [pinSet, qc])
   const rows = useMemo(
     () => (cands.data?.candidate_values ?? [])
+      // 'next phase' rows are tried-terminal this phase -- except a
+      // live rental (judging now) or a ★ pin (forces an audition)
+      .filter((c) => !hideDead || c.upgrade_status !== 'tried'
+        || c.tried_active || pinSet.has(c.server_id))
       .filter((c) => !rentedOnly || c.meas_rentals > 0),
-    [cands.data, rentedOnly])
+    [cands.data, rentedOnly, hideDead, pinSet])
   const unlistedPins = pinSet.size
     - rows.reduce((n, r) => n + (pinSet.has(r.server_id) ? 1 : 0), 0)
   return (
     <Panel title={`Candidates (${rows.length})`}
       right={<span className="text-[11px] text-gray-500">
+        <label className="mr-2 inline-flex cursor-pointer items-center gap-1">
+          <input type="checkbox" checked={hideDead}
+            onChange={(e) => setHideDead(e.target.checked)}
+            className="accent-teal-400" />
+          hide 'next phase'
+        </label>
         <label className="mr-2 inline-flex cursor-pointer items-center gap-1">
           <input type="checkbox" checked={rentedOnly}
             onChange={(e) => setRentedOnly(e.target.checked)}
