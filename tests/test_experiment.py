@@ -6670,7 +6670,8 @@ class PoolShareEstimateTests(unittest.TestCase):
                           extra=self.EXTRA)
             est = experiment.pool_share_estimate(
                 db, self._rentals(),
-                dict(CFG, pool_share_target_pct=1.0), now=NOW)
+                dict(CFG, pool_share_enabled=True,
+                     pool_share_target_pct=1.0), now=NOW)
             # measured sol/its = 200/100; pool ratio (5.0) unused
             self.assertAlmostEqual(est["sol_per_its"], 2.0)
             self.assertAlmostEqual(est["needed_sol"], 2800.0)
@@ -6700,7 +6701,8 @@ class PoolShareEstimateTests(unittest.TestCase):
                           extra=self.EXTRA)
             est = experiment.pool_share_estimate(
                 db, self._rentals(),
-                dict(CFG, pool_share_target_pct=0), now=NOW)
+                dict(CFG, pool_share_enabled=True,
+                     pool_share_target_pct=0), now=NOW)
             self.assertEqual(est["needed_sol"], 0.0)
             self.assertEqual(est["needed_its"], 0.0)
             self.assertEqual(est["est_cost_hr"], 0.0)
@@ -6722,7 +6724,8 @@ class PoolShareEstimateTests(unittest.TestCase):
         try:
             add_pool_snap(db, 1, workers=None, extra=self.EXTRA)
             est = experiment.pool_share_estimate(
-                db, [], dict(CFG, pool_share_target_pct=2.0), now=NOW)
+                db, [], dict(CFG, pool_share_enabled=True,
+                     pool_share_target_pct=2.0), now=NOW)
             # no workers -> pool-wide ratio 280000/56000 = 5.0
             self.assertAlmostEqual(est["sol_per_its"], 5.0)
             self.assertAlmostEqual(est["needed_sol"], 5600.0)
@@ -6745,12 +6748,43 @@ class PoolShareEstimateTests(unittest.TestCase):
                 extra=dict(self.EXTRA, epoch_progress=None))
             est = experiment.pool_share_estimate(
                 db, self._rentals(),
-                dict(CFG, pool_share_target_pct=1.0), now=NOW)
+                dict(CFG, pool_share_enabled=True,
+                     pool_share_target_pct=1.0), now=NOW)
             self.assertIsNone(est["epoch_h_left"])
             self.assertIsNone(est["est_cost_epoch"])
             self.assertIsNotNone(est["est_cost_hr"])
         finally:
             db.close()
+
+    def test_disabled_yields_no_objective(self):
+        db = make_db()
+        try:
+            add_pool_snap(db, 1, workers={"a": (200.0, 100.0)},
+                          extra=self.EXTRA)
+            est = experiment.pool_share_estimate(
+                db, self._rentals(),
+                dict(CFG, pool_share_enabled=False,
+                     pool_share_target_pct=1.0), now=NOW)
+            self.assertFalse(est["enabled"])
+            self.assertEqual(est["target_pct"], 1.0)
+            for k in ("needed_sol", "needed_its", "est_cost_hr",
+                      "est_cost_day", "est_cost_epoch"):
+                self.assertIsNone(est[k], k)
+            # measurements still report -- only the objective hides
+            self.assertIsNotNone(est["share_now_pct"])
+            self.assertIsNotNone(est["sol_per_its"])
+        finally:
+            db.close()
+
+    def test_enabled_flag_validated(self):
+        for bad in ("x", 1, 0.0, None):
+            with self.assertRaises(ValueError, msg=str(bad)):
+                experiment.validate_config(
+                    dict(CFG, pool_share_enabled=bad))
+        for ok in (True, False):
+            self.assertIs(experiment.validate_config(
+                dict(CFG, pool_share_enabled=ok))[
+                    "pool_share_enabled"], ok)
 
     def test_target_pct_validated(self):
         for bad in ("x", True, -1, 101, float("nan"), float("inf")):

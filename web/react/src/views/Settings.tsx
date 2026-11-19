@@ -57,9 +57,16 @@ const SPOT_FLOAT_FIELDS = [
   ['spot_bid_premium', 'spot bid premium'],
 ] as const
 
+// inert while pool_share_enabled is unchecked -- display-only
+// estimator input today; the Experiment tab prices holding it
+const SHARE_FIELDS = [
+  ['pool_share_target_pct', 'target % of pool'],
+] as const
+
 const TEXT_FIELDS = [
   ...GATE_FIELDS, ...INT_FIELDS, ...FLEET_FLOAT_FIELDS,
   ...TIMING_FIELDS, ...LAMBDA_FIELDS, ...SPOT_FLOAT_FIELDS,
+  ...SHARE_FIELDS,
 ]
 const INT_KEYS: Set<string> =
   new Set([...INT_FIELDS, ...TIMING_FIELDS].map(([k]) => k))
@@ -212,6 +219,7 @@ export default function Settings() {
   const [slotMode, setSlotMode] = useState('static')
   const [shrinkMode, setShrinkMode] = useState('passive')
   const [spotOn, setSpotOn] = useState(false)
+  const [shareOn, setShareOn] = useState(false)
   const [spotModes, setSpotModes] = useState<Record<string, string>>({})
   const [msg, setMsg] = useState('')
   const [busy, setBusy] = useState(false)
@@ -227,6 +235,7 @@ export default function Settings() {
     setSlotMode(c.slot_mode || 'static')
     setShrinkMode(c.shrink_mode || 'passive')
     setSpotOn(Boolean(c.spot_enabled))
+    setShareOn(Boolean(c.pool_share_enabled))
     setSpotModes(Object.fromEntries(SPOT_SELECTS.map(([k]) => [k, c[k] || 'auto'])))
   }, [cfg.data])
 
@@ -234,13 +243,14 @@ export default function Settings() {
     const body: Record<string, unknown> = {
       score, loss_mining: loss, paused, probes_enabled: probes,
       slot_mode: slotMode, shrink_mode: shrinkMode,
-      spot_enabled: spotOn,
+      spot_enabled: spotOn, pool_share_enabled: shareOn,
     }
     for (const [k] of TEXT_FIELDS) {
       if (loss && LM_FIELDS.some(([g]) => g === k)) continue
       if (slotMode === 'static'
           && (k === 'slot_min' || k === 'growth_margin')) continue
       if (!spotOn && SPOT_FLOAT_FIELDS.some(([g]) => g === k)) continue
+      if (!shareOn && SHARE_FIELDS.some(([g]) => g === k)) continue
       const raw = (gates[k] ?? '').trim()
       if (raw === '') continue
       if (k === 'max_price_hr') {
@@ -352,6 +362,14 @@ export default function Settings() {
           </label>
         ))}
         {SPOT_FLOAT_FIELDS.map(([k, lbl]) => field([k, lbl] as const, !spotOn))}
+        <span className={SECTION_CLS}>pool share</span>
+        <label className="flex items-center gap-2 pb-1.5 text-sm"
+          title="declares a pool-window share objective -- the Experiment tab shows the live budget estimate (estimator only, no spending)">
+          <input type="checkbox" checked={shareOn}
+            onChange={(e) => setShareOn(e.target.checked)} className="accent-teal-400" />
+          pool_share_enabled
+        </label>
+        {SHARE_FIELDS.map(([k, lbl]) => field([k, lbl] as const, !shareOn))}
         <button onClick={save} disabled={busy}
           className="rounded bg-teal-600 px-3 py-1.5 text-sm font-semibold text-white disabled:opacity-50">
           {busy ? 'saving…' : 'Save'}

@@ -202,6 +202,7 @@ DEFAULT_CONFIG = {
     # Not a controller yet -- the Experiment tab shows the estimated
     # budget to hold the share from live pool telemetry, and the
     # operator tunes the target against that estimate.
+    "pool_share_enabled": False,
     "pool_share_target_pct": 0.0,
     # Poisson kill evidence: dry/low-yield verdicts wait for
     # kill_lambda expected shares to have elapsed -- P(0 observed |
@@ -512,6 +513,8 @@ def validate_config(cfg):
         re.compile(cfg["cpu_blocklist_re"] or "")
     except re.error as exc:
         raise ValueError(f"cpu_blocklist_re: {exc}") from None
+    if not isinstance(cfg["pool_share_enabled"], bool):
+        raise ValueError("pool_share_enabled must be a boolean")
     if not isinstance(cfg["pool_share_target_pct"], (int, float)) \
             or isinstance(cfg["pool_share_target_pct"], bool) \
             or not 0 <= cfg["pool_share_target_pct"] <= 100:
@@ -1462,9 +1465,10 @@ def pool_share_estimate(db, rentals, cfg, now=None):
             and sum(c for _, c in r.get("share_arrivals", [])) > 0]
     eff = _median(effs)
 
+    enabled = bool(cfg.get("pool_share_enabled"))
     target_pct = float(cfg.get("pool_share_target_pct") or 0)
     needed_sol = (target_pct / 100.0) * total_sol \
-        if total_sol else None
+        if enabled and total_sol else None
     needed_its = (needed_sol / sol_per_its
                   if needed_sol is not None and sol_per_its else None)
     est_cost_hr = (needed_its / eff
@@ -1480,6 +1484,7 @@ def pool_share_estimate(db, rentals, cfg, now=None):
             pass
 
     return {
+        "enabled": enabled,
         "target_pct": target_pct,
         "share_now_pct": (100.0 * our_sol / total_sol
                           if total_sol else None),

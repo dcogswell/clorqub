@@ -305,7 +305,8 @@ _CONFIG_KEYS = ("score", "upgrade_margin", "promote_margin",
                 "startup_min", "dry_after_min",
                 "kill_lambda", "kill_lambda_free",
                 "spot_enabled", "spot_probe_mode", "spot_slot_mode",
-                "spot_bid_premium", "pool_share_target_pct")
+                "spot_bid_premium", "pool_share_enabled",
+                "pool_share_target_pct")
 
 
 @app.get("/api/config")
@@ -348,6 +349,7 @@ class ConfigRequest(BaseModel):
     spot_probe_mode: str | None = None
     spot_slot_mode: str | None = None
     spot_bid_premium: float | None = None
+    pool_share_enabled: bool | None = None
     pool_share_target_pct: float | None = None
     strategy: str | None = None
 

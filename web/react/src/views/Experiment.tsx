@@ -528,13 +528,18 @@ function PoolSharePanel({ ps, cfgPct }: {
             {` (${num(ps?.our_sol ?? 0, 0)} sol / ${num(ps?.total_sol ?? 0, 0)})`}
           </span>
         </div>
-        <div>
+        {ps && !ps.enabled && (
+          <span className="text-xs text-amber-400">
+            share targeting off — enable in Settings › Strategy
+          </span>
+        )}
+        <div className={ps && !ps.enabled ? 'opacity-40' : ''}>
           <span className="text-gray-500">needs </span>
           {ps?.needed_its != null
             ? `${num(ps.needed_its, 0)} it/s (${num(ps.needed_sol ?? 0, 0)} sol)`
             : '—'}
         </div>
-        <div>
+        <div className={ps && !ps.enabled ? 'opacity-40' : ''}>
           <span className="text-gray-500">est </span>
           {`${usdOr(ps?.est_cost_hr)}/hr · ${usdOr(ps?.est_cost_day)}/day · `}
           {ps?.epoch_h_left != null

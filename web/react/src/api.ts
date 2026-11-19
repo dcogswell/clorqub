@@ -228,6 +228,7 @@ export interface Experiment {
 }
 
 export interface PoolShareEstimate {
+  enabled: boolean
   target_pct: number
   share_now_pct: number | null
   our_sol: number
@@ -324,6 +325,7 @@ export interface ExpConfig {
   spot_probe_mode: string | null
   spot_slot_mode: string | null
   spot_bid_premium: number | null
+  pool_share_enabled: boolean | null
   pool_share_target_pct: number | null
   score_help?: Record<string, string>
   strategies?: string[]
@@ -354,6 +356,7 @@ export interface ConfigUpdate {
   spot_probe_mode?: string
   spot_slot_mode?: string
   spot_bid_premium?: number
+  pool_share_enabled?: boolean
   pool_share_target_pct?: number
   strategy?: string
 }
