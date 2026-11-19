@@ -3,7 +3,6 @@ import type { ComponentType } from 'react'
 import { useState } from 'react'
 import { api } from './api'
 import { ago } from './lib/format'
-import Candidates from './views/Candidates'
 import Experiment from './views/Experiment'
 import Fleet from './views/Fleet'
 import Marketplace from './views/Marketplace'
@@ -14,7 +13,6 @@ import Settings from './views/Settings'
 
 const TABS = [
   { id: 'overview', label: 'Overview' },
-  { id: 'candidates', label: 'Candidates' },
   { id: 'marketplace', label: 'Marketplace' },
   { id: 'fleet', label: 'Fleet' },
   { id: 'orders', label: 'Orders' },
@@ -27,7 +25,6 @@ type TabId = (typeof TABS)[number]['id']
 
 const VIEWS: Record<TabId, ComponentType> = {
   overview: Overview,
-  candidates: Candidates,
   marketplace: Marketplace,
   fleet: Fleet,
   orders: Orders,
