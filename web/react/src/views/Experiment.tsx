@@ -108,7 +108,10 @@ const CAND_COLS: ColDef<Candidate>[] = [
       }
       if (d.upgrade_status === 'tried') {
         return (
-          <span className="text-gray-500" title="a ★ pin re-opens it sooner">next phase</span>
+          <span className="text-gray-500"
+            title="already rented this phase — excluded from upgrade auditions (still rentable via fills/rerents); a ★ pin or next phase re-opens it">
+            next phase
+          </span>
         )
       }
       if (d.upgrade_status === 'ok' || d.upgrade_status === 'retryable') {
