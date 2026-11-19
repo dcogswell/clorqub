@@ -5481,6 +5481,26 @@ def summary(db, now, db_path=None):
              if c["prior"] is not None), None)
         cand_floor = (cand_best_prior * cfg["min_value_ratio"]
                       if cand_best_prior is not None else None)
+        # per-server latest phase rental: the "why" behind a tried
+        # mark -- outcome of its last audition/rental and when.
+        # Respects tried_reset like tried_servers does.
+        tried_reset_at = db.execute(
+            "SELECT MAX(ts) FROM experiment_events WHERE phase_id=?"
+            " AND kind='tried_reset'", (phase["phase_id"],)
+        ).fetchone()[0]
+        tried_detail = {}
+        for r in db.execute(
+                "SELECT server_id, role, end_reason, created_at,"
+                " ended_at FROM experiment_rentals WHERE phase_id=?"
+                " AND created_at>=? ORDER BY created_at DESC",
+                (phase["phase_id"], tried_reset_at or "1970-01-01")):
+            if r["server_id"] in tried_detail:
+                continue
+            tried_detail[r["server_id"]] = {
+                "reason": r["end_reason"],
+                "at": r["ended_at"] or r["created_at"],
+                "active": r["ended_at"] is None,
+                "role": r["role"]}
         candidate_values = []
         for c in cand_rows:
             if c["prior"] is None:
@@ -5501,6 +5521,7 @@ def summary(db, now, db_path=None):
                 status = "value ok"
             sp = (state["stats"].get("server_prior") or {}).get(
                 c["server_id"]) or {}
+            td = tried_detail.get(c["server_id"])
             th_its, th_x, th_c = (
                 est_its(state["stats"], c["server_id"], c["cpu"],
                         c["gpu"], gpu_count=c.get("gpu_count") or 1,
@@ -5553,7 +5574,11 @@ def summary(db, now, db_path=None):
                         c["server_id"])) is not None
                     else "tried"
                     if c["server_id"] in state["tried_servers"]
-                    else "ok")})
+                    else "ok"),
+                "tried_reason": td["reason"] if td else None,
+                "tried_at": td["at"] if td else None,
+                "tried_active": bool(td and td["active"]),
+                "tried_role": td["role"] if td else None})
     return {
         "phase": {
             "phase_id": phase["phase_id"],

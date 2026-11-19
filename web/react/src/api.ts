@@ -85,6 +85,10 @@ export interface Candidate {
   hourly: number | null
   fill_status: string | null
   upgrade_status: string | null
+  tried_reason: string | null
+  tried_at: string | null
+  tried_active: boolean
+  tried_role: string | null
   mode?: string | null
   od_hourly?: number | null
   spot_hourly?: number | null

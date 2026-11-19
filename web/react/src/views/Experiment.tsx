@@ -71,6 +71,30 @@ const CAND_COLS: ColDef<Candidate>[] = [
     cellRenderer: (p: { value: string | null }) =>
       p.value === 'tried' ? <span className="text-amber-400/80">{p.value}</span> : p.value,
   },
+  {
+    field: 'tried_reason', headerName: 'last trial', width: 165,
+    cellRenderer: (p: { value: string | null; data?: Candidate }) => {
+      const d = p.data
+      if (!d || (d.tried_reason == null && !d.tried_active)) return ''
+      const bad = /fault|unreachable|dead_tree|low_yield/.test(d.tried_reason ?? '')
+      const tip = d.tried_active
+        ? 'rental active now'
+        : d.upgrade_status === 'tried'
+          ? 'excluded from upgrade scans this phase — a ★ pin or next phase re-opens it'
+          : d.upgrade_status === 'retryable'
+            ? 'cleared for re-audition now'
+            : (d.upgrade_status ?? '').startsWith('cd ')
+              ? `cooldown — eligible in ~${(d.upgrade_status ?? '').slice(3)}`
+              : undefined
+      return (
+        <span title={tip} className={bad ? 'text-red-400/80' : 'text-gray-400'}>
+          {d.tried_active
+            ? `${d.tried_role ?? 'rental'} live ${ago(d.tried_at)}`
+            : `${d.tried_reason} · ${ago(d.tried_at)}`}
+        </span>
+      )
+    },
+  },
 ]
 
 const RENTAL_COLS: ColDef<ExpRental>[] = [
