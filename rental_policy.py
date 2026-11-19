@@ -7,7 +7,7 @@ from decimal import Decimal, InvalidOperation, ROUND_CEILING
 
 from market import DEFAULT_COUNTRY_BLOCKLIST, available, cuda_version
 
-BOOTSTRAP_COMMIT = "eb3af58a857cb1906b50515a49692161a34cef7f"
+BOOTSTRAP_COMMIT = "25c5128d28e155637fe6652c1726a80b22040c78"
 BOOTSTRAP_SHA256 = "01dfe899bc4341f2e0846b637f05a67c675abba9cf2e401f54b63766fcd59cd6"
 BOOTSTRAP_URL = (
     "https://raw.githubusercontent.com/dcogswell/clorqub/"
@@ -62,8 +62,17 @@ def offered_threads(specs):
     return int(parts[-1]) if parts else None
 
 
+# CPU miner threads contend with the GPU feed path for memory
+# bandwidth: measured +17% gpu it/s on an i5-10600KF after cutting
+# the default 11 mining threads to 3, while the CPU side lost ~1
+# it/s. The cap keeps a few CPU threads earning without starving
+# the card; an explicit cpu_threads order overrides it entirely.
+CPU_THREADS_CAP = 4
+
+
 def prepare_order(server, fees, *, hours, max_cost_usd, pool, public_key,
-                  alias, cpu_threads=None, auto_renew=False,
+                  alias, cpu_threads=None, cpu_threads_cap=None,
+                  auto_renew=False,
                   expected_gpu_count=1, mode="on-demand",
                   spot_bid_usd_day=None, spot_floor_usd_day=None):
     """Quote an on-demand order with an explicit whole-hour term.
@@ -149,8 +158,14 @@ def prepare_order(server, fees, *, hours, max_cost_usd, pool, public_key,
         raise ValueError(f"Quoted cost bound ${bound} exceeds your ${cap} cap")
     if cpu_threads is None:
         # stock miner convention (amountOfThreads:0 -> nproc-1): one
-        # logical CPU stays free to feed the GPU and post shares
-        cpu_threads = max(1, (offered_threads(specs) or 2) - 1)
+        # logical CPU stays free to feed the GPU and post shares.
+        # cpu_threads_cap additionally bounds the mining side --
+        # excess slow threads throttle the GPU harder than their
+        # own yield. cap <= 0 restores the uncapped convention.
+        offered = max(1, (offered_threads(specs) or 2) - 1)
+        cap = cpu_threads_cap if cpu_threads_cap is not None \
+            else CPU_THREADS_CAP
+        cpu_threads = offered if cap <= 0 else min(offered, cap)
     if isinstance(cpu_threads, bool) or not isinstance(cpu_threads, int) or not 1 <= cpu_threads <= 512:
         raise ValueError("CPU threads must be an integer from 1 to 512")
     bootstrap = (
