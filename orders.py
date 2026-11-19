@@ -3,12 +3,14 @@
 import json
 import math
 import time
+from datetime import datetime, timedelta, timezone
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 from market import utcnow
 
 REQUEST_GAP_SECONDS = 1.1
+INVENTORY_MAX_AGE_SECONDS = 900
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS order_inventory (
     id INTEGER PRIMARY KEY,
@@ -68,6 +70,10 @@ def sanitize_orders(payload):
             if isinstance(raw.get("auto_renew"), bool) else None,
             "online_reported": raw.get("online") if isinstance(raw.get("online"), bool) else None,
             "spot": raw.get("spot") if isinstance(raw.get("spot"), bool) else None,
+            "status": raw.get("status")
+            if isinstance(raw.get("status"), str) else None,
+            "expired": raw.get("expired")
+            if isinstance(raw.get("expired"), bool) else None,
             "control": "observe-only",
         }
         specs = raw.get("specs") or {}
@@ -207,3 +213,66 @@ def read_inventory(db):
     if good is not None:
         result.update(orders=json.loads(good["orders_json"]), captured_at=good["captured_at"])
     return result
+
+
+def _fresh_orders(inventory, now=None):
+    """Sanitized items from the latest good inventory; None if not fresh."""
+    if not inventory.get("ok") or not inventory.get("captured_at"):
+        return None
+    try:
+        captured = datetime.fromisoformat(
+            inventory["captured_at"].replace("Z", "+00:00"))
+    except (TypeError, ValueError, AttributeError):
+        return None
+    if captured.tzinfo is None:
+        return None
+    age = ((now or datetime.now(timezone.utc)) - captured).total_seconds()
+    if not -60 <= age <= INVENTORY_MAX_AGE_SECONDS:
+        return None
+    return [item for item in inventory.get("orders") or []
+            if isinstance(item, dict)]
+
+
+def fresh_order_ids(inventory, now=None):
+    """Managed-order ids from the latest good inventory; None if not fresh."""
+    items = _fresh_orders(inventory, now)
+    if items is None:
+        return None
+    return {item["order_id"] for item in items
+            if isinstance(item.get("order_id"), int)}
+
+
+def order_paused(item):
+    """Clore positively reports a non-running state (an outbid spot
+    order stays listed while paused). Missing or unknown fields mean
+    'not paused' -- falsy keys are simply omitted from the payload."""
+    if not isinstance(item, dict):
+        return False
+    return item.get("status") == "paused" or item.get("expired") is True
+
+
+def paused_order_ids(inventory, now=None):
+    """Paused order ids from a fresh good inventory; None if not fresh."""
+    items = _fresh_orders(inventory, now)
+    if items is None:
+        return None
+    return {item["order_id"] for item in items
+            if isinstance(item.get("order_id"), int)
+            and order_paused(item)}
+
+
+def snapshot_postdates(inventory, created_at, margin_seconds=60):
+    """True when a good inventory was captured at least margin_seconds
+    after the order's creation -- only then does an order's absence
+    from it prove the order ended. A snapshot predating creation (or
+    one Clore hasn't listed the new order in yet) proves nothing."""
+    try:
+        captured = datetime.fromisoformat(
+            inventory["captured_at"].replace("Z", "+00:00"))
+        created = datetime.fromisoformat(
+            created_at.replace("Z", "+00:00"))
+    except (TypeError, ValueError, AttributeError):
+        return False
+    if captured.tzinfo is None or created.tzinfo is None:
+        return False
+    return captured > created + timedelta(seconds=margin_seconds)

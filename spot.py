@@ -92,6 +92,35 @@ def summarize_quote(record, now=None):
     return result
 
 
+def bid_for(record, now=None, premium=1.01):
+    """The bid a fresh spot order would place, or None when the cached
+    quote is unusable (same rules as summarize_quote). The bid is the
+    USD floor, or `premium` x the top competing USD-Blockchain bid when
+    offers exist (Clore requires at least 1.01x), rounded up to the
+    cent."""
+    summary = summarize_quote(record, now)
+    floor = summary["floor_usd_day"]
+    if floor is None:
+        return None
+    offers = json.loads(record["raw_json"])["market"].get("offers") or []
+    usd = [o for o in offers if isinstance(o, dict)
+           and o.get("currency") == "USD-Blockchain"]
+    # a standing (inactive) offer is still a queued bid, and Clore
+    # requires 1% over the top bid in the currency regardless of which
+    # one currently holds the server; only our own offer is not
+    # competition
+    competing = [float(o["bid"]) for o in usd
+                 if o.get("my") is not True
+                 and not isinstance(o.get("bid"), bool)
+                 and isinstance(o.get("bid"), (int, float))
+                 and math.isfinite(o["bid"]) and o["bid"] > 0]
+    top = max(competing) if competing else None
+    bid = floor if top is None else max(floor, top * premium)
+    bid = math.ceil(round(bid * 100, 9)) / 100
+    return {"floor_usd_day": floor, "top_bid_usd_day": top,
+            "offers": len(usd), "bid_usd_day": bid}
+
+
 def fetch_quote(api_key, server_id):
     request = Request(
         f"https://api.clore.ai/v1/spot_marketplace?market={int(server_id)}",
@@ -119,8 +148,15 @@ def refresh_quotes(db, servers, api_key, limit, stop_event=None):
     candidates.sort(
         key=lambda row: previous.get(row["server_id"], {}).get("captured_at", "")
     )
+    return _fetch_quotes_for(
+        db, (row["server_id"] for row in candidates[:limit]),
+        api_key, stop_event)
+
+
+def _fetch_quotes_for(db, server_ids, api_key, stop_event=None):
+    """One spaced request per server id; record every attempt."""
     attempts = 0
-    for row in candidates[:limit]:
+    for server_id in server_ids:
         if stop_event is not None:
             if stop_event.wait(REQUEST_GAP_SECONDS):
                 break
@@ -128,7 +164,7 @@ def refresh_quotes(db, servers, api_key, limit, stop_event=None):
             time.sleep(REQUEST_GAP_SECONDS)
         payload, error, abort = None, None, False
         try:
-            payload = fetch_quote(api_key, row["server_id"])
+            payload = fetch_quote(api_key, server_id)
             abort = not isinstance(payload, dict) or payload.get("code") != 0
         except HTTPError as exc:
             error = f"HTTP {exc.code}"
@@ -140,10 +176,18 @@ def refresh_quotes(db, servers, api_key, limit, stop_event=None):
             db.execute(
                 "INSERT INTO spot_quotes(server_id, captured_at, raw_json, error_kind) "
                 "VALUES (?, ?, ?, ?)",
-                (row["server_id"], utcnow(),
+                (int(server_id), utcnow(),
                  json.dumps(payload, sort_keys=True) if payload is not None else None, error),
             )
         attempts += 1
         if abort:
             break
     return attempts
+
+
+def refresh_quotes_for(db, server_ids, api_key, stop_event=None):
+    """Targeted spot-market refresh for an explicit server list (e.g.
+    the active spot rentals); same spacing as refresh_quotes."""
+    db.executescript(SCHEMA)
+    return _fetch_quotes_for(db, list(dict.fromkeys(
+        int(sid) for sid in server_ids)), api_key, stop_event)

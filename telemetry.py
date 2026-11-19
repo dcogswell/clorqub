@@ -5,32 +5,35 @@ import argparse
 import os
 import sqlite3
 import threading
-from datetime import datetime, timezone
+from datetime import datetime
 
 import fleet_store
 import rig_logs
 import rig_ssh
 from market import connect_db
-from orders import read_inventory
-from telemetry_policy import POLL_SECONDS, sanitize_status, timestamp
+from orders import (
+    fresh_order_ids,
+    paused_order_ids,
+    read_inventory,
+    snapshot_postdates,
+)
+from telemetry_policy import POLL_SECONDS, sanitize_status
 
 DEFAULT_DB = "~/.local/share/clorqub/clorqub.sqlite3"
-INVENTORY_MAX_AGE_SECONDS = 900
 
 
-def _fresh_order_ids(inventory):
-    """Managed-order ids from the latest good inventory; None if not fresh."""
-    if not inventory.get("ok") or not inventory.get("captured_at"):
-        return None
+def _deadline_passed(row, inventory):
+    """True when the freshest inventory was captured after the order's
+    deadline -- the moment an absent observe-only order is provably
+    ended rather than pausable. Unparseable dates prove nothing."""
     try:
-        captured = timestamp(inventory["captured_at"])
-    except (TypeError, ValueError):
-        return None
-    age = (datetime.now(timezone.utc) - captured).total_seconds()
-    if not -60 <= age <= INVENTORY_MAX_AGE_SECONDS:
-        return None
-    return {item["order_id"] for item in inventory.get("orders") or []
-            if isinstance(item.get("order_id"), int)}
+        captured = datetime.fromisoformat(
+            inventory["captured_at"].replace("Z", "+00:00"))
+        deadline = datetime.fromisoformat(
+            (row["deadline_at"] or "").replace("Z", "+00:00"))
+    except (TypeError, ValueError, AttributeError):
+        return False
+    return deadline.tzinfo is not None and deadline <= captured
 
 
 def _archive_log(db, row, pool):
@@ -59,11 +62,16 @@ def collect_once(db_path, stop_event=None):
     db = connect_db(os.path.expanduser(db_path))
     try:
         fleet_store.initialize(db)
-        live = _fresh_order_ids(read_inventory(db))
+        inventory = read_inventory(db)
+        live = fresh_order_ids(inventory)
+        # a paused order (outbid spot) has no rig to poll; SSH'ing it
+        # only manufactures unreachable evidence
+        paused = paused_order_ids(inventory) or set()
         for row in fleet_store.read_fleet(db):
             if stop_event is not None and stop_event.is_set():
                 break
             if row["provision_state"] in ("cancelled", "missing") \
+                    or row["order_id"] in paused \
                     or not row["ssh_host"] or not row["ssh_port"]:
                 continue
             try:
@@ -76,10 +84,18 @@ def collect_once(db_path, stop_event=None):
                 # Never retain transport stderr, raw remote JSON or exception text.
                 fleet_store.append_observation(db, row["order_id"], None, type(exc).__name__)
                 # Order gone from a fresh good inventory + SSH failing:
-                # stop polling user-cancelled rigs.
+                # stop polling user-cancelled rigs. The snapshot must
+                # postdate the order's creation -- a still-provisioning
+                # order is absent from any inventory taken before it
+                # existed, and that proves nothing. An observe-only
+                # enrollment also needs its deadline past: until then an
+                # absent order could still reactivate (paused spot bid),
+                # afterwards it provably ended.
                 if isinstance(exc, rig_ssh.SSHError) and live is not None \
                         and row["order_id"] not in live \
-                        and row["provision_state"] != "observe-only":
+                        and snapshot_postdates(inventory, row["created_at"]) \
+                        and (row["provision_state"] != "observe-only"
+                             or _deadline_passed(row, inventory)):
                     fleet_store.set_state(db, row["order_id"], "missing")
                 continue
             try:

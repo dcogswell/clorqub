@@ -85,10 +85,16 @@ class TestMarketplaceScoring(unittest.TestCase):
         )
         multi = listing()
         multi["gpu_array"] = ["RTX 3070", "RTX 3070"]
-        self.assertEqual(
-            market.score_listing(multi)["ineligible_reason"],
-            "not a single-GPU listing",
-        )
+        row = market.score_listing(multi)
+        self.assertIsNone(row["ineligible_reason"])
+        self.assertEqual(row["gpu_count"], 2)
+        for bad in (["RTX 3070", "RTX 3080"],
+                    ["RTX 3070", "RTX 3070", "RTX 3070"]):
+            multi["gpu_array"] = bad
+            self.assertEqual(
+                market.score_listing(multi)["ineligible_reason"],
+                "unsupported GPU layout",
+            )
 
     def test_spot_zero_placeholder_is_not_scored(self):
         row = market.score_listing(listing(), mode="spot")

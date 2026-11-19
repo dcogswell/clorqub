@@ -8,7 +8,7 @@ DESCRIPTION = "clorqub read-only marketplace scanner"
 
 
 def start_command(db_path, env_file, interval, spot_limit=0,
-                  tick_interval=None):
+                  tick_interval=None, spot_watch_interval=None):
     """Use the existing bounded, non-overlapping scanner; never pass secrets."""
     repo = Path(__file__).resolve().parent
     argv = [
@@ -24,4 +24,6 @@ def start_command(db_path, env_file, interval, spot_limit=0,
     ]
     if tick_interval is not None:
         argv += ["--tick-interval", str(tick_interval)]
+    if spot_watch_interval is not None:
+        argv += ["--spot-watch-interval", str(spot_watch_interval)]
     return argv

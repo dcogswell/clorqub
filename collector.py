@@ -94,6 +94,12 @@ def cmd_start(args):
             or args.tick_interval < 10):
         err("--tick-interval must be finite and >= 10 seconds")
         return 2
+    if args.spot_watch_interval is not None and (
+            not math.isfinite(args.spot_watch_interval)
+            or (args.spot_watch_interval != 0
+                and args.spot_watch_interval < 10)):
+        err("--spot-watch-interval must be finite, 0, or >= 10 seconds")
+        return 2
 
     props, error = query_unit()
     if error:
@@ -118,7 +124,8 @@ def cmd_start(args):
 
     argv = collector_service.start_command(
         db_path, env_file, interval, spot_limit=args.spot_limit,
-        tick_interval=args.tick_interval)
+        tick_interval=args.tick_interval,
+        spot_watch_interval=args.spot_watch_interval)
     try:
         cp = subprocess.run(argv, capture_output=True, text=True,
                             timeout=30)
@@ -208,6 +215,9 @@ def main(argv=None):
                     default=spot.DEFAULT_SPOT_LIMIT,
                     help="also fetch up to N spot floors per cycle "
                     f"(0..{spot.MAX_SPOT_LIMIT}, observation only)")
+    sp.add_argument("--spot-watch-interval", type=float, default=None,
+                    help="seconds between spot-rental inventory polls "
+                    "(0 disables; finite, >= 10 otherwise)")
     sub.add_parser("stop", help="stop the service")
     sub.add_parser("status", help="show unit load/active state")
     sub.add_parser("logs", help="show last 50 journal lines")

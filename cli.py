@@ -15,11 +15,12 @@ import sqlite3
 import sys
 import threading
 import urllib.error
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import scanner_watch
 import spot
 import orders
+import pool_stats
 import telemetry
 from telemetry_policy import POLL_SECONDS
 from formatting import rel_percent
@@ -162,6 +163,116 @@ def display(rows, limit, source_desc, inventory=None, orders_ok=None):
     )
 
 
+def _spot_outbid_min(db):
+    """spot_outbid_min from the open phase's validated config;
+    60 when there is no phase or it doesn't read/validate."""
+    try:
+        import experiment  # deferred: experiment imports cli
+        phase = experiment.open_phase(db)
+        if phase is None:
+            return 60
+        return experiment.validate_config(
+            json.loads(phase["config_json"]))["spot_outbid_min"]
+    except Exception:
+        return 60
+
+
+def _active_spot(db, now=None):
+    """Active spot orders worth watching: experiment rentals with
+    mode='spot' (read defensively -- the column may not exist) plus
+    recently-outbid rows still inside their resume window, falling
+    back to spot-flagged inventory orders."""
+    now = now or datetime.now(timezone.utc)
+    try:
+        rows = db.execute(
+            "SELECT order_id, server_id FROM experiment_rentals"
+            " WHERE ended_at IS NULL AND mode='spot'").fetchall()
+    except sqlite3.Error:
+        rows = []
+    try:
+        # an outbid row keeps the standing bid alive server-side:
+        # watching it is what lets a Clore resume be seen at all
+        rows += db.execute(
+            "SELECT order_id, server_id FROM experiment_rentals"
+            " WHERE end_reason='outbid' AND ended_at>=?",
+            ((now - timedelta(minutes=_spot_outbid_min(db)))
+             .isoformat(),)).fetchall()
+    except sqlite3.Error:
+        pass
+    if rows:
+        bids = {}
+        for e in db.execute(
+                "SELECT order_id, detail_json FROM experiment_events"
+                " WHERE kind='rent'"
+                " AND json_extract(detail_json, '$.mode')='spot'"
+                " ORDER BY id"):
+            detail = json.loads(e["detail_json"])
+            bids[e["order_id"]] = detail.get("spot_bid_usd_day")
+        return [{"order_id": r["order_id"], "server_id": r["server_id"],
+                 "bid_usd_day": bids.get(r["order_id"])}
+                for r in rows]
+    return [{"order_id": o["order_id"], "server_id": o["server_id"],
+             "bid_usd_day": None}
+            for o in orders.read_inventory(db).get("orders") or []
+            if o.get("spot") is True and o.get("server_id")]
+
+
+def spot_watch(db_path, env_file, stop_event, say=print):
+    """One spaced inventory + spot-market poll, only while a spot
+    rental is active (recently-outbid rows count, which is also what
+    keeps read_inventory fresh for build_state's resume detection).
+    Zero API calls otherwise."""
+    db = connect_db(db_path)
+    try:
+        active = _active_spot(db)
+        if not active:
+            return 0
+        api_key = os.environ.get("CLORE_API_KEY")
+        if not api_key:
+            try:
+                env = load_env_file(os.path.expanduser(env_file))
+            except OSError:
+                env = {}
+            api_key = env.get("CLORE_API_KEY")
+        if not api_key:
+            return 0
+        prev = {o["order_id"]: o
+                for o in orders.read_inventory(db).get("orders") or []
+                if isinstance(o, dict)}
+        orders.refresh_inventory(db, api_key, stop_event)
+        stamped = datetime.now(timezone.utc).isoformat(
+            timespec="seconds")
+        ours = {a["order_id"] for a in active}
+        for item in orders.read_inventory(db).get("orders") or []:
+            oid = item.get("order_id")
+            if oid not in ours and item.get("spot") is not True:
+                continue
+            before = prev.get(oid) or {}
+            # raw as-received values: the paused encoding is an
+            # observed unknown, so transitions double as learning
+            if (before.get("status"), before.get("expired")) != (
+                    item.get("status"), item.get("expired")):
+                say(f"{stamped} spot watch order {oid} status "
+                    f"{before.get('status')!r}/{before.get('expired')!r}"
+                    f" -> {item.get('status')!r}"
+                    f"/{item.get('expired')!r}")
+        server_ids = [a["server_id"] for a in active]
+        if spot.refresh_quotes_for(db, server_ids, api_key, stop_event):
+            quotes = spot.latest_quotes(db)
+            for a in active:
+                bid = spot.bid_for(quotes.get(a["server_id"]))
+                top = bid["top_bid_usd_day"] if bid else None
+                if top is not None \
+                        and a["bid_usd_day"] is not None \
+                        and top >= a["bid_usd_day"]:
+                    say(f"{stamped} spot watch s{a['server_id']}: "
+                        f"competing USD bid ${top}/day >= our bid "
+                        f"${a['bid_usd_day']}/day -- outbid likely")
+        return 0
+    finally:
+        db.close()
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(
         description="Scan and rank Clore listings (read-only).")
@@ -195,6 +306,11 @@ def main(argv=None):
                         help="Live mode: also fetch up to N spot floors "
                         f"per cycle (0..{spot.MAX_SPOT_LIMIT}, "
                         "observation only -- no bids placed)")
+    parser.add_argument("--spot-watch-interval", type=float,
+                        default=None,
+                        help="Watch mode: seconds between spot-rental "
+                        "inventory polls (0 disables; finite, >= 10 "
+                        "otherwise, default 60)")
     args = parser.parse_args(argv)
 
     if args.top < 1:
@@ -210,10 +326,16 @@ def main(argv=None):
         parser.error("--interval only makes sense with --watch")
     if args.tick_interval is not None and not args.watch:
         parser.error("--tick-interval only makes sense with --watch")
+    if args.spot_watch_interval is not None and not args.watch:
+        parser.error("--spot-watch-interval only makes sense "
+                     "with --watch")
     interval = (args.interval if args.interval is not None
                 else scanner_watch.DEFAULT_INTERVAL)
     tick_interval = (args.tick_interval if args.tick_interval is not None
                      else POLL_SECONDS)
+    spot_watch_interval = (args.spot_watch_interval
+                           if args.spot_watch_interval is not None
+                           else 60.0)
     if args.watch:
         if not math.isfinite(interval) \
                 or interval < scanner_watch.MIN_INTERVAL:
@@ -222,6 +344,11 @@ def main(argv=None):
                 f">= {scanner_watch.MIN_INTERVAL:g} seconds")
         if not math.isfinite(tick_interval) or tick_interval < 10:
             parser.error("--tick-interval must be finite and >= 10 seconds")
+        if not math.isfinite(spot_watch_interval) or (
+                spot_watch_interval != 0
+                and spot_watch_interval < 10):
+            parser.error("--spot-watch-interval must be finite, "
+                         "0, or >= 10 seconds")
         if os.path.expanduser(args.db) == ":memory:":
             parser.error("--watch with --db :memory: discards every scan")
 
@@ -245,11 +372,28 @@ def main(argv=None):
                   file=sys.stderr, flush=True)
             return 2
 
+    def _spot_tick():
+        # inventory + spot-market polls, only while a spot rental is
+        # active; a failure must never kill the watch loop
+        try:
+            return spot_watch(os.path.expanduser(args.db),
+                              args.env_file, stop)
+        except sqlite3.Error as exc:
+            print(f"spot watch failed ({type(exc).__name__})",
+                  file=sys.stderr, flush=True)
+            return 2
+        except Exception as exc:
+            print(f"spot watch failed ({type(exc).__name__})",
+                  file=sys.stderr, flush=True)
+            return 0
+
     try:
         args.stop_event = stop
         return scanner_watch.run_watch(
             lambda: scan_once(args), interval, stop,
-            tick=_telemetry_tick, tick_interval=tick_interval)
+            tick=_telemetry_tick, tick_interval=tick_interval,
+            extra_tick=(_spot_tick if spot_watch_interval else None),
+            extra_tick_interval=spot_watch_interval or None)
     finally:
         signal.signal(signal.SIGINT, old_int)
         signal.signal(signal.SIGTERM, old_term)
@@ -280,6 +424,7 @@ def scan_once(args):
         # file is only consulted when no key was supplied, so an
         # inaccessible file cannot block a working key.
         api_key = os.environ.get("CLORE_API_KEY")
+        env = {}
         if not api_key:
             try:
                 env = load_env_file(os.path.expanduser(args.env_file))
@@ -333,6 +478,18 @@ def scan_once(args):
                     db, api_key, getattr(args, "stop_event", None))
                 orders.refresh_wallets(
                     db, api_key, getattr(args, "stop_event", None))
+                # best-effort pool snapshot for per-rental payout
+                # attribution; the wallet is a secret and failures
+                # must never break the scan. Same precedence as the API
+                # key, and the env file is only the one already read for
+                # it -- a process-env key never triggers a file read
+                try:
+                    wallet = os.environ.get("JETSKI_WALLET") \
+                        or env.get("JETSKI_WALLET")
+                    if wallet:
+                        pool_stats.maybe_record(db, wallet, 600)
+                except Exception:
+                    pass
                 inventory = orders.read_inventory(db)
                 if orders_ok and args.spot_limit > 0:
                     spot_attempts = spot.refresh_quotes(

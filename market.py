@@ -173,15 +173,41 @@ def normalize_gpu(value):
     text = str(value or "").upper()
     if re.search(r"\b(?:LAPTOP|MOBILE)\b", text):
         return None
-    match = re.search(r"\bRTX\s*(\d{4})\s*(TI)?\b", text)
+    match = re.search(r"\b(RT|GT)X\s*(\d{4})\s*(TI|SUPER)?\b", text)
     if not match:
         return None
-    return f"RTX {match.group(1)}" + (" Ti" if match.group(2) else "")
+    brand, num, suffix = match.groups()
+    return (f"{brand}X {num}"
+            + (f" {suffix.title()}" if suffix else ""))
+
+
+def _cpu_text(cpu):
+    return str(cpu or "").upper().replace("(R)", "").replace("(TM)", "")
+
+
+# X3D V-cache parts share silicon with the non-X3D model and mine
+# identically; the unmeasured variant borrows the sibling's measured
+# cpu_prior instead of the ISA-class median. Sibling patterns use a
+# word boundary so they never match back to the X3D variant.
+CPU_SIBLINGS = (
+    (r"\bRYZEN\s+9\s+7900X3D\b", r"\bRYZEN\s+9\s+7900X\b"),
+    (r"\bRYZEN\s+9\s+7950X3D\b", r"\bRYZEN\s+9\s+7950X\b"),
+    (r"\bRYZEN\s+9\s+9950X3D\b", r"\bRYZEN\s+9\s+9950X\b"),
+)
+
+
+def cpu_sibling(cpu):
+    """Regex matching models measured to mine identically, or None."""
+    text = _cpu_text(cpu)
+    for model, sibling in CPU_SIBLINGS:
+        if re.search(model, text):
+            return re.compile(sibling, re.IGNORECASE)
+    return None
 
 
 def cpu_profile(cpu):
     """Infer ISA conservatively; only exact reference CPU models get a prior."""
-    text = str(cpu or "").upper().replace("(R)", "").replace("(TM)", "")
+    text = _cpu_text(cpu)
     if "UNKNOWN" in text or not text.strip():
         return "unknown", "unknown"
     if re.search(r"\bRYZEN\s+9\s+(?:7945HX|7950X)\b", text):
@@ -209,12 +235,26 @@ def cuda_capable(server):
     return parsed is not None and parsed >= DEFAULT_MIN_CUDA
 
 
+MAX_GPU_ARRAY = 2
+
+
 def offered_gpu(server):
-    """Return the single advertised GPU model; avoid extrapolating multi-GPU."""
+    """Return the advertised GPU model for a uniform array of up to
+    MAX_GPU_ARRAY cards; mixed models or larger arrays are unsupported."""
     gpu_array = server.get("gpu_array")
-    if not isinstance(gpu_array, list) or len(gpu_array) != 1:
+    if not isinstance(gpu_array, list) \
+            or not 1 <= len(gpu_array) <= MAX_GPU_ARRAY:
         return None
-    return normalize_gpu(gpu_array[0])
+    models = {normalize_gpu(g) for g in gpu_array}
+    return models.pop() if len(models) == 1 else None
+
+
+def offered_gpu_count(server):
+    """Card count when the array is a supported uniform rig, else None."""
+    gpu_array = server.get("gpu_array")
+    if offered_gpu(server) is None:
+        return None
+    return len(gpu_array)
 
 
 def available(server):
@@ -223,7 +263,8 @@ def available(server):
     partial = server.get("partial_gpu_rental")
     if isinstance(partial, dict):
         try:
-            if int(partial.get("available_gpus", 0)) < 1:
+            need = len(server.get("gpu_array") or []) or 1
+            if int(partial.get("available_gpus", 0)) < need:
                 return False
         except (TypeError, ValueError):
             return False
@@ -260,6 +301,7 @@ def score_listing(server, mode="on-demand", benchmarks=None):
     country = ((specs.get("net") or {}).get("cc") or "").upper()
     profile, isa = cpu_profile(specs.get("cpu"))
     gpu = offered_gpu(server)
+    gpu_count = offered_gpu_count(server)
     price_day = price_per_day_usd(server, mode)
     cuda = cuda_version(server.get("cuda_version"))
     index = benchmark_index(benchmarks)
@@ -272,7 +314,7 @@ def score_listing(server, mode="on-demand", benchmarks=None):
     elif cuda is None or cuda < DEFAULT_MIN_CUDA:
         reason = "CUDA unknown or below 12.0"
     elif gpu is None:
-        reason = "not a single-GPU listing"
+        reason = "unsupported GPU layout"
     elif price_day is None or price_day <= 0:
         reason = "no supported USD price"
     else:
@@ -280,12 +322,14 @@ def score_listing(server, mode="on-demand", benchmarks=None):
 
     fee = RENTER_FEES[mode]
     hourly_cost = (price_day / 24.0) * (1 + fee) if price_day else None
-    sols_hr = benchmark["min_sols_hr"] if benchmark else None
+    sols_hr = (benchmark["min_sols_hr"] * gpu_count
+               if benchmark and gpu_count else None)
     return {
         "server_id": server.get("id"),
         "owner": server.get("owner"),
         "country": country,
         "gpu": gpu,
+        "gpu_count": gpu_count,
         "cpu": specs.get("cpu") or "Unknown CPU",
         "cpu_profile": profile,
         "cpu_isa": isa,

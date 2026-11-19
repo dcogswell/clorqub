@@ -14,7 +14,9 @@ CREATE TABLE IF NOT EXISTS rental_attempts (
     state TEXT NOT NULL,
     order_id INTEGER,
     created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
+    updated_at TEXT NOT NULL,
+    recheck_count INTEGER NOT NULL DEFAULT 0,
+    last_recheck_at TEXT
 );
 CREATE TABLE IF NOT EXISTS fleet_rentals (
     order_id INTEGER PRIMARY KEY,
@@ -67,6 +69,18 @@ def initialize(db):
     if "auto_renew" not in cols:
         db.execute("ALTER TABLE fleet_rentals ADD COLUMN auto_renew INTEGER")
         db.commit()
+    # migration: rental_attempts recheck bookkeeping -- parked
+    # ('unknown'/'creating') attempts get re-polled against the live
+    # order list so a transient reconcile failure cannot freeze the
+    # runner forever
+    cols = {row[1] for row in db.execute("PRAGMA table_info(rental_attempts)")}
+    if "recheck_count" not in cols:
+        db.execute(
+            "ALTER TABLE rental_attempts"
+            " ADD COLUMN recheck_count INTEGER NOT NULL DEFAULT 0")
+        db.execute(
+            "ALTER TABLE rental_attempts ADD COLUMN last_recheck_at TEXT")
+        db.commit()
 
 
 def begin_attempt(db, attempt_id, server_id, alias, before_ids, quote):
@@ -79,7 +93,11 @@ def begin_attempt(db, attempt_id, server_id, alias, before_ids, quote):
     now = utcnow()
     with db:
         db.execute(
-            "INSERT INTO rental_attempts VALUES (?, ?, ?, ?, ?, 'creating', NULL, ?, ?)",
+            "INSERT INTO rental_attempts"
+            "(attempt_id, server_id, alias, before_ids_json, quote_json,"
+            " state, order_id, created_at, updated_at,"
+            " recheck_count, last_recheck_at)"
+            " VALUES (?, ?, ?, ?, ?, 'creating', NULL, ?, ?, 0, NULL)",
             (attempt_id, server_id, alias, json.dumps(sorted(before_ids)),
              json.dumps(safe_quote, sort_keys=True), now, now),
         )
@@ -93,6 +111,23 @@ def finish_attempt(db, attempt_id, state, order_id=None):
             "UPDATE rental_attempts SET state=?, order_id=?, updated_at=? WHERE attempt_id=?",
             (state, order_id, utcnow(), attempt_id),
         )
+
+
+def note_attempt_recheck(db, attempt_id, count, ts):
+    """Record one recheck pass against a parked attempt. `count` is
+    the running consecutive-clean tally -- callers reset it to 0 when
+    a candidate order appears so clearing requires uninterrupted
+    evidence that no order was created."""
+    with db:
+        db.execute(
+            "UPDATE rental_attempts SET recheck_count=?,"
+            " last_recheck_at=? WHERE attempt_id=?",
+            (count, _iso_ts(ts), attempt_id),
+        )
+
+
+def _iso_ts(value):
+    return value.isoformat() if hasattr(value, "isoformat") else value
 
 
 def pending_attempts(db):
@@ -186,15 +221,18 @@ def append_log_chunk(db, order_id, pool, start_offset, chunk, end_offset):
         )
 
 
-def read_log_archive(db, order_id, pool, max_chars=200000):
-    """Concatenated archived chunks (tail `max_chars` kept) for a rig/pool."""
+def read_log_archive(db, order_id, pool, max_chars=200000,
+                     head=False):
+    """Concatenated archived chunks for a rig/pool, capped at
+    `max_chars`: the newest bytes by default, the oldest (startup
+    output, config) when head=True."""
     rows = db.execute(
         "SELECT captured_at, chunk FROM rig_log_chunks"
         " WHERE order_id=? AND pool=? ORDER BY id",
         (order_id, pool)).fetchall()
     text = "".join(row["chunk"] for row in rows)
     if len(text) > max_chars:
-        text = text[-max_chars:]
+        text = text[:max_chars] if head else text[-max_chars:]
     return {
         "text": text,
         "last_captured_at": rows[-1]["captured_at"] if rows else None,
