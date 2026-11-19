@@ -148,6 +148,7 @@ def candidates():
         row["listings"] = len(vals)
     return resp({
         "candidate_values": exp.get("candidate_values") or [],
+        "phase_ends_at": (exp.get("phase") or {}).get("ends_at"),
         "term_hours": exp.get("candidate_term_hours"),
         "value_model": ((exp.get("phase") or {}).get("value_model")),
         "gpu_stats": gpu_stats,

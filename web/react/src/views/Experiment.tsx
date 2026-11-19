@@ -118,8 +118,8 @@ const CAND_COLS: ColDef<Candidate>[] = [
       if (d.upgrade_status === 'tried') {
         return (
           <span className="text-gray-500"
-            title="already rented this phase — excluded from upgrade auditions (still rentable via fills/rerents); a ★ pin or next phase re-opens it">
-            next phase
+            title="already rented this phase — excluded from upgrade auditions (still rentable via fills/rerents); a ★ pin re-opens it sooner">
+            next phase{d._phase_ends ? ` · ${until(d._phase_ends)}` : ''}
           </span>
         )
       }
@@ -249,6 +249,7 @@ function CandidatesPanel() {
     ...CAND_COLS], [pinSet, qc])
   const rows = useMemo(
     () => (cands.data?.candidate_values ?? [])
+      .map((c) => ({ ...c, _phase_ends: cands.data?.phase_ends_at ?? null }))
       // 'next phase' rows are tried-terminal this phase -- except a
       // live rental (judging now), a ★ pin (forces an audition), or
       // a slot that completed a full term (proven; still rentable

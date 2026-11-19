@@ -94,6 +94,7 @@ export interface Candidate {
   od_hourly?: number | null
   spot_hourly?: number | null
   spot_discount?: number | null
+  _phase_ends?: string | null
 }
 
 export interface Rig {
@@ -464,6 +465,7 @@ export const api = {
   candidates: () =>
     get<{
       candidate_values: Candidate[]
+      phase_ends_at: string | null
       term_hours: number | null
       value_model: unknown
       gpu_stats: Record<string, GpuStat>
