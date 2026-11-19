@@ -34,6 +34,7 @@ const INT_FIELDS = [
 // count exceptional (earns a growth seat); shrink picks the policy
 const FLEET_FLOAT_FIELDS = [
   ['growth_margin', 'growth margin'],
+  ['seat_its_floor_frac', 'seat its floor ×'],
 ] as const
 const SHRINK_MODES = ['passive', 'no_renew', 'cull'] as const
 

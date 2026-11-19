@@ -6991,6 +6991,64 @@ class PoolShareEstimateTests(unittest.TestCase):
         finally:
             db.close()
 
+    def test_seat_its_floor_rejects_unpromotable_rigs(self):
+        """A 1070-class rig tops the return ranking on price alone
+        but can't reach half the weakest slot's its -- the floor
+        rejects it before it wastes a probe."""
+        db = make_db()
+        try:
+            phase = add_phase(db)
+            # weakest slot: 200 its measured -> floor 100 at frac .5
+            add_fleet(db, 9, 99)
+            add_rental(db, phase["phase_id"], 9, 99, 60, role="slot")
+            add_obs(db, 9, 5, status(cpu=100, gpu=100))
+            # weak candidate: measured prior 50 its
+            add_snapshot(db, [listing(server_id=2, gpu="GTX 1070")])
+            add_history(db, 2, gpu="GTX 1070",
+                        its_cpu=10, its_gpu=40)
+            state = experiment.build_state(
+                db, phase, NOW, CFG, say=lambda *_a: None)
+            rejects = {}
+            cands = experiment._candidates(
+                state, CFG, set(), [], rejects=rejects)
+            self.assertEqual(rejects.get("below_seat_floor"), 1)
+            self.assertNotIn(2, [c["server_id"] for c in cands])
+            # frac 0 disables the floor entirely
+            cfg0 = dict(CFG, seat_its_floor_frac=0.0)
+            cands0 = experiment._candidates(
+                state, cfg0, set(), [], rejects={})
+            self.assertIn(2, [c["server_id"] for c in cands0])
+        finally:
+            db.close()
+
+    def test_seat_its_floor_off_without_slots(self):
+        """No measured slot -> no floor: cheap exploration stays
+        open when the fleet has nothing to defend."""
+        db = make_db()
+        try:
+            add_phase(db)
+            add_snapshot(db, [listing(server_id=2, gpu="GTX 1070")])
+            add_history(db, 2, gpu="GTX 1070",
+                        its_cpu=10, its_gpu=40)
+            state = experiment.build_state(
+                db, db.execute(
+                    "SELECT * FROM experiment_phases").fetchone(),
+                NOW, CFG, say=lambda *_a: None)
+            cands = experiment._candidates(
+                state, CFG, set(), [], rejects={})
+            self.assertIn(2, [c["server_id"] for c in cands])
+        finally:
+            db.close()
+
+    def test_seat_its_floor_frac_validated(self):
+        for bad in (-0.1, 1.1, float("nan")):
+            with self.assertRaises(ValueError, msg=str(bad)):
+                experiment.validate_config(
+                    dict(CFG, seat_its_floor_frac=bad))
+        self.assertEqual(experiment.validate_config(
+            dict(CFG, seat_its_floor_frac=0.5))[
+                "seat_its_floor_frac"], 0.5)
+
     def test_approve_pool_share_sets_budget(self):
         db = make_db()
         try:

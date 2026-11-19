@@ -327,6 +327,7 @@ export interface ExpConfig {
   slot_min: number | null
   max_rentals: number | null
   growth_margin: number | null
+  seat_its_floor_frac: number | null
   shrink_mode: string | null
   startup_min: number | null
   dry_after_min: number | null
@@ -360,6 +361,7 @@ export interface ConfigUpdate {
   slot_min?: number
   max_rentals?: number
   growth_margin?: number
+  seat_its_floor_frac?: number
   shrink_mode?: string
   startup_min?: number
   dry_after_min?: number

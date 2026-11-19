@@ -328,6 +328,12 @@ DEFAULT_CONFIG = {
     "slot_mode": "dynamic",
     "slot_min": 2,
     "growth_margin": 0.25,
+    # candidate floor: a probe exists to take a seat, so rigs whose
+    # est_its can't plausibly reach the weakest slot's measured its
+    # have no path -- dirt-cheap 1070-class hardware tops the
+    # return-multiple ranking but can never promote. est_its=None
+    # passes (unmeasurable, audition decides); 0 disables.
+    "seat_its_floor_frac": 0.5,
     # how an over-target fleet contracts: "passive" just stops
     # refills (attrition only); "no_renew" also denies succession
     # auditions and pending rerents to the weakest excess slots so
@@ -596,6 +602,9 @@ def validate_config(cfg):
     if not math.isfinite(cfg["growth_margin"]) \
             or not 0 <= cfg["growth_margin"] <= 10:
         raise ValueError("growth_margin must be in [0, 10]")
+    if not math.isfinite(cfg["seat_its_floor_frac"]) \
+            or not 0 <= cfg["seat_its_floor_frac"] <= 1:
+        raise ValueError("seat_its_floor_frac must be in [0, 1]")
     if cfg["shrink_mode"] not in ("passive", "no_renew", "cull"):
         raise ValueError("shrink_mode must be passive, no_renew or cull")
     if cfg["spot_outbid_min"] < 0:
@@ -4929,6 +4938,12 @@ def _candidates(state, cfg, active_ids, chosen, rejects=None,
     except re.error:
         cpu_blocked = None
     pool = []
+    slot_its = [float(r["its_total"]) for r in
+                (state.get("rentals") or [])
+                if r.get("role") == "slot" and r.get("its_total")]
+    its_floor = (min(slot_its) * cfg["seat_its_floor_frac"]
+                 if slot_its and cfg["seat_its_floor_frac"] > 0
+                 else None)
 
     def _reject(reason):
         if rejects is not None:
@@ -4981,6 +4996,12 @@ def _candidates(state, cfg, active_ids, chosen, rejects=None,
         coverage = state["stats"]["coverage"].get((cpu, gpu), 0.0)
         est, extrapolated, cross_ep = est_its(
             state["stats"], sid, cpu, gpu, gpu_count=gpu_n)
+        # no plausible path to a seat: projecting under the floor
+        # fraction of the weakest slot wastes a probe/slot spend
+        if (its_floor is not None and est is not None
+                and est < its_floor):
+            _reject("below_seat_floor")
+            continue
         quote = spot_quotes.get(sid)
         spot_hourly = None
         if quote is not None and sid not in spot_cooling:

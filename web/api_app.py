@@ -302,6 +302,7 @@ _CONFIG_KEYS = ("score", "upgrade_margin", "promote_margin",
                 "loss_mining", "paused", "probes_enabled",
                 "slot_mode", "slot_min", "max_rentals",
                 "growth_margin", "shrink_mode",
+                "seat_its_floor_frac",
                 "startup_min", "dry_after_min",
                 "kill_lambda", "kill_lambda_free",
                 "spot_enabled", "spot_probe_mode", "spot_slot_mode",
@@ -341,6 +342,7 @@ class ConfigRequest(BaseModel):
     slot_min: int | None = None
     max_rentals: int | None = None
     growth_margin: float | None = None
+    seat_its_floor_frac: float | None = None
     shrink_mode: str | None = None
     startup_min: int | None = None
     dry_after_min: int | None = None
