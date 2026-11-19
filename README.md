@@ -312,9 +312,9 @@ python3 blacklist.py rm --server ID               # clear active entries
 
 All commands take `--db PATH`. The experiment runner writes auto entries for
 confirmed fault/unreachable cancels, failed provisioning, >40% failed rig
-reads over 30 min (20+ samples), CPU/thread mismatch vs the listing, and
-sustained it/s under 50% of a compatible 3-rental prior. Share yield, dry
-trees and slow first shares never trigger a block. Blocked servers are
+reads over 30 min (20+ samples), and CPU/thread mismatch vs the listing.
+Share yield, dry trees, low it/s and slow first shares never trigger a
+block -- throughput is priced by the value model, not blacklisted. Blocked servers are
 excluded from automatic fills/probes/re-rents and TUI Candidates; manual
 `rent.py create` and the TUI review show a warning but still allow the
 rental. An already-running experiment process must be restarted to pick up

@@ -925,16 +925,12 @@ automatic entries for:
   20 reads and a rental age of at least 30 minutes.
 - CPU model-number mismatch, or fewer visible CPU threads than the listing's
   offered allocation (parsed the same way as the order's default thread count).
-- CPU or GPU median it/s below 50% of a compatible model prior from at least
-  **3 other rentals**, excluding the current order. Requires 30 minutes since
-  first telemetry, at least 20 usable readings spanning 20 minutes within the
-  last 30 minutes, and excludes the first 2 minutes after start/restart.
-  Compare only matching epoch, package, pool, visible CPU count, GPU count
-  and trainer variant/version; skip unknown epoch/package/allocation.
 
-Stale collection supplies no new blacklist evidence. Low shares, dry trees
-and slow first shares never trigger a block. Flaky SSH means unreliable
-controller access, not proof of lost pool shares. Flaky SSH, low it/s, and
+Stale collection supplies no new blacklist evidence. Low shares, dry trees,
+low it/s and slow first shares never trigger a block -- observed throughput
+is already priced into the value model, so it is not blacklist evidence.
+Flaky SSH means unreliable
+controller access, not proof of lost pool shares. Flaky SSH and
 late spec mismatches block future automatic rentals without cancelling the
 current order. Spec mismatches also join the existing free-window fault check.
 New blocks are recorded once per rental; removing one does not immediately
@@ -1271,6 +1267,85 @@ it/s prior is therefore keyed by CPU model and threads offered, not ISA.
   it/s in the expected range for its GPU, listing matches). Hourly shares
   did not follow it/s in our data, which supports not ranking on short
   share windows.
+- **Wallet value is observed; worker value remains provisional.**
+  Once fresh pool snapshots exist, a rig's forecast is
+  predicted $/h: `usd_hr(its) = S × w(its) × $/counted`, where S is
+  this phase's shares per rig-hour, $/counted comes from the newest
+  pool snapshot, and w(its) is an assumed payout weight curve:
+  `w_bar * (its/its_ref)^its_exponent` (0.3), normalized at the fleet's
+  median its. Wallet averages also include bosgame and historical rigs,
+  so this calibration is not measured per-hardware profitability.
+  The first 53 minutes of snapshots gained 56 shares but 1,565 counted
+  solutions; interval deltas cannot safely be attributed to the worker
+  mining at that moment. Automatic exponent fitting is disabled; the
+  fit remains diagnostic until payout timing and identifiability are
+  validated. Ended-rental dollar figures are explicitly wallet-average
+  allocations, never actual earnings. Forecasts require a snapshot no
+  older than 30 minutes. Candidates must clear both `min_return`
+  (1.2x fee-inclusive cost, a forecast rather than a guarantee) and the
+  relative efficiency floor `min_value_ratio` (0.7) — both stay
+  safety gates, not the objective. With fresh calibration the ranking
+  objective is forecast net $/h (revenue minus fee-inclusive hourly
+  cost, a fresh creation fee amortized over the term for new fills and
+  probes), not the return multiple: a high-ROI micro-rental can lose
+  to a lower-ROI rig that banks more dollars per hour. The Candidates
+  tab sorts on that same net $/h forecast when present and keeps the
+  return multiple beside it for gate context. Without fresh pool
+  calibration, use the existing relative-value ranking and budget
+  rails.
+  Short share windows signal tree liveness, not payout. Across 16 rentals of
+  50 min or more, shares/h was flat vs it/s (r = 0.01, 140-580 sh/h at
+  50-580 it/s). The feed reports 50k sol/hr at this snapshot; this is
+  not proof of a permanent hard cap or a particular worker payout law.
+- **Pacing: stay in budget, mine to epoch end.** The sustainable burn rate is
+  (remaining + active rentals' cost to their deadlines) / hours to
+  Wednesday 00:00 UTC. New fills and probes must fit the headroom (the
+  sustainable rate minus the current slot burn), choosing the set that
+  maximizes total forecast net profit. `max_price_hr` stays as a
+  hard safety rail. Probes' quotes don't count against the headroom
+  (they're cancelled inside the free window unless promoted). EP in the
+  header is the projected cost of the gated fleet with the highest
+  predicted net profit over the rest of the epoch — profit-ranked
+  after every value gate, with no budget or headroom cap inside the
+  projection: `EP = sum(fee_inclusive_hr) * hours remaining`,
+  `projected profit = sum(forecast_usd_hr - fee_inclusive_hr) *
+  hours remaining`, and the `(+$N)` shortfall is
+  `max(0, EP - available funds)`. It is a static fee-amortized
+  planning estimate, not exact scheduling, and a phase ending before
+  the epoch is flagged rather than silently extended. A slot stays
+  empty when nothing fits — except the
+  never-idle fallback: with no slot, nothing reserved, and budget
+  left, the best-return listing that still clears the floor and
+  return gate at the shortened term rents for the largest term that
+  fits, headroom notwithstanding.
+- **Vacancy-blocked replacement audition.** Normally an upgrade probe
+  only runs when the fleet is full — an empty slot captures the same
+  upside through the normal fill. The exception: with some but not all
+  slots occupied, nothing reserving the vacancy, and no ordinary fill
+  feasible (every eligible candidate fails headroom or the quote
+  bound), a challenger can audition against the weakest incumbent when
+  it is genuinely cheaper than that incumbent after fee amortization
+  and clears the same floor, return, margin, and quote gates. The
+  judged audition — not a direct swap — stays the authority. The
+  Experiment tab pins the newest `upgrade scan:` note — challenger vs
+  incumbent forecast net $/h against the configured 25%
+  profit-improvement threshold (relative value/$ when uncalibrated) —
+  as a dated assessment (not a live ranking), beside per-rental
+  smoothed it/s, forecast return, and net $/h (probe fees count fresh
+  over the remaining term; an incumbent's creation fee is sunk).
+- **Bounded retry of healthy no-share draws.** A first no-share draw is
+  a possible tree-luck miss, not a proven hardware verdict: a server may
+  audition again only
+  when every phase rental of it was an upgrade probe that provably
+  ended inside a free window (`probe_no_share`/`probe_deadline`) on a
+  `kept_original` judgement that explicitly tagged it — the probe had
+  fresh healthy telemetry, one matching GPU, measured it/s and an
+  economic return that would have beaten the incumbent. Retried no
+  sooner than `upgrade_cooldown_min` after the latest confirmed end or
+  judgement, and never past `upgrade_tree_max_attempts` (default 3)
+  actual orders per server per phase. Legacy judgements without the
+  tag are unknowns and stay excluded; this bounds upgrade auditions
+  only — normal fills are unchanged.
 - **Rig comparisons only within one tree ID.** When two of our rigs ever
   report the same ID at overlapping times, that window is a valid
   head-to-head comparison; otherwise rigs are compared only by price and
@@ -1348,6 +1423,32 @@ runs past 10 minutes; cancelling earlier costs seconds of rent only (see
 - The share **curve** for a whole rental (early burst, slump, second burst)
   is recorded so the pattern can be checked across rentals rather than
   assumed.
+
+### Worker-identity reuse (donor aliases)
+
+**Measured 2026-11-17: the pool does NOT restore a dead worker's tree
+pin.** Three probes landed on donor aliases 1–7 min after the donor's
+death and all drew fresh trees (`reuse_check` pin_hit 0/3). The pin is
+session-scoped anti-churn, not a persistent wallet+alias claim.
+
+So reuse buys **dashboard hygiene**, not tree luck: `alias_donor` hands
+any new rental the alias of the most recent *provably dead* rental,
+keeping the pool worker list bounded instead of one dead row per probe.
+"Provably dead" is the only gate:
+
+- no open rental or pending rent attempt still holds the alias;
+- the order is gone: absent from a fresh orders inventory, or (with no
+  fresh inventory) ended by us with a terminal fleet state. An `outbid`
+  spot order's standing bid can reactivate it, so without fresh
+  inventory proving it gone its alias stays off-limits.
+
+Since there is no tree carryover, donors need no share/tree history and
+no recency cap — newest-first ordering just keeps the active identity
+set small. The `same_tree` early-cancel applies to reuse probes exactly
+like fresh-draw probes (a repeated tree on one server is a wasted draw
+either way). `rental_value` still subtracts the alias's pre-handoff
+`sol` baseline so a donor's counted shares aren't credited to the
+recipient (`merged` confidence when no baseline snapshot exists).
 
 ### Experiments before any auto-rental logic
 
@@ -1493,3 +1594,50 @@ spending anything.
 - Confirm qli's `.lock` deletion behavior also happens inside the container.
 - Qubic idle phases exist (qli has `Idling` settings): on what schedule, and
   do they need a "no shares expected" window in stall detection?
+
+## Isolated Wallet Weight Experiment
+
+`scripts/weight_batch.py` supports a separately approved measurement batch,
+not normal profit selection. The first batch uses one fresh wallet for
+each of RTX 3060, RTX 3080 Ti, RTX 3090, RTX 4090, RTX 5080 and 2x RTX 3060.
+The protected address mapping stays outside the repository; observations
+contain profile labels rather than wallet addresses.
+
+The first batch's total quoted liability is capped at $3 inside the
+existing $20 phase budget. All orders have one-hour, non-renewing terms.
+The existing fleet keeps mining while its profit controller is paused.
+Order creation remains serialized through the normal operator lock,
+single-POST and receipt checks; mining periods overlap. The explicit
+`expected_gpu_count=2` quote path is only used by the approved dual-3060
+trial; normal callers still require one GPU.
+
+The original batch stopped after five continuous minutes of GPU hashing.
+That was insufficient: three profiles had no recorded submissions. It
+is a setup/credit-timing observation, not a completed weight comparison.
+Future prepared batches require both five continuous minutes of fresh,
+positive GPU hashing with the expected detected GPU count AND at least
+100 wallet-level, pool-confirmed shares. This is an initial sample floor,
+not a statistical guarantee. Reaching the existing 20-minute time limit
+without that sample is explicitly inconclusive; a longer run needs its
+own approved protocol. An independent watchdog also checks the time
+limit; one-hour receipts bound liability if cancellation is delayed.
+These are actual recorded mining periods, not assumed five-minute periods.
+Detected card count and aggregate reported speed do not independently
+prove both cards' contributions.
+
+Trial costs are booked in `experiment_rentals` with role `weight`.
+They are excluded from original-wallet value allocations and forecasts.
+The pool observer stores separate, labelled wallet snapshots before,
+during and after mining; it must not write them into the single-wallet
+`pool_snapshots` table. Sampling is approximately 30 seconds during the
+batch, 60 seconds for its first stopped hour, then ten minutes through
+epoch end plus one hour. Null/absent counters stay null, not measured zero.
+
+`prepare`, `observe`, `guard`, `run` and `resume` are separate modes sharing
+a protected run directory. The resumer starts the original $20 profit
+controller only after all known trial orders have ended and no ambiguous
+attempts remain. Unknown outcomes require reconciliation before resumption.
+Meeting the share target still leaves weighted credit pending. Short-run
+counted/share ratios are provisional observations, not a learned payout
+formula. CPU, trainer, tree luck, credit timing and repeated trials still
+matter; this experiment never automatically changes `its_exponent`.
