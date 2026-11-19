@@ -59,16 +59,19 @@ def sanitize_status(raw, expected_alias=None):
         "miner": {
             "running": miner.get("running") if isinstance(miner.get("running"), bool) else None,
             "started_at": text(miner.get("started_at")),
-            "restarts": number(miner.get("restarts"), integer=True),
         },
         "its": {
             "cpu": number(rates.get("cpu")), "gpu": number(rates.get("gpu")),
             "devices": {name: number(devices.get(name)) for name in
                         ("AVX2", "AVX512", "CUDA", "CUDA12")},
         },
-        "shares": {name: number(shares.get(name), integer=True) for name in
+        "shares": {name: number(
+                       shares.get(name),
+                       integer=name not in ("score_med", "score_sum"))
+                   for name in
                    ("epoch", "found", "submitted", "invalid",
-                    "log_found", "log_submitted", "log_rejected")},
+                    "log_found", "log_submitted", "log_rejected",
+                    "best_score", "score_n", "score_med", "score_sum")},
         "trainer": {name: text(trainer.get(name)) for name in ("variant", "flavor", "version")},
         "package": {name: text(package.get(name)) for name in ("version", "sha256")},
         "hardware": {

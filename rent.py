@@ -2,7 +2,8 @@
 """Operator rental CLI: create (dry-run default), list, cancel, enroll,
 reconcile. On-demand USD-Blockchain only, <=24h, unbounded manual
 orders (the MAX_AUTO_RENTALS cap is for a future auto-selector),
-renewal off unless --auto-renew, no spot, no auto-retries on POSTs."""
+renewal off unless --auto-renew, spot via experiment mode only,
+no auto-retries on POSTs."""
 
 import argparse
 import fcntl
@@ -23,6 +24,7 @@ import blacklist
 import fleet_store
 import rental_policy
 import rig_ssh
+import spot
 import telemetry_policy
 from cli import DEFAULT_DB, DEFAULT_ENV
 from market import connect_db, fetch_marketplace, load_env_file
@@ -240,6 +242,7 @@ def _terms_signature(server, quote):
     return (
         quote["cost_bound_usd"], quote["hourly_cost_usd"],
         quote["creation_fee_usd"], quote["listed_cpu_allocation"],
+        quote.get("mode"), quote.get("spot_bid_usd_day"),
         quote["payload"].get("required_price"),
         specs.get("cpu"), specs.get("cpus"), specs.get("ram"),
         json.dumps(server.get("gpu_array"), sort_keys=True),
@@ -266,9 +269,10 @@ def _register_managed(db, attempt_id, order, server_id, alias, quote,
              "rental; refusing to overwrite")
         return False
     cts = creation_unix(order)
-    deadline_at = (datetime.fromtimestamp(
-        cts + quote["hours"] * 3600, timezone.utc
-    ).isoformat(timespec="seconds") if cts is not None else None)
+    deadline_at = None if quote.get("mode") == "spot" else (
+        datetime.fromtimestamp(
+            cts + quote["hours"] * 3600, timezone.utc
+        ).isoformat(timespec="seconds") if cts is not None else None)
     fleet_store.register_rental(
         db, order_id=order_id, server_id=server_id, alias=alias,
         pool=quote.get("pool") or "unknown", deadline_at=deadline_at,
@@ -280,7 +284,7 @@ def _register_managed(db, attempt_id, order, server_id, alias, quote,
     return True
 
 
-def _term_matches(order, hours, want_renew=False):
+def _term_matches(order, hours, want_renew=False, mode="on-demand"):
     # Clore omits auto_renew on orders created without renewal. With
     # want_renew False, explicit null/true/non-boolean values remain unsafe;
     # with True the receipt must echo auto_renew is True (a per-term flag --
@@ -288,6 +292,12 @@ def _term_matches(order, hours, want_renew=False):
     # path). A missing/different native end is unsafe either way.
     if isinstance(hours, bool) or not isinstance(hours, int) or hours <= 0:
         return False
+    if mode == "spot":
+        # spot orders carry no term: the receipt must flag spot and
+        # must not have renewal enabled; rental_hours/rental_end are
+        # absent by design
+        return order.get("spot") is True \
+            and order.get("auto_renew") is not True
     requested = order.get("rental_hours")
     if isinstance(requested, bool) or not isinstance(requested, int) or requested != hours:
         return False
@@ -356,19 +366,26 @@ def _unguarded_db(db_path):
 
 def quote_order(*, server_id, hours, max_cost_usd, pool, cpu_threads,
                 db_path, env_file, key_path, auto_renew=False,
-                say=print, warn=err):
+                expected_gpu_count=1, mode="on-demand",
+                cpu_threads_cap=None,
+                spot_bid_usd_day=None, spot_floor_usd_day=None,
+                alias=None, say=print, warn=err):
     """Phase 1 of `create`: everything up to the confirmation prompt,
     minus the operator lock. Returns a secret-free ctx dict for
     create_order_flow. Failures are reported via warn() and raised as
-    ValueError (validation/policy, safe message) or APIError."""
+    ValueError (validation/policy, safe message) or APIError. An
+    explicit alias (a prior rental's worker name) reuses that pool-side
+    worker identity instead of drawing a fresh one; None generates a
+    new random alias as before."""
     def reject(msg):
         warn(msg)
         raise ValueError(msg)
 
+    # coarse sanity only -- the real ceiling is the host's advertised
+    # mrl, enforced in prepare_order once the listing is fetched
     if isinstance(hours, bool) or not isinstance(hours, int) \
-            or not 1 <= hours <= rental_policy.MAX_HOURS:
-        reject("hours must be an integer 1.."
-               f"{rental_policy.MAX_HOURS}")
+            or not 1 <= hours <= 8760:
+        reject("hours must be an integer 1..8760")
     if not isinstance(auto_renew, bool):
         reject("auto_renew must be a boolean")
     key_path = os.path.expanduser(key_path)
@@ -410,13 +427,18 @@ def quote_order(*, server_id, hours, max_cost_usd, pool, cpu_threads,
                        if s.get("id") == server_id), None)
         if server is None:
             reject(f"server {server_id} not in marketplace")
-        alias = rental_policy.new_alias(server_id, public_key)
+        alias = alias or rental_policy.new_alias(server_id, public_key)
         try:
             quote = rental_policy.prepare_order(
                 server, fee_data, hours=hours,
                 max_cost_usd=max_cost_usd, pool=pool,
                 public_key=public_key, alias=alias,
-                cpu_threads=cpu_threads, auto_renew=auto_renew)
+                cpu_threads=cpu_threads,
+                cpu_threads_cap=cpu_threads_cap,
+                auto_renew=auto_renew,
+                expected_gpu_count=expected_gpu_count, mode=mode,
+                spot_bid_usd_day=spot_bid_usd_day,
+                spot_floor_usd_day=spot_floor_usd_day)
         except ValueError as exc:
             reject(f"policy rejected: {exc}")
         quote["pool"] = pool
@@ -426,6 +448,10 @@ def quote_order(*, server_id, hours, max_cost_usd, pool, cpu_threads,
                 "auto_renew": auto_renew,
                 "max_cost_usd": max_cost_usd, "pool": pool,
                 "cpu_threads": cpu_threads, "alias": alias,
+                "expected_gpu_count": expected_gpu_count,
+                "mode": quote.get("mode") or "on-demand",
+                "spot_bid_usd_day": quote.get("spot_bid_usd_day"),
+                "spot_floor_usd_day": quote.get("spot_floor_usd_day"),
                 "quote": quote, "server": server,
                 "public_key": public_key, "key_path": key_path,
                 "blacklist": blocked,
@@ -434,11 +460,16 @@ def quote_order(*, server_id, hours, max_cost_usd, pool, cpu_threads,
         db.close()
 
 
-def create_order_flow(ctx, *, say=print, warn=err):
+def create_order_flow(ctx, *, say=print, warn=err,
+                      defer_provision=False):
     """Phase 2 of `create`: everything after confirmation, verbatim from
     the old cmd_create tail. Re-opens the operator db under the
     exclusive flock, re-fetches/re-verifies all terms, then makes ONE
-    create_order POST (never retried). Returns (rc, info)."""
+    create_order POST (never retried). Returns (rc, info). With
+    defer_provision the call returns right after the order is created
+    and registered -- the caller provisions via provision_order, so
+    the operator lock frees for the next create instead of serializing
+    burst probes behind one SSH wait each."""
     info = {"order_id": None, "provision_state": None,
             "stage": "confirm"}
     server_id = ctx["server_id"]
@@ -480,13 +511,46 @@ def create_order_flow(ctx, *, say=print, warn=err):
         if server2 is None:
             warn("server disappeared; aborting")
             return 2, info
+        mode = ctx.get("mode") or "on-demand"
+        spot_bid = ctx.get("spot_bid_usd_day")
+        spot_floor = ctx.get("spot_floor_usd_day")
+        if mode == "spot":
+            # the spot market moves fast: re-validate floor and
+            # competition against the bid we were about to place
+            info["stage"] = "spot_recheck"
+            try:
+                bid_day = float(spot_bid)
+                fresh = spot.fetch_quote(api_key, server_id)
+            except Exception:
+                fresh = None
+            recheck = spot.bid_for({
+                "captured_at": datetime.now(timezone.utc).isoformat(),
+                "raw_json": json.dumps(fresh)
+                if fresh is not None else None,
+                "error_kind": None if fresh is not None else "fetch"})
+            if recheck is None \
+                    or recheck["floor_usd_day"] > bid_day \
+                    or (recheck["top_bid_usd_day"] is not None
+                        and recheck["top_bid_usd_day"] >= bid_day):
+                # a dead fetch is no market verdict -- the caller may
+                # still retry on-demand; a floor/top-bid move IS the
+                # market talking and the pick dies here
+                info["spot_fetch_failed"] = fresh is None
+                warn("spot market moved against the quoted bid; "
+                     "aborting")
+                return 2, info
+            spot_floor = recheck["floor_usd_day"]
+            info["stage"] = "guards"
         try:
             quote2 = rental_policy.prepare_order(
                 server2, fee_data2, hours=hours,
                 max_cost_usd=ctx["max_cost_usd"], pool=pool,
                 public_key=ctx["public_key"], alias=alias,
                 cpu_threads=ctx["cpu_threads"],
-                auto_renew=ctx["auto_renew"])
+                auto_renew=ctx["auto_renew"],
+                expected_gpu_count=ctx.get("expected_gpu_count", 1),
+                mode=mode, spot_bid_usd_day=spot_bid,
+                spot_floor_usd_day=spot_floor)
         except ValueError as exc:
             warn(f"terms changed since review ({exc}); aborting")
             return 2, info
@@ -552,7 +616,8 @@ def create_order_flow(ctx, *, say=print, warn=err):
 
         # bounded-term receipt check BEFORE any provisioning
         info["stage"] = "register"
-        term_ok = _term_matches(order, hours, ctx.get("auto_renew"))
+        term_ok = _term_matches(order, hours, ctx.get("auto_renew"),
+                                mode=mode)
         if not _register_managed(db, attempt_id, order, server_id,
                                  alias, quote, key_path, warn=warn):
             return 2, info
@@ -576,6 +641,12 @@ def create_order_flow(ctx, *, say=print, warn=err):
             say(f"order {order_id} cancelled (term not honored); "
                 "verify any billed amount in the web UI")
             return 1, info
+
+        if defer_provision:
+            info["provision_state"] = "deferred"
+            info["stage"] = "provision_deferred"
+            say(f"order {order_id} created; provisioning deferred")
+            return 0, info
 
         # provision: bounded SSH retry, then credentials push, then a
         # sanitized status that must match our alias and pool
@@ -636,10 +707,105 @@ def create_order_flow(ctx, *, say=print, warn=err):
             lock.close()
 
 
+def _op_write(db_path, write):
+    """Open the operator db just long enough for one fleet_store
+    write; the flock is retried briefly since deferred provisions and
+    a following create can contend on it."""
+    for _ in range(30):
+        try:
+            db, lock = open_operator_db(db_path, live=True)
+            break
+        except ValueError:
+            time.sleep(1)
+    else:
+        raise ValueError("operator lock busy")
+    try:
+        write(db)
+    finally:
+        db.close()
+        if lock:
+            lock.close()
+
+
+def provision_order(ctx, order_id, *, say=print, warn=err):
+    """Deferred provision for a created+registered order: bounded SSH
+    poll, credentials push, sanitized-status verify, auto-cancel on
+    timeout -- the same tail as create_order_flow, but each
+    fleet_store write takes the operator lock only for the write so
+    parallel provisions don't serialize."""
+    try:
+        api_key, creds = load_secrets(ctx["env_file"],
+                                      need_creds=True)
+    except ValueError as exc:
+        warn(str(exc))
+        return "unprovisioned"
+    host = port = None
+    deadline = time.monotonic() + PROVISION_SECONDS
+    status = None
+    while time.monotonic() < deadline:
+        if host is None or port is None:
+            try:
+                fresh = my_orders(api_key)
+                order = next((o for o in fresh
+                              if o.get("id") == order_id), None)
+                if order is not None:
+                    host, port = endpoint(order)
+            except APIError:
+                pass
+        if host and port:
+            try:
+                _op_write(ctx["db_path"], lambda db:
+                          fleet_store.set_connection(
+                              db, order_id, host, port))
+            except ValueError:
+                pass
+            try:
+                rig_ssh.push_credentials(host, port, ctx["key_path"],
+                                         order_id, creds)
+                raw = rig_ssh.ssh_json(host, port, ctx["key_path"],
+                                       order_id)
+                candidate = telemetry_policy.sanitize_status(
+                    raw, expected_alias=ctx["alias"])
+                if candidate["pool"] == ctx["pool"]:
+                    status = candidate
+                    break
+            except (rig_ssh.SSHError, ValueError, KeyError):
+                pass
+        time.sleep(PROVISION_GAP_SECONDS)
+    if status is None:
+        say(f"provisioning order {order_id} failed within "
+            f"{PROVISION_SECONDS:.0f}s; auto-cancelling that "
+            "exact order")
+        cresp, cerr = _post_once("cancel_order", api_key,
+                                 {"id": int(order_id)})
+        final = ("cancelled" if not cerr and isinstance(cresp, dict)
+                 and cresp.get("code") == 0 else "provision_failed")
+        try:
+            _op_write(ctx["db_path"], lambda db:
+                      fleet_store.set_state(db, order_id, final))
+        except ValueError:
+            pass
+        if cerr or not (isinstance(cresp, dict)
+                        and cresp.get("code") == 0):
+            warn(f"CANCEL UNCONFIRMED for {order_id}: "
+                 "check the web UI immediately")
+        return final
+    try:
+        _op_write(ctx["db_path"], lambda db:
+                  fleet_store.append_observation(db, order_id, status))
+        _op_write(ctx["db_path"], lambda db:
+                  fleet_store.set_state(db, order_id, "ready"))
+    except ValueError:
+        pass
+    say(f"order {order_id} READY at root@{host}:{port} "
+        f"(pool={ctx['pool']}, alias={ctx['alias']})")
+    return "ready"
+
+
 def cmd_create(args):
     live = bool(args.live)
-    if not (1 <= args.hours <= rental_policy.MAX_HOURS):
-        err("--hours must be 1..24")
+    if not (1 <= args.hours <= 8760):
+        err("--hours must be 1..8760")
         return 2
     try:
         ctx = quote_order(
@@ -978,7 +1144,9 @@ def cmd_reconcile(args):
                 if args.adopt_order is not None:
                     adopt_seen = True
                 if not _term_matches(candidate, quote.get("hours"),
-                                     quote.get("auto_renew") is True):
+                                     quote.get("auto_renew") is True,
+                                     mode=quote.get("mode")
+                                     or "on-demand"):
                     print(f"candidate {candidate['id']} lacks the "
                           "stored bounded term (rental_hours/"
                           "auto_renew) -- stays unknown; review and "
