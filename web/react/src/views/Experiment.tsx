@@ -246,6 +246,9 @@ function PriorsPanel() {
                     title="pool-weighted sol per raw submitted share — ~1.0 means the pool credits each share equally">
                     wt</th>
                   <th className="py-1 text-right font-normal"
+                    title="mean ReportedScore per submitted share — ant-quality signal behind the weight">
+                    sps</th>
+                  <th className="py-1 text-right font-normal"
                     title="total weighted sol across measured stints">
                     sol</th>
                   <th className="py-1 text-right font-normal"
@@ -279,6 +282,13 @@ function PriorsPanel() {
                         : 'no sol-windowed stints'}>
                       {g.weight != null ? num(g.weight, 2) : '—'}
                     </td>
+                    <td className="py-1 text-right"
+                      title={g.score_n
+                        ? `score per submitted share over ${g.score_n} scored stint${g.score_n === 1 ? '' : 's'}`
+                        : 'no score-reporting stints'}>
+                      {g.score_per_share != null
+                        ? num(g.score_per_share, 0) : '—'}
+                    </td>
                     <td className="py-1 text-right">
                       {g.sol ? num(g.sol, 0) : '—'}
                     </td>
@@ -298,6 +308,9 @@ function PriorsPanel() {
               wt: pool sol ÷ miner-submitted shares per stint,
               reset-segmented (per-session sol, ~10min snapshot cadence —
               short stints can miss their sol peak and read low) ·
+              sps: mean ReportedScore per submitted share
+              (score-weighted yield normalizes against the fleet
+              median of this) ·
               sol: summed weighted sol ·
               w/prv/tot = sol-covered stints / share-proven / all rentals ·
               † older-epoch · — no proven prior (extrapolated)

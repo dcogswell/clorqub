@@ -61,6 +61,8 @@ export interface GpuStat {
   weight?: number | null
   weight_n?: number
   sol?: number
+  score_per_share?: number | null
+  score_n?: number
   cross_epoch: boolean
   median_hr?: number | null
   listings?: number
