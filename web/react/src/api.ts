@@ -241,9 +241,20 @@ export interface PoolShareEstimate {
   eff_n: number
   needed_sol: number | null
   needed_its: number | null
+  fleet_its: number
+  deficit_its: number | null
   est_cost_hr: number | null
   est_cost_day: number | null
   est_cost_epoch: number | null
+  cost_basis: 'supply_curve' | 'measured_eff' | null
+  cap_ceiling_its: number | null
+  supply_short_its: number | null
+  affordable_pct: number | null
+  approved: { usd: number; hr: number; pct: number;
+              at: string | null }
+  cost_drift: number | null
+  reapproval_needed: boolean
+  pace_deficit: boolean
   epoch_h_left: number | null
   snapshot_ts: string
   snapshot_age_s: number | null
@@ -327,6 +338,8 @@ export interface ExpConfig {
   spot_bid_premium: number | null
   pool_share_enabled: boolean | null
   pool_share_target_pct: number | null
+  pool_share_max_price_hr: string | null
+  pool_share_reapprove_drift: number | null
   score_help?: Record<string, string>
   strategies?: string[]
 }
@@ -358,6 +371,8 @@ export interface ConfigUpdate {
   spot_bid_premium?: number
   pool_share_enabled?: boolean
   pool_share_target_pct?: number
+  pool_share_max_price_hr?: string
+  pool_share_reapprove_drift?: number
   strategy?: string
 }
 
@@ -466,6 +481,10 @@ export const api = {
   blacklist: () => get<Record<string, unknown>[]>('/api/blacklist'),
   config: () => get<ExpConfig>('/api/config'),
   updateConfig: (body: ConfigUpdate) => post<ExpConfig>('/api/config', body),
+  approvePoolShare: () => post<{
+    budget_usd: string; committed: string; approved: number;
+    est_cost_epoch: number; est_cost_hr: number
+  }>('/api/pool-share/approve', {}),
   rentQuote: (body: RentQuoteRequest) =>
     post<{ token: string; review: RentReview; lines: string[] }>('/api/rent/quote', body),
   rentConfirm: (token: string) =>

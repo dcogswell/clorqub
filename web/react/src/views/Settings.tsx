@@ -61,6 +61,8 @@ const SPOT_FLOAT_FIELDS = [
 // estimator input today; the Experiment tab prices holding it
 const SHARE_FIELDS = [
   ['pool_share_target_pct', 'target % of pool'],
+  ['pool_share_max_price_hr', 'catch-up price cap $/hr'],
+  ['pool_share_reapprove_drift', 're-approve drift'],
 ] as const
 
 const TEXT_FIELDS = [
@@ -253,7 +255,7 @@ export default function Settings() {
       if (!shareOn && SHARE_FIELDS.some(([g]) => g === k)) continue
       const raw = (gates[k] ?? '').trim()
       if (raw === '') continue
-      if (k === 'max_price_hr') {
+      if (k === 'max_price_hr' || k === 'pool_share_max_price_hr') {
         body[k] = raw
       } else {
         const n = Number(raw)

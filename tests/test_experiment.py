@@ -5,6 +5,7 @@ calls, no SSH, dry-run by default."""
 import json
 import os
 import sqlite3
+from decimal import Decimal
 import sys
 import tempfile
 import unittest
@@ -6795,6 +6796,240 @@ class PoolShareEstimateTests(unittest.TestCase):
             self.assertEqual(experiment.validate_config(
                 dict(CFG, pool_share_target_pct=ok))[
                     "pool_share_target_pct"], ok)
+
+    def _supply(self):
+        """Three rigs priced under the share cap ($2): A best-eff
+        then B then C; est_its resolves via server_prior."""
+        stats = {"server_prior": {1: {"its": 800.0},
+                                  2: {"its": 600.0},
+                                  3: {"its": 500.0}}}
+        scored = {
+            1: {"hourly_cost_usd": 0.30, "cpu": "c", "gpu": "g",
+                "ineligible_reason": None},   # 2667 its/$
+            2: {"hourly_cost_usd": 0.40, "cpu": "c", "gpu": "g",
+                "ineligible_reason": None},   # 1500
+            3: {"hourly_cost_usd": 0.50, "cpu": "c", "gpu": "g",
+                "ineligible_reason": None},   # 1000
+        }
+        return stats, scored
+
+    def test_supply_curve_prices_target(self):
+        db = make_db()
+        try:
+            add_pool_snap(db, 1, workers={"a": (200.0, 100.0)},
+                          extra=self.EXTRA)
+            stats, scored = self._supply()
+            est = experiment.pool_share_estimate(
+                db, [], dict(CFG, pool_share_enabled=True,
+                             pool_share_target_pct=1.0), now=NOW,
+                stats=stats, scored=scored)
+            # needed_its = 1400; walk A(800)+B(600) = 1400 -> $0.70/hr
+            self.assertEqual(est["cost_basis"], "supply_curve")
+            self.assertAlmostEqual(est["est_cost_hr"], 0.70)
+            self.assertAlmostEqual(est["cap_ceiling_its"], 1900.0)
+            self.assertIsNone(est["supply_short_its"])
+        finally:
+            db.close()
+
+    def test_supply_shortfall_flagged(self):
+        db = make_db()
+        try:
+            add_pool_snap(db, 1, workers={"a": (200.0, 100.0)},
+                          extra=self.EXTRA)
+            stats, scored = self._supply()
+            est = experiment.pool_share_estimate(
+                db, [], dict(CFG, pool_share_enabled=True,
+                             pool_share_target_pct=2.0), now=NOW,
+                stats=stats, scored=scored)
+            # 2% -> 2800 its needed; ceiling 1900 -> short 900
+            self.assertIsNone(est["est_cost_hr"])
+            self.assertIsNone(est["cost_basis"])
+            self.assertAlmostEqual(est["supply_short_its"], 900.0)
+            self.assertAlmostEqual(est["cap_ceiling_its"], 1900.0)
+        finally:
+            db.close()
+
+    def test_deficit_uses_fleet_max(self):
+        db = make_db()
+        try:
+            add_pool_snap(db, 1, workers={"a": (200.0, 100.0)},
+                          extra=self.EXTRA)
+            stats, scored = self._supply()
+            rentals = [{"its_total": 500.0, "hourly_usd": "0.10",
+                        "share_arrivals": [("t", 1)]},
+                       {"its_total": 200.0, "hourly_usd": "0.10",
+                        "share_arrivals": [("t", 1)]}]
+            est = experiment.pool_share_estimate(
+                db, rentals, dict(CFG, pool_share_enabled=True,
+                                  pool_share_target_pct=1.0), now=NOW,
+                stats=stats, scored=scored)
+            # fleet_its = max(feed 100, measured 700) = 700
+            self.assertAlmostEqual(est["fleet_its"], 700.0)
+            self.assertAlmostEqual(est["deficit_its"], 700.0)
+        finally:
+            db.close()
+
+    def test_approved_drift_and_reapproval(self):
+        db = make_db()
+        try:
+            add_pool_snap(db, 1, workers={"a": (200.0, 100.0)},
+                          extra=self.EXTRA)
+            stats, scored = self._supply()
+            base = dict(CFG, pool_share_enabled=True,
+                        pool_share_target_pct=1.0,
+                        pool_share_approved_usd=50.0,
+                        pool_share_approved_hr=0.60,
+                        pool_share_approved_pct=1.0,
+                        pool_share_approved_at="2026-11-15T10:00")
+            est = experiment.pool_share_estimate(
+                db, [], base, now=NOW, stats=stats, scored=scored)
+            self.assertAlmostEqual(est["approved"]["usd"], 50.0)
+            # est 0.70/hr vs approved 0.60 -> +16.7% < 25% drift
+            self.assertAlmostEqual(est["cost_drift"], 0.70/0.60 - 1)
+            self.assertFalse(est["reapproval_needed"])
+            # a target change always forces re-approval
+            est2 = experiment.pool_share_estimate(
+                db, [], dict(base, pool_share_target_pct=2.0),
+                now=NOW, stats=stats, scored=scored)
+            self.assertTrue(est2["reapproval_needed"])
+            # and cost drift past the band does too
+            est3 = experiment.pool_share_estimate(
+                db, [], dict(base, pool_share_approved_hr=0.50),
+                now=NOW, stats=stats, scored=scored)
+            self.assertTrue(est3["reapproval_needed"])
+        finally:
+            db.close()
+
+    def test_pace_deficit_and_affordable(self):
+        db = make_db()
+        try:
+            add_pool_snap(db, 1, workers={"a": (200.0, 100.0)},
+                          extra=self.EXTRA)
+            stats, scored = self._supply()
+            cfg = dict(CFG, pool_share_enabled=True,
+                       pool_share_target_pct=1.0)
+            # est_epoch = 0.70/hr x 84h = 58.80; remaining 20 < est
+            est = experiment.pool_share_estimate(
+                db, [], cfg, now=NOW, stats=stats, scored=scored,
+                remaining=20.0)
+            self.assertTrue(est["pace_deficit"])
+            # remaining/84h = $0.238/hr: buys A(0.30)? no -- every rig
+            # exceeds the budget, so affordable_its = 0
+            self.assertAlmostEqual(est["affordable_pct"], 0.0)
+            est2 = experiment.pool_share_estimate(
+                db, [], cfg, now=NOW, stats=stats, scored=scored,
+                remaining=100.0)
+            self.assertFalse(est2["pace_deficit"])
+            # 100/84 = $1.19/hr: A+B+C ($1.20) just misses C -> 1400 its
+            # -> 1400 x 2 sol / 280000 = 1.0%
+            self.assertAlmostEqual(est2["affordable_pct"], 1.0)
+        finally:
+            db.close()
+
+    def test_share_price_cap_arming(self):
+        cfg = dict(CFG, pool_share_max_price_hr="2.00",
+                   max_price_hr="0.50")
+        off = {"pool_share": {"enabled": False}}
+        self.assertIsNone(experiment._share_price_cap(off, cfg))
+        unapproved = {"pool_share": {
+            "enabled": True, "deficit_its": 100,
+            "approved": {"usd": 0}}}
+        self.assertIsNone(
+            experiment._share_price_cap(unapproved, cfg))
+        caught_up = {"pool_share": {
+            "enabled": True, "deficit_its": 0,
+            "approved": {"usd": 50}}}
+        self.assertIsNone(
+            experiment._share_price_cap(caught_up, cfg))
+        armed = {"pool_share": {
+            "enabled": True, "deficit_its": 10,
+            "approved": {"usd": 50}}}
+        self.assertEqual(
+            experiment._share_price_cap(armed, cfg), Decimal("2.00"))
+        # the share cap never lowers the normal cap
+        cfg2 = dict(cfg, pool_share_max_price_hr="0.10")
+        self.assertEqual(
+            experiment._share_price_cap(armed, cfg2), Decimal("0.50"))
+
+    def test_candidates_take_lifted_cap_when_armed(self):
+        db = make_db()
+        try:
+            phase = add_phase(db)
+            # $15/day -> $0.656/hr: over max_price_hr ($0.50) but
+            # inside the $2 share cap
+            add_snapshot(db, [listing(server_id=1, price=15)])
+            add_history(db, 1)   # server_prior + cpu/gpu priors
+            add_pool_snap(db, 1, workers={"a": (200.0, 100.0)},
+                          extra=self.EXTRA)
+            cfg = dict(CFG, pool_share_enabled=True,
+                       pool_share_target_pct=1.0,
+                       pool_share_approved_usd=50.0,
+                       pool_share_approved_hr=0.60,
+                       pool_share_approved_pct=1.0,
+                       pool_share_approved_at=iso(30))
+            state = experiment.build_state(
+                db, phase, NOW, cfg, say=lambda *_a: None)
+            # $1.20/hr is over max_price_hr ($0.50) but inside the
+            # share cap; with a deficit it should not be rejected
+            rejects = {}
+            cands = experiment._candidates(
+                state, cfg, set(), [], rejects=rejects)
+            self.assertNotIn("over_cap", rejects)
+            self.assertEqual(
+                [c["server_id"] for c in cands], [1])
+        finally:
+            db.close()
+
+    def test_approve_pool_share_sets_budget(self):
+        db = make_db()
+        try:
+            cfg = dict(CFG, pool_share_enabled=True,
+                       pool_share_target_pct=1.0)
+            phase = add_phase(db, budget="10", cfg=cfg)
+            # $12/day -> $0.525/hr; server_prior -> 2000 its supply
+            add_snapshot(db, [listing(server_id=1, price=12)])
+            add_history(db, 1, its_cpu=1500, its_gpu=500)
+            add_pool_snap(db, 1, workers={"a": (200.0, 100.0)},
+                          extra=self.EXTRA)
+            out = experiment.approve_pool_share(db, now=NOW)
+            # est 0.525/hr x 84h left = 44.10; committed 0 -> budget
+            self.assertAlmostEqual(out["est_cost_epoch"], 44.1)
+            self.assertEqual(out["budget_usd"], "44.10")
+            row = db.execute(
+                "SELECT budget_usd, config_json FROM"
+                " experiment_phases WHERE phase_id=?",
+                (phase["phase_id"],)).fetchone()
+            self.assertEqual(row["budget_usd"], out["budget_usd"])
+            saved = json.loads(row["config_json"])
+            self.assertAlmostEqual(saved["pool_share_approved_usd"],
+                                   out["est_cost_epoch"])
+            self.assertEqual(saved["pool_share_approved_pct"], 1.0)
+            self.assertTrue(saved["pool_share_approved_at"])
+            # re-estimate on the funded phase: pace_deficit clears
+            phase2 = db.execute(
+                "SELECT * FROM experiment_phases WHERE phase_id=?",
+                (phase["phase_id"],)).fetchone()
+            cfg2 = experiment.validate_config(
+                json.loads(phase2["config_json"]))
+            state = experiment.build_state(
+                db, dict(phase2), NOW, cfg2, say=lambda *_a: None)
+            est = state["pool_share"]
+            self.assertFalse(est["pace_deficit"])
+            self.assertAlmostEqual(
+                est["approved"]["usd"], out["est_cost_epoch"])
+            self.assertFalse(est["reapproval_needed"])
+        finally:
+            db.close()
+
+    def test_approve_pool_share_refuses_no_estimate(self):
+        db = make_db()
+        try:
+            add_phase(db, cfg=dict(CFG, pool_share_enabled=True,
+                                   pool_share_target_pct=5.0))
+            with self.assertRaises(ValueError):
+                experiment.approve_pool_share(db, now=NOW)
+        finally:
+            db.close()
 
 
 if __name__ == "__main__":

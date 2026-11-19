@@ -29,7 +29,7 @@ import sys
 import threading
 import time
 from datetime import datetime, timedelta, timezone
-from decimal import Decimal
+from decimal import Decimal, ROUND_CEILING
 
 import blacklist
 import fleet_store
@@ -199,11 +199,22 @@ DEFAULT_CONFIG = {
     # clocks and stays eligible. Manual rentals are unaffected.
     "cpu_blocklist_re": r"\bEPYC\s+[1-8]",
     # target pool-window share (percent of pool total_sol): 0 = off.
-    # Not a controller yet -- the Experiment tab shows the estimated
-    # budget to hold the share from live pool telemetry, and the
-    # operator tunes the target against that estimate.
+    # The Experiment tab prices holding the share from live pool
+    # telemetry plus the marketplace its-supply curve; the operator
+    # approves the estimate, which funds it as the phase budget.
+    # While enabled + approved + capacity-deficit, the candidate
+    # price cap lifts from max_price_hr to pool_share_max_price_hr
+    # so throughput rigs can catch up -- value gates still apply.
     "pool_share_enabled": False,
     "pool_share_target_pct": 0.0,
+    "pool_share_max_price_hr": "2.00",
+    "pool_share_reapprove_drift": 0.25,
+    # approval snapshot -- written by approve_pool_share, not user
+    # input: the funded estimate the runner defends against
+    "pool_share_approved_usd": 0.0,
+    "pool_share_approved_hr": 0.0,
+    "pool_share_approved_pct": 0.0,
+    "pool_share_approved_at": "",
     # Poisson kill evidence: dry/low-yield verdicts wait for
     # kill_lambda expected shares to have elapsed -- P(0 observed |
     # healthy) ~= e^-lambda -- so judgement windows stretch with
@@ -519,6 +530,24 @@ def validate_config(cfg):
             or isinstance(cfg["pool_share_target_pct"], bool) \
             or not 0 <= cfg["pool_share_target_pct"] <= 100:
         raise ValueError("pool_share_target_pct must be a number 0..100")
+    _dec(cfg["pool_share_max_price_hr"])
+    if not isinstance(cfg["pool_share_approved_usd"], (int, float)) \
+            or isinstance(cfg["pool_share_approved_usd"], bool) \
+            or cfg["pool_share_approved_usd"] < 0:
+        raise ValueError("pool_share_approved_usd must be >= 0")
+    if not isinstance(cfg["pool_share_approved_hr"], (int, float)) \
+            or isinstance(cfg["pool_share_approved_hr"], bool) \
+            or cfg["pool_share_approved_hr"] < 0:
+        raise ValueError("pool_share_approved_hr must be >= 0")
+    if not isinstance(cfg["pool_share_approved_pct"], (int, float)) \
+            or isinstance(cfg["pool_share_approved_pct"], bool) \
+            or not 0 <= cfg["pool_share_approved_pct"] <= 100:
+        raise ValueError("pool_share_approved_pct must be a number 0..100")
+    if not isinstance(cfg["pool_share_approved_at"], str):
+        raise ValueError("pool_share_approved_at must be a string")
+    if not math.isfinite(cfg["pool_share_reapprove_drift"]) \
+            or not 0 < cfg["pool_share_reapprove_drift"] <= 1:
+        raise ValueError("pool_share_reapprove_drift must be in (0, 1]")
     if not math.isfinite(cfg["kill_lambda"]) or cfg["kill_lambda"] <= 0:
         raise ValueError("kill_lambda must be > 0")
     if not math.isfinite(cfg["kill_lambda_free"]) \
@@ -1423,13 +1452,15 @@ def history_stats(db, known_listings, exclude_order_id=None, now=None):
     }
 
 
-def pool_share_estimate(db, rentals, cfg, now=None):
+def pool_share_estimate(db, rentals, cfg, now=None, stats=None,
+                        scored=None, remaining=None):
     """Budget estimate for holding cfg['pool_share_target_pct']% of
     the pool's window presence (total_sol).
 
     Chain: needed_sol = target x total_sol;
     needed_its = needed_sol / sol-per-its (ours measured, pool's as
-    fallback); est_cost_hr = needed_its / fleet-measured its-per-$.
+    fallback); est_cost_hr = supply-curve price of needed_its under
+    pool_share_max_price_hr (measured fleet eff as fallback).
 
     Returns None when no pool snapshot is available. Fields stay
     honest about which inputs are measured vs fallbacks.
@@ -1471,8 +1502,37 @@ def pool_share_estimate(db, rentals, cfg, now=None):
         if enabled and total_sol else None
     needed_its = (needed_sol / sol_per_its
                   if needed_sol is not None and sol_per_its else None)
-    est_cost_hr = (needed_its / eff
-                   if needed_its is not None and eff else None)
+
+    # fleet capacity for the deficit trigger: pool-feed its vs the
+    # sum of measured rental its -- the max covers fresh rigs whose
+    # workers haven't appeared in the feed yet, so a just-placed
+    # catch-up order already counts toward the deficit
+    fleet_its = max(our_its or 0.0, sum(
+        float(r["its_total"]) for r in rentals if r.get("its_total")))
+    deficit_its = (max(0.0, needed_its - fleet_its)
+                   if needed_its is not None else None)
+
+    # its supply under the share price cap, best eff first; the walk
+    # prices the target off what is actually buyable and reports the
+    # ceiling when even the whole under-cap market falls short
+    cap = cfg.get("pool_share_max_price_hr") or cfg["max_price_hr"]
+    supply = _share_supply(scored, stats, cap)
+    cap_ceiling_its = (sum(r[1] for r in supply)
+                       if supply else None)
+    est_cost_hr = None
+    supply_short_its = None
+    cost_basis = None
+    if needed_its:
+        got, cost = _walk_share_supply(supply, need_its=needed_its)
+        if got >= needed_its:
+            est_cost_hr, cost_basis = cost, "supply_curve"
+        else:
+            supply_short_its = needed_its - got
+            if eff:  # soft fallback: fleet-measured efficiency
+                est_cost_hr = needed_its / eff
+                cost_basis = "measured_eff"
+    elif enabled:
+        est_cost_hr, cost_basis = 0.0, "supply_curve"
 
     epoch_h_left = None
     prog = ext.get("epoch_progress")
@@ -1482,6 +1542,35 @@ def pool_share_estimate(db, rentals, cfg, now=None):
                 0.0, (1.0 - float(prog[:-1]) / 100.0) * 168.0)
         except ValueError:
             pass
+    est_cost_epoch = (est_cost_hr * epoch_h_left
+                      if est_cost_hr and epoch_h_left else None)
+
+    # what the remaining budget still buys at the current curve
+    affordable_pct = None
+    if enabled and remaining is not None and epoch_h_left \
+            and sol_per_its and total_sol:
+        hr_budget = max(0.0, float(remaining) / epoch_h_left)
+        a_its, _ = _walk_share_supply(supply, budget_hr=hr_budget)
+        affordable_pct = 100.0 * a_its * sol_per_its / total_sol
+
+    approved = {
+        "usd": float(cfg.get("pool_share_approved_usd") or 0),
+        "hr": float(cfg.get("pool_share_approved_hr") or 0),
+        "pct": float(cfg.get("pool_share_approved_pct") or 0),
+        "at": cfg.get("pool_share_approved_at") or None,
+    }
+    cost_drift = (est_cost_hr / approved["hr"] - 1.0
+                  if approved["hr"] > 0 and est_cost_hr else None)
+    reapproval_needed = bool(
+        enabled and approved["usd"] > 0 and (
+            approved["pct"] != target_pct
+            or (cost_drift is not None
+                and abs(cost_drift)
+                > cfg["pool_share_reapprove_drift"])))
+    pace_deficit = bool(
+        enabled and est_cost_epoch is not None
+        and remaining is not None
+        and float(remaining) < est_cost_epoch)
 
     return {
         "enabled": enabled,
@@ -1495,15 +1584,104 @@ def pool_share_estimate(db, rentals, cfg, now=None):
         "eff_its_per_usd": eff,
         "eff_n": len(effs),
         "needed_sol": needed_sol, "needed_its": needed_its,
+        "fleet_its": fleet_its,
+        "deficit_its": deficit_its,
         "est_cost_hr": est_cost_hr,
         "est_cost_day": (est_cost_hr * 24 if est_cost_hr else None),
-        "est_cost_epoch": (est_cost_hr * epoch_h_left
-                           if est_cost_hr and epoch_h_left else None),
+        "est_cost_epoch": est_cost_epoch,
+        "cost_basis": cost_basis,
+        "cap_ceiling_its": cap_ceiling_its,
+        "supply_short_its": supply_short_its,
+        "affordable_pct": affordable_pct,
+        "approved": approved,
+        "cost_drift": cost_drift,
+        "reapproval_needed": reapproval_needed,
+        "pace_deficit": pace_deficit,
         "epoch_h_left": epoch_h_left,
         "snapshot_ts": row["source_ts"],
         "snapshot_age_s": ((now - _dt(row["source_ts"])).total_seconds()
                            if now else None),
     }
+
+
+def _share_supply(scored, stats, price_cap):
+    """Rentable its supply under `price_cap`, best its-per-$ first.
+    Rows are (eff, its, hourly_usd) over listings whose price and
+    est_its are both known and not flagged ineligible."""
+    rows = []
+    cap = float(_dec(price_cap))
+    for sid, row in (scored or {}).items():
+        hourly = row.get("hourly_cost_usd")
+        if hourly is None or float(hourly) > cap:
+            continue
+        # same tolerance _candidates gives: "no matching benchmark"
+        # rigs still estimate from model-class priors
+        if row.get("ineligible_reason") not in \
+                (None, "no matching benchmark"):
+            continue
+        its, _, _ = est_its(
+            stats, sid, row.get("cpu"), row.get("gpu"),
+            gpu_count=row.get("gpu_count") or 1)
+        if not its:
+            continue
+        rows.append((float(its) / float(hourly), float(its),
+                     float(hourly)))
+    rows.sort(key=lambda r: -r[0])
+    return rows
+
+
+def _walk_share_supply(rows, need_its=None, budget_hr=None):
+    """Consume the supply rows best-first until `need_its` is covered
+    or `budget_hr` is spent; returns (its_acquired, cost_hr)."""
+    its = cost = 0.0
+    for _, r_its, r_hr in rows:
+        if need_its is not None and its >= need_its:
+            break
+        if budget_hr is not None and cost + r_hr > budget_hr:
+            continue  # too dear for the remaining budget; try cheaper
+        its += r_its
+        cost += r_hr
+    return its, cost
+
+
+def approve_pool_share(db, now=None):
+    """Snapshot the current share-target estimate as the funded
+    objective: records the approved cost/pct in the phase config and
+    sets budget_usd = committed + est_cost_epoch, so `remaining`
+    exactly funds the forward estimate. Returns the new estimate
+    (with approval fields) or raises ValueError when there is
+    nothing priceable to approve."""
+    now = now or utcnow()
+    phase = open_phase(db, now)
+    if phase is None:
+        raise ValueError("no open phase")
+    cfg = validate_config(json.loads(phase["config_json"]))
+    state = build_state(db, dict(phase), now, cfg,
+                        apply_endings=False, say=lambda *a: None)
+    est = state["pool_share"] or {}
+    if est.get("est_cost_epoch") is None:
+        raise ValueError(
+            "no epoch-cost estimate yet (need pool totals and a "
+            "reachable supply curve)")
+    set_phase_config(
+        db,
+        pool_share_approved_usd=est["est_cost_epoch"],
+        pool_share_approved_hr=est["est_cost_hr"] or 0.0,
+        pool_share_approved_pct=est["target_pct"],
+        pool_share_approved_at=_iso(now))
+    # ceiling to cents: the funded budget must never land below the
+    # estimate it approved (rounding down would under-fund by <1c)
+    new_budget = (state["committed"] + _dec(str(est["est_cost_epoch"]))
+                  ).quantize(Decimal("0.01"), rounding=ROUND_CEILING)
+    with db:
+        db.execute(
+            "UPDATE experiment_phases SET budget_usd=? WHERE phase_id=?",
+            (f"{new_budget:.2f}", phase["phase_id"]))
+    return {"budget_usd": f"{new_budget:.2f}",
+            "committed": f"{state['committed']:.2f}",
+            "approved": est["target_pct"],
+            "est_cost_epoch": est["est_cost_epoch"],
+            "est_cost_hr": est["est_cost_hr"]}
 
 
 def _median(values):
@@ -2472,7 +2650,9 @@ def build_state(db, phase, now, cfg, apply_endings=True, say=print):
                            if snapshot_at else None),
         "pending_attempts": bool(fleet_store.pending_attempts(db)),
         "stats": stats,
-        "pool_share": pool_share_estimate(db, rentals, cfg, now),
+        "pool_share": pool_share_estimate(
+            db, rentals, cfg, now, stats=stats, scored=scored,
+            remaining=budget - committed),
         "value_model": vm,
         # tried only counts rentals placed after the latest
         # tried_reset event -- a manual reset re-opens the upgrade
@@ -4696,8 +4876,24 @@ def _spot_fields(c):
             "spot_bid_usd_day": c.get("spot_bid_usd_day")}
 
 
+def _share_price_cap(state, cfg):
+    """Raised candidate price cap while pool-share targeting is
+    armed and behind: enabled + funded approval + capacity deficit
+    lets throughput rigs past max_price_hr (value gates still
+    apply). Returns None when the override isn't armed."""
+    ps = state.get("pool_share") or {}
+    if not ps.get("enabled") \
+            or not (ps.get("approved") or {}).get("usd") \
+            or (ps.get("deficit_its") or 0) <= 0:
+        return None
+    cap = _dec(cfg.get("pool_share_max_price_hr")
+               or cfg["max_price_hr"])
+    return max(cap, _dec(cfg["max_price_hr"]))
+
+
 def _candidates(state, cfg, active_ids, chosen, rejects=None,
-                term=None, spot_min_discount=None, spot_mode="auto"):
+                term=None, spot_min_discount=None, spot_mode="auto",
+                price_cap=None):
     """Acceptable listings minus active/pending/excluded, sorted by
     fee-amortized value/$ prior (hourly + creation fee/`term`), then
     hourly, then id. When the pool-snapshot value model is available,
@@ -4771,7 +4967,10 @@ def _candidates(state, cfg, active_ids, chosen, rejects=None,
         if hourly is None:
             _reject("no_price")
             continue
-        if hourly > _dec(cfg["max_price_hr"]):
+        cap = (price_cap if price_cap is not None
+               else _share_price_cap(state, cfg)
+               or _dec(cfg["max_price_hr"]))
+        if hourly > cap:
             _reject("over_cap")
             continue
         cpu = row["cpu"]

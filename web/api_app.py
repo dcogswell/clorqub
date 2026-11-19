@@ -306,7 +306,8 @@ _CONFIG_KEYS = ("score", "upgrade_margin", "promote_margin",
                 "kill_lambda", "kill_lambda_free",
                 "spot_enabled", "spot_probe_mode", "spot_slot_mode",
                 "spot_bid_premium", "pool_share_enabled",
-                "pool_share_target_pct")
+                "pool_share_target_pct", "pool_share_max_price_hr",
+                "pool_share_reapprove_drift")
 
 
 @app.get("/api/config")
@@ -351,6 +352,8 @@ class ConfigRequest(BaseModel):
     spot_bid_premium: float | None = None
     pool_share_enabled: bool | None = None
     pool_share_target_pct: float | None = None
+    pool_share_max_price_hr: str | None = None
+    pool_share_reapprove_drift: float | None = None
     strategy: str | None = None
 
 
@@ -382,6 +385,23 @@ def config_update(body: ConfigRequest):
     if cfg is None:
         raise HTTPException(404, "no open experiment phase")
     return resp({k: cfg[k] for k in _CONFIG_KEYS})
+
+
+@app.post("/api/pool-share/approve")
+def pool_share_approve():
+    """Fund the current share-target estimate: snapshots the
+    approved cost/pct into the phase config and sets the phase
+    budget to committed + estimated epoch cost."""
+    import experiment as exp
+    db = exp.open_db(DB)
+    try:
+        try:
+            result = exp.approve_pool_share(db)
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
+    finally:
+        db.close()
+    return resp(result)
 
 
 @app.get("/api/pool/series")

@@ -507,6 +507,17 @@ function PoolSharePanel({ ps, cfgPct }: {
   }
   const usdOr = (v: number | null | undefined, p = 2) =>
     v == null ? '—' : usd(v, p)
+  const approve = () => {
+    setBusy(true)
+    setMsg('')
+    api.approvePoolShare().then((r) => {
+      setMsg(`approved — budget now $${r.budget_usd}`)
+      qc.invalidateQueries({ queryKey: ['config'] })
+      qc.invalidateQueries({ queryKey: ['experiment'] })
+    }).catch((e) => setMsg(String(e.message ?? e)))
+      .finally(() => setBusy(false))
+  }
+  const app = ps?.approved
   return (
     <Panel title="pool share target">
       <div className="flex flex-wrap items-end gap-x-6 gap-y-2 text-sm">
@@ -538,6 +549,12 @@ function PoolSharePanel({ ps, cfgPct }: {
           {ps?.needed_its != null
             ? `${num(ps.needed_its, 0)} it/s (${num(ps.needed_sol ?? 0, 0)} sol)`
             : '—'}
+          {ps?.enabled && (ps.deficit_its ?? 0) > 0 && (
+            <span className="text-amber-300">
+              {` · behind by ${num(ps.deficit_its, 0)} it/s`}
+              {app && app.usd > 0 ? ' → catch-up pricing armed' : ''}
+            </span>
+          )}
         </div>
         <div className={ps && !ps.enabled ? 'opacity-40' : ''}>
           <span className="text-gray-500">est </span>
@@ -546,16 +563,64 @@ function PoolSharePanel({ ps, cfgPct }: {
             ? `${usdOr(ps.est_cost_epoch)} over ${num(ps.epoch_h_left, 0)}h left`
             : '—'}
         </div>
+        {ps?.enabled && ps.est_cost_epoch != null && (
+          <button onClick={approve} disabled={busy}
+            className="rounded bg-teal-600 px-2.5 py-1 text-xs font-semibold
+              text-white disabled:opacity-50"
+            title="sets phase budget = committed + estimated epoch cost">
+            approve → fund {usdOr(ps.est_cost_epoch)}
+          </button>
+        )}
         {msg && <span className="text-teal-400">{msg}</span>}
       </div>
+      {app != null && app.usd > 0 && (
+        <div className="mt-1 flex flex-wrap gap-x-4 text-[11px]">
+          <span className="text-gray-400">
+            approved {usdOr(app.usd)} @ {num(app.pct, 2)}%
+            {app.at ? ` · ${ago(app.at)}` : ''}
+            {` (${usdOr(app.hr)}/hr then)`}
+          </span>
+          {ps?.reapproval_needed && (
+            <span className="text-amber-400">
+              target or cost moved &gt;{''}
+              {Math.round((ps.cost_drift ?? 0) * 100)}% vs approved — re-approve
+            </span>
+          )}
+        </div>
+      )}
+      {(ps?.pace_deficit || (ps?.supply_short_its ?? 0) > 0) && (
+        <div className="mt-1 space-y-0.5 text-[11px]">
+          {ps?.pace_deficit && (
+            <p className="text-red-400">
+              remaining budget can't fund the target to epoch end —
+              re-approve or lower the %
+            </p>
+          )}
+          {(ps?.supply_short_its ?? 0) > 0 && (
+            <p className="text-red-400">
+              under-cap supply reaches only {num(ps.cap_ceiling_its ?? 0)} it/s
+              — target needs +{num(ps.supply_short_its, 0)} more;
+              raise pool_share_max_price_hr or lower the %
+            </p>
+          )}
+        </div>
+      )}
       <div className="mt-1 text-[10px] text-gray-600">
-        eff basis: {ps?.eff_its_per_usd != null
-          ? `${num(ps.eff_its_per_usd, 0)} it/s per $/hr over ${ps.eff_n} proven stints`
-          : 'no proven stints yet'}
+        {ps?.enabled && ps.affordable_pct != null && (
+          <span className="text-gray-500">
+            {`remaining buys ~${num(ps.affordable_pct, 2)}% · `}
+          </span>
+        )}
+        cost basis: {ps?.cost_basis === 'supply_curve'
+          ? 'marketplace supply curve (share cap)'
+          : ps?.cost_basis === 'measured_eff'
+            ? `fleet-measured ${num(ps.eff_its_per_usd ?? 0, 0)} it/s per $/hr`
+            : '—'}
         {` · sol/its ${ps?.sol_per_its != null ? num(ps.sol_per_its, 2) : '—'}`}
+        {` · fleet ${num(ps?.fleet_its ?? 0, 0)} it/s`}
         {` · pool snap ${ps?.snapshot_age_s != null
           ? `${Math.round(ps.snapshot_age_s / 60)}m old` : '—'}`}
-        {' · linear projection — share presence is window-lagged (~hours), budget estimate moves with pool totals'}
+        {' · estimator only — share presence is window-lagged (~hours)'}
       </div>
     </Panel>
   )
