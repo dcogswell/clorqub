@@ -17,13 +17,21 @@ def timedelta_safe(seconds):
 
 # Regex for the share/hashrate status line emitted by both miners.
 # Example: 2026-10-24 15:57:28.118 [INFO]  E:236 | SHARES: 94/94 (R:17) | 100 it/s | 84 avg it/s
+# Rates switch to k-suffix above ~1k ("[CUDA] 1.17k it/s") --
+# rate_value() scales them back to plain ints.
 STATUS_RE = re.compile(
     r"(?P<ts>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d+)"
     r".*?E:(?P<epoch>\d+)"
     r"\s*\|\s*SHARES:\s*(?P<found>\d+)/(?P<submitted>\d+)\s*\(R:(?P<rejected>\d+)\)"
-    r"\s*\|\s*(?:\[[^\]]*\]\s*)?(?P<it>\d+)\s*it/s"
-    r"\s*\|\s*(?P<avg>\d+)\s*avg it/s"
+    r"\s*\|\s*(?:\[[^\]]*\]\s*)?(?P<it>\d+(?:\.\d+)?k?)\s*it/s"
+    r"\s*\|\s*(?P<avg>\d+(?:\.\d+)?k?)\s*avg it/s"
 )
+
+
+def rate_value(s):
+    """'1170' -> 1170, '1.17k' -> 1170. None-safe via callers."""
+    return int(round(float(s[:-1]) * 1000)) \
+        if s.endswith("k") else int(s)
 
 # Fallback: some lines may not carry the it/s portion; still capture share counts.
 SHARES_ONLY_RE = re.compile(
@@ -319,8 +327,8 @@ def tail_hashrate(log_file, max_lines=400):
     for line in reversed(lines):
         m = STATUS_RE.search(line)
         if m:
-            result["it"] = int(m.group("it"))
-            result["avg"] = int(m.group("avg"))
+            result["it"] = rate_value(m.group("it"))
+            result["avg"] = rate_value(m.group("avg"))
             result["epoch"] = int(m.group("epoch"))
             result["found"] = int(m.group("found"))
             result["submitted"] = int(m.group("submitted"))

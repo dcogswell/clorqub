@@ -137,6 +137,21 @@ class TestLogParsing(unittest.TestCase):
         self.assertEqual(m.group("rejected"), "17")
         self.assertEqual(m.group("it"), "100")
 
+    def test_k_suffix_rates(self):
+        # jetski renders rates > ~1k as "1.17k it/s": the regexes must
+        # match or fast rigs freeze on their last sub-1k reading
+        self.assertEqual(qp.rate_value("1.17k"), 1170)
+        self.assertEqual(qp.rate_value("847"), 847)
+        line = ("2026-11-19 14:22:49.257 [INFO]  E:240 | SHARES: 42/42 "
+                "(R:0) | [AVX2] 1 it/s | [CUDA] 1.17k it/s "
+                "| 1.16k avg it/s")
+        devs = {m.group(1): qp.rate_value(m.group(2))
+                for m in agent.DEVICE_RATE_RE.finditer(line)}
+        self.assertEqual(devs, {"AVX2": 1, "CUDA": 1170})
+        am = agent.AVG_RATE_RE.search(line)
+        self.assertIsNotNone(am)
+        self.assertEqual(qp.rate_value(am.group(1)), 1160)
+
     def test_trainer_regexes(self):
         m = qp.TRAINER_UPDATED_RE.search(
             "Trainer Updated: AVX2    v236.17")

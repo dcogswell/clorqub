@@ -432,8 +432,9 @@ def hardware_info():
 
 # Per-device hashrate tags, e.g. "[AVX2] 1 it/s | [CUDA] 84 it/s" (jetski,
 # one line) or separate lines per device (qli).
-DEVICE_RATE_RE = re.compile(r"\[([A-Za-z0-9_]+)\]\s*(\d+)\s*it/s")
-AVG_RATE_RE = re.compile(r"(\d+)\s+avg it/s")
+DEVICE_RATE_RE = re.compile(
+    r"\[([A-Za-z0-9_]+)\]\s*(\d+(?:\.\d+)?k?)\s*it/s")
+AVG_RATE_RE = re.compile(r"(\d+(?:\.\d+)?k?)\s+avg it/s")
 CPU_TAGS = {"AVX2", "AVX512", "GENERIC"}
 GPU_TAGS = {"CUDA", "AMD"}
 
@@ -453,11 +454,11 @@ def parse_its(log_path, max_lines=300):
         for m in DEVICE_RATE_RE.finditer(line):
             tag = m.group(1)
             if tag not in devices:
-                devices[tag] = int(m.group(2))
+                devices[tag] = qp.rate_value(m.group(2))
         if avg is None:
             am = AVG_RATE_RE.search(line)
             if am:
-                avg = int(am.group(1))
+                avg = qp.rate_value(am.group(1))
         if epoch is None:
             sm = qp.STATUS_RE.search(line) or qp.SHARES_ONLY_RE.search(line)
             if sm:
