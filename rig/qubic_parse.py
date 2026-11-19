@@ -78,6 +78,9 @@ def parse_stats_file(path):
       "invalid_shares": int,
       "solution_times": [datetime, ...]   # UTC, sorted ascending
       "best_score": int | None           # max ReportedScore, non-invalid sols
+      "score_n": int                     # non-invalid solutions with a score
+      "score_med": float | None          # median ReportedScore
+      "score_sum": float                 # total ReportedScore
     }
     """
     if not path or not os.path.isfile(path):
@@ -106,6 +109,7 @@ def parse_stats_file(path):
             dt = dt.replace(tzinfo=timezone.utc)
         times.append(dt)
     times.sort()
+    scores.sort()
     return {
         "epoch": data.get("Epoch"),
         "found_shares": data.get("FoundShares", 0),
@@ -113,6 +117,12 @@ def parse_stats_file(path):
         "invalid_shares": data.get("InvalidShares", 0),
         "solution_times": times,
         "best_score": max(scores) if scores else None,
+        "score_n": len(scores),
+        "score_med": (scores[len(scores) // 2] if len(scores) % 2
+                      else (scores[len(scores) // 2 - 1]
+                            + scores[len(scores) // 2]) / 2)
+        if scores else None,
+        "score_sum": sum(scores),
     }
 
 

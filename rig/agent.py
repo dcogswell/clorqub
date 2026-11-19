@@ -610,6 +610,10 @@ def cmd_run(_args):
         _h = hashlib.sha256(os.uname().nodename.encode()).digest()
         alias = f"rig-{_animals[_h[0] % len(_animals)]}"
     threads = env_int("CPU_THREADS", max(1, (os.cpu_count() or 2) - 1))
+    # never let an explicit count eat the whole visible CPU: the
+    # stock amountOfThreads:0 semantics are nproc-1, so clamp to it
+    if threads <= 0 or threads >= (os.cpu_count() or 2):
+        threads = max(1, (os.cpu_count() or 2) - 1)
     gpu = os.environ.get("GPU", "off") == "on"
     packages = {}  # pool -> pkg info dict
     log(f"agent start pool={pool} (from {pool_source}) "
@@ -632,7 +636,6 @@ def cmd_run(_args):
     log("credentials ready")
 
     miner = None
-    restarts = 0
     backoff = 5
     bg_fetch = {}  # pool -> thread
 
@@ -699,6 +702,9 @@ def cmd_run(_args):
                     "submitted": parsed["submitted_shares"],
                     "invalid": parsed["invalid_shares"],
                     "best_score": parsed["best_score"],
+                    "score_n": parsed["score_n"],
+                    "score_med": parsed["score_med"],
+                    "score_sum": parsed["score_sum"],
                 })
         trainer = {}
         for line in reversed(qp.tail_log_lines(
@@ -732,7 +738,6 @@ def cmd_run(_args):
                 else None,
                 "running": bool(miner_obj and miner_obj.alive()),
                 "started_at": miner_obj.started_at if miner_obj else None,
-                "restarts": restarts,
             },
             "its": parse_its(os.path.join(LOGS_DIR, f"{pool}.log")),
             "shares": shares,
@@ -806,7 +811,6 @@ def cmd_run(_args):
                     pass
                 if pool in bg_fetch and bg_fetch[pool].is_alive():
                     bg_fetch[pool].join(timeout=300)
-                restarts = 0
                 backoff = 5
                 switched = True
                 break
@@ -826,7 +830,6 @@ def cmd_run(_args):
                 backoff = min(backoff * 2, 60)
                 miner = MinerProc(pool, pkg["dir"], binary, args)
                 miner.start()
-                restarts += 1
             else:
                 backoff = 5
         if not switched:
