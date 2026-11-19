@@ -6757,23 +6757,34 @@ class PoolShareEstimateTests(unittest.TestCase):
         finally:
             db.close()
 
-    def test_disabled_yields_no_objective(self):
+    def test_disabled_still_estimates_but_never_warns(self):
+        """Off = what-if view: the estimate computes fully while
+        arming signals (approval warnings, pace deficit) stay off."""
         db = make_db()
         try:
             add_pool_snap(db, 1, workers={"a": (200.0, 100.0)},
                           extra=self.EXTRA)
+            stats, scored = self._supply()
             est = experiment.pool_share_estimate(
                 db, self._rentals(),
                 dict(CFG, pool_share_enabled=False,
-                     pool_share_target_pct=1.0), now=NOW)
+                     pool_share_target_pct=1.0,
+                     pool_share_approved_usd=50.0,
+                     pool_share_approved_hr=0.40,
+                     pool_share_approved_pct=1.0), now=NOW,
+                stats=stats, scored=scored, remaining=5.0)
             self.assertFalse(est["enabled"])
-            self.assertEqual(est["target_pct"], 1.0)
-            for k in ("needed_sol", "needed_its", "est_cost_hr",
-                      "est_cost_day", "est_cost_epoch"):
-                self.assertIsNone(est[k], k)
-            # measurements still report -- only the objective hides
-            self.assertIsNotNone(est["share_now_pct"])
-            self.assertIsNotNone(est["sol_per_its"])
+            self.assertAlmostEqual(est["needed_its"], 1400.0)
+            self.assertAlmostEqual(est["est_cost_hr"], 0.70)
+            self.assertAlmostEqual(est["deficit_its"], 700.0)
+            self.assertIsNotNone(est["est_cost_epoch"])
+            self.assertIsNotNone(est["affordable_pct"])
+            # arm-state signals stay off regardless of the numbers
+            self.assertFalse(est["reapproval_needed"])
+            self.assertFalse(est["pace_deficit"])
+            self.assertIsNone(
+                experiment._share_price_cap(
+                    {"pool_share": est}, CFG))
         finally:
             db.close()
 

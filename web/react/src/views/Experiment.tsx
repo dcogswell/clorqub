@@ -541,22 +541,23 @@ function PoolSharePanel({ ps, cfgPct }: {
         </div>
         {ps && !ps.enabled && (
           <span className="text-xs text-amber-400">
-            share targeting off — enable in Settings › Strategy
+            off — what-if estimate; enable in Settings › Strategy to arm
           </span>
         )}
-        <div className={ps && !ps.enabled ? 'opacity-40' : ''}>
+        <div>
           <span className="text-gray-500">needs </span>
           {ps?.needed_its != null
             ? `${num(ps.needed_its, 0)} it/s (${num(ps.needed_sol ?? 0, 0)} sol)`
             : '—'}
-          {ps?.enabled && (ps.deficit_its ?? 0) > 0 && (
+          {(ps?.deficit_its ?? 0) > 0 && (
             <span className="text-amber-300">
               {` · behind by ${num(ps.deficit_its, 0)} it/s`}
-              {app && app.usd > 0 ? ' → catch-up pricing armed' : ''}
+              {ps?.enabled && app && app.usd > 0
+                ? ' → catch-up pricing armed' : ''}
             </span>
           )}
         </div>
-        <div className={ps && !ps.enabled ? 'opacity-40' : ''}>
+        <div>
           <span className="text-gray-500">est </span>
           {`${usdOr(ps?.est_cost_hr)}/hr · ${usdOr(ps?.est_cost_day)}/day · `}
           {ps?.epoch_h_left != null
@@ -606,7 +607,7 @@ function PoolSharePanel({ ps, cfgPct }: {
         </div>
       )}
       <div className="mt-1 text-[10px] text-gray-600">
-        {ps?.enabled && ps.affordable_pct != null && (
+        {ps?.affordable_pct != null && (
           <span className="text-gray-500">
             {`remaining buys ~${num(ps.affordable_pct, 2)}% · `}
           </span>

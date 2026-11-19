@@ -1496,10 +1496,12 @@ def pool_share_estimate(db, rentals, cfg, now=None, stats=None,
             and sum(c for _, c in r.get("share_arrivals", [])) > 0]
     eff = _median(effs)
 
+    # the estimate always computes -- enabled only gates arming
+    # (approval, warnings, catch-up pricing), not visibility
     enabled = bool(cfg.get("pool_share_enabled"))
     target_pct = float(cfg.get("pool_share_target_pct") or 0)
     needed_sol = (target_pct / 100.0) * total_sol \
-        if enabled and total_sol else None
+        if total_sol else None
     needed_its = (needed_sol / sol_per_its
                   if needed_sol is not None and sol_per_its else None)
 
@@ -1531,7 +1533,7 @@ def pool_share_estimate(db, rentals, cfg, now=None, stats=None,
             if eff:  # soft fallback: fleet-measured efficiency
                 est_cost_hr = needed_its / eff
                 cost_basis = "measured_eff"
-    elif enabled:
+    elif needed_its is not None:
         est_cost_hr, cost_basis = 0.0, "supply_curve"
 
     epoch_h_left = None
@@ -1547,7 +1549,7 @@ def pool_share_estimate(db, rentals, cfg, now=None, stats=None,
 
     # what the remaining budget still buys at the current curve
     affordable_pct = None
-    if enabled and remaining is not None and epoch_h_left \
+    if remaining is not None and epoch_h_left \
             and sol_per_its and total_sol:
         hr_budget = max(0.0, float(remaining) / epoch_h_left)
         a_its, _ = _walk_share_supply(supply, budget_hr=hr_budget)
